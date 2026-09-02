@@ -202,6 +202,8 @@ fetch('/api/backends/chat-completions/generate', {
 })
 ```
 不受浏览器跨域限制，不碰主模型密钥，不切 connection profile。Gemini 走其 OpenAI 兼容端点即可。
+拉模型列表走同一后端的 `/api/backends/chat-completions/status`（主 API「连接」按钮同路），后端向 `{url}/models` 发 GET；
+上游出错时酒馆只回 `{error:true}` 不带原因，前端提示去看后台日志并允许手填模型名。
 超时默认 60s（AbortController）。可选**备用模型**（第二组 url/key/model）：主副 API 连续失败或返回空时自动换。
 
 ### 6.2 提示词初稿
@@ -343,10 +345,12 @@ S + pinned 条目 ≤ 25 时逐条注入；超过时副 API 把全部 S 压成 �
 
 ## 9. 面板（手机优先）
 
-入口：顶栏图标（与 toy-sync 状态灯同位置风格）+ 扩展设置抽屉里的「打开记忆面板」按钮。
-形态：`position:fixed; inset:0` 全屏浮层，顶部工具条，主体纵向滚动卡片列表，底部操作条。不用 `prompt()/confirm()`。
+入口三处：顶栏图标（与 toy-sync 状态灯同位置风格，不挂酒馆 `.drawer-toggle` 类，免得被酒馆抽屉处理器抢事件）
++ 输入框左侧魔杖菜单 `#extensionsMenu` 里的「记忆面板」项 + 扩展设置抽屉里的按钮。
+形态：`position:fixed; inset:0` 全屏浮层，顶部工具条带「记忆 / 设置」两页切换，主体纵向滚动，底部操作条。不用 `prompt()/confirm()`。
+未配副 API 且无条目时，打开面板直接落到设置页。
 
-顶部：状态摘要「已入库 N / 待处理 N / 失败 N / 本轮注入 N 条 ≈ M 字」；筛选：等级 / 类型 / 状态；搜索框（标题/摘要/标签）。
+「记忆」页顶部：状态摘要「已入库 N / 待处理 N / 失败 N / 本轮注入 N 条 ≈ M 字」；筛选：等级 / 类型 / 状态；搜索框（标题/摘要/标签）。
 
 卡片：`story_time` 一行 · 等级色块（点按循环 S→A→B→C；长按钉/取消钉 S）· 标题 · 摘要（点开展开全文，
 再点进入编辑 textarea）· 状态徽标（待处理/失败/过期/孤立/归档/兜底抠取）· 楼层号（点击跳到该楼）。
@@ -362,11 +366,14 @@ S + pinned 条目 ≤ 25 时逐条注入；超过时副 API 把全部 S 压成 �
 
 ## 10. 设置项
 
+§10 的表单全部放在面板「设置」页；扩展设置抽屉只留总开关 + 两个打开按钮 + 状态行。
+
 | 键 | 默认 | 说明 |
 |---|---|---|
 | enabled | true | 总开关 |
 | autoIngest | true | 自动补齐；关掉则只手动 |
-| api.url / api.key / api.model | 空 | 副 API；「测试连接」按钮 |
+| api.url / api.key / api.model | 空 | 副 API；「拉取模型」+ 下拉选择，「测试连接」按钮 |
+| api.models | [] | 上次拉取到的模型列表缓存，刷新页面后下拉框仍可选 |
 | api.temperature | 0.3 | |
 | api.maxTokens | 900 | |
 | api.timeoutSec | 60 | |

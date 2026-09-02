@@ -27,7 +27,7 @@
     const DEFAULTS = {
         enabled: true,
         autoIngest: true,
-        api: { url: '', key: '', model: '', temperature: 0.3, maxTokens: 900, timeoutSec: 60 },
+        api: { url: '', key: '', model: '', models: [], temperature: 0.3, maxTokens: 900, timeoutSec: 60 },
         contentWindow: 6,   // 与预设 6🌸 的 minDepth 一致
         injectDepth: 6,
         maxInjectChars: 9000,
@@ -45,7 +45,7 @@
         if (settings[key] === undefined) settings[key] = structuredClone(DEFAULTS[key]);
     }
     for (const key of Object.keys(DEFAULTS.api)) {
-        if (settings.api[key] === undefined) settings.api[key] = DEFAULTS.api[key];
+        if (settings.api[key] === undefined) settings.api[key] = structuredClone(DEFAULTS.api[key]);
     }
     const saveSettings = () => getCtx().saveSettingsDebounced();
 
@@ -159,12 +159,13 @@
     /* ================= 副 API ================= */
 
     const apiConfigured = () => !!(settings.api.url?.trim() && settings.api.key?.trim());
+    const apiBase = () => settings.api.url.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
 
     // 经酒馆后端转发：openai 源 + reverse_proxy/proxy_password 覆盖目标与密钥，
     // 不受浏览器跨域限制，不碰主模型连接
     async function callApi(messages, maxTokens) {
         const ctx = getCtx();
-        const base = settings.api.url.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/i, '');
+        const base = apiBase();
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), Math.max(5, Number(settings.api.timeoutSec) || 60) * 1000);
         let res, text;
@@ -199,6 +200,33 @@
         const content = json.choices?.[0]?.message?.content;
         if (!content || !String(content).trim()) throw new Error('空回复');
         return String(content).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    }
+
+    // 拉模型列表：与主 API「连接」按钮同一条路，后端拿 reverse_proxy + proxy_password 去请求 {base}/models
+    // 上游出错时酒馆后端回 200 + {error:true}，不带原因，只能提示去看后台日志
+    async function fetchModels() {
+        const ctx = getCtx();
+        let res, text;
+        try {
+            res = await fetch('/api/backends/chat-completions/status', {
+                method: 'POST',
+                headers: ctx.getRequestHeaders(),
+                body: JSON.stringify({ chat_completion_source: 'openai', reverse_proxy: apiBase(), proxy_password: settings.api.key.trim() }),
+            });
+            text = await res.text();
+        } catch (err) {
+            throw new Error(`网络错误：${err.message}`);
+        }
+        let json;
+        try { json = JSON.parse(text); } catch { throw new Error(`后端返回非 JSON：${text.slice(0, 120)}`); }
+        if (json.error === true) throw new Error('上游未返回模型列表：检查地址是否到 /v1、密钥是否正确，或该接口不支持 /models（可手动填模型名）');
+        if (!res.ok || json.error) throw new Error(String(json.error?.message || json.error || `HTTP ${res.status}`).slice(0, 200));
+        const raw = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : Array.isArray(json) ? json : [];
+        const ids = [...new Set(raw.map(m => typeof m === 'string' ? m : (m?.id || m?.name)).filter(Boolean).map(String))].sort();
+        if (!ids.length) throw new Error('接口返回了空的模型列表');
+        settings.api.models = ids;
+        saveSettings();
+        return ids;
     }
 
     const isRefusal = raw =>
@@ -592,7 +620,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     function refreshStatus() {
         const c = counts();
         const s = `已入库 ${c.ok} · 待处理 ${c.pending + c.stale} · 失败 ${c.failed + c.refused} · 孤立 ${c.orphan} · 本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（裁掉 ${lastInject.dropped}）` : ''}`;
-        $('#em_status').text(s);
+        $('.em-status').text(s);
         $('#em_stat').text(`${c.ok}/${c.total}`);
         const icon = $('#em_icon');
         if (icon.length) {
@@ -603,22 +631,148 @@ C = 日常、闲聊、氛围、无后果的互动。
         }
     }
 
+    // 顶栏图标：不挂 .drawer-toggle，免得酒馆的抽屉点击处理器抢事件（本扩展没有 drawer-content）
     function addTopIcon() {
         const holder = $('#top-settings-holder');
         if (!holder.length) return;
         const drawer = $(`
         <div id="em_drawer" class="drawer">
-            <div class="drawer-toggle">
-                <div id="em_icon" class="drawer-icon fa-solid fa-brain fa-fw closedIcon interactable" tabindex="0"></div>
+            <div class="em-toggle">
+                <div id="em_icon" class="drawer-icon fa-solid fa-brain fa-fw closedIcon interactable" tabindex="0" title="Erato Memory"></div>
             </div>
         </div>`);
         const rightNav = holder.children('#rightNavHolder');
         rightNav.length ? rightNav.before(drawer) : holder.append(drawer);
-        $('#em_icon').on('click', () => togglePanel());
+        $('#em_icon').on('click', ev => { ev.stopPropagation(); ev.preventDefault(); togglePanel(); });
         $('#em_icon').on('contextmenu', e => e.preventDefault());
     }
 
-    /* ================= 设置抽屉 ================= */
+    // 输入框左侧魔杖菜单里的入口，手机上比顶栏好点
+    function addWandEntry() {
+        const menu = $('#extensionsMenu');
+        if (!menu.length) return;
+        const item = $(`
+        <div id="em_wand" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
+            <div class="fa-solid fa-brain extensionsMenuExtensionButton"></div>
+            <span>记忆面板</span>
+        </div>`);
+        menu.append(item);
+        item.on('click', () => togglePanel(true));
+    }
+
+    /* ================= 设置表单（放在面板「设置」页；扩展设置抽屉只留开关和入口） ================= */
+
+    function settingsFormHtml() {
+        return `
+        <div class="em-form">
+            <label class="checkbox_label"><input type="checkbox" id="em_enabled"><span>启用记忆</span></label>
+            <label class="checkbox_label"><input type="checkbox" id="em_auto"><span>自动入库（关掉则只在「记忆」页手动补齐）</span></label>
+            <hr>
+            <div class="em-sec">副 API（OpenAI 兼容）</div>
+            <label>地址<input id="em_api_url" class="text_pole" placeholder="https://api.example.com/v1"></label>
+            <label>密钥<input id="em_api_key" class="text_pole" type="password" placeholder="sk-…" autocomplete="off"></label>
+            <div class="em-row em-model-row">
+                <label class="em-grow">模型（先拉取再选，或直接手填）
+                    <select id="em_api_model_sel"></select>
+                </label>
+                <div class="menu_button" id="em_models">拉取模型</div>
+            </div>
+            <label>模型名（手填 / 当前生效值）<input id="em_api_model" class="text_pole" placeholder="gpt-4o-mini / gemini-2.0-flash …"></label>
+            <div class="em-hint"><span id="em_model_count"></span></div>
+            <div class="em-row">
+                <label>温度 <input id="em_api_temp" class="text_pole" type="number" step="0.1" min="0" max="2"></label>
+                <label>回复上限 <input id="em_api_max" class="text_pole" type="number" min="200" step="100"></label>
+                <label>超时(秒) <input id="em_api_timeout" class="text_pole" type="number" min="5"></label>
+            </div>
+            <div class="menu_button" id="em_test">测试连接</div>
+            <hr>
+            <div class="em-sec">窗口与注入</div>
+            <div class="em-row">
+                <label>正文窗口 <input id="em_window" class="text_pole" type="number" min="2" max="40" title="与预设 6🌸 的 minDepth 保持一致"></label>
+                <label>注入深度 <input id="em_depth" class="text_pole" type="number" min="0" max="40"></label>
+                <label>注入上限(字) <input id="em_maxchars" class="text_pole" type="number" min="1000" step="500"></label>
+                <label>单次补齐楼数 <input id="em_batch" class="text_pole" type="number" min="1" max="200"></label>
+            </div>
+            <div class="em-sec">记忆导演指令</div>
+            <div class="em-hint">附加到每次摘要，可空</div>
+            <textarea id="em_directive" class="text_pole" rows="3" placeholder="例：重点记录承诺与信息差"></textarea>
+            <label class="checkbox_label"><input type="checkbox" id="em_debug"><span>控制台调试日志</span></label>
+            <hr>
+            <div class="em-status"></div>
+        </div>`;
+    }
+
+    function renderModelSelect() {
+        const sel = $('#em_api_model_sel');
+        if (!sel.length) return;
+        const cur = (settings.api.model || '').trim();
+        const list = Array.isArray(settings.api.models) ? settings.api.models : [];
+        const opts = ['<option value="">（未选择 / 手填）</option>']
+            .concat(list.map(m => `<option value="${esc(m)}">${esc(m)}</option>`));
+        sel.html(opts.join(''));
+        sel.val(list.includes(cur) ? cur : '');
+        $('#em_model_count').text(list.length ? `已拉取 ${list.length} 个模型` : '尚未拉取模型列表');
+    }
+
+    function bindSettingsForm() {
+        $('#em_enabled').prop('checked', settings.enabled).on('change', function () {
+            settings.enabled = this.checked; saveSettings();
+            $('#em_enabled_d').prop('checked', settings.enabled);
+            applyInjection(); refreshStatus();
+        });
+        $('#em_auto').prop('checked', settings.autoIngest).on('change', function () {
+            settings.autoIngest = this.checked; saveSettings();
+        });
+        const bindApi = (id, key, num) => $(id).val(settings.api[key]).on('change', function () {
+            settings.api[key] = num ? Number(this.value) : this.value.trim(); saveSettings();
+        });
+        bindApi('#em_api_url', 'url'); bindApi('#em_api_key', 'key');
+        bindApi('#em_api_temp', 'temperature', true); bindApi('#em_api_max', 'maxTokens', true); bindApi('#em_api_timeout', 'timeoutSec', true);
+        $('#em_api_model').val(settings.api.model).on('change', function () {
+            settings.api.model = this.value.trim(); saveSettings(); renderModelSelect();
+        });
+        $('#em_api_model_sel').on('change', function () {
+            if (!this.value) return;
+            settings.api.model = this.value; saveSettings();
+            $('#em_api_model').val(this.value);
+        });
+        renderModelSelect();
+        $('#em_models').on('click', async function () {
+            if (!apiConfigured()) return toast('warning', '请先填写副 API 地址与密钥');
+            const btn = $(this).addClass('disabled').text('拉取中…');
+            try {
+                const ids = await fetchModels();
+                renderModelSelect();
+                toast('success', `拉到 ${ids.length} 个模型，请在下拉框里选择`);
+            } catch (err) {
+                toast('error', `拉取失败：${err.message}`);
+            } finally {
+                btn.removeClass('disabled').text('拉取模型');
+            }
+        });
+        const bindNum = (id, key, after) => $(id).val(settings[key]).on('change', function () {
+            settings[key] = Number(this.value); saveSettings(); after?.();
+        });
+        bindNum('#em_window', 'contentWindow', applyInjection);
+        bindNum('#em_depth', 'injectDepth', applyInjection);
+        bindNum('#em_maxchars', 'maxInjectChars', applyInjection);
+        bindNum('#em_batch', 'ingestBatch');
+        $('#em_directive').val(settings.directive).on('change', function () { settings.directive = this.value; saveSettings(); });
+        $('#em_debug').prop('checked', settings.debug).on('change', function () { settings.debug = this.checked; saveSettings(); });
+        $('#em_test').on('click', async function () {
+            if (!apiConfigured()) return toast('warning', '请先填写副 API 地址与密钥');
+            if (!settings.api.model?.trim()) toast('warning', '未指定模型，将由接口默认模型响应');
+            const btn = $(this).addClass('disabled').text('测试中…');
+            try {
+                const r = await callApi([{ role: 'user', content: '请只回复「连接成功」四个字。' }], 50);
+                toast('success', `副 API 可用：${r.slice(0, 60)}`);
+            } catch (err) {
+                toast('error', `副 API 失败：${err.message}`);
+            } finally {
+                btn.removeClass('disabled').text('测试连接');
+            }
+        });
+    }
 
     function addSettingsUI() {
         const html = `
@@ -629,74 +783,31 @@ C = 日常、闲聊、氛围、无后果的互动。
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
-                    <label class="checkbox_label"><input type="checkbox" id="em_enabled"><span>启用</span></label>
-                    <label class="checkbox_label"><input type="checkbox" id="em_auto"><span>自动入库（关掉则只在面板里手动补齐）</span></label>
-                    <hr>
-                    <b>副 API（OpenAI 兼容）</b>
-                    <input id="em_api_url" class="text_pole" placeholder="地址，如 https://api.example.com/v1">
-                    <input id="em_api_key" class="text_pole" type="password" placeholder="密钥">
-                    <input id="em_api_model" class="text_pole" placeholder="模型名">
+                    <label class="checkbox_label"><input type="checkbox" id="em_enabled_d"><span>启用</span></label>
+                    <div class="em-hint">副 API、模型选择、窗口与注入等设置都在记忆面板的「设置」页里；顶栏 🧠 图标或魔杖菜单「记忆面板」也可打开。</div>
                     <div class="em-row">
-                        <label>温度 <input id="em_api_temp" class="text_pole" type="number" step="0.1" min="0" max="2"></label>
-                        <label>回复上限 <input id="em_api_max" class="text_pole" type="number" min="200" step="100"></label>
-                        <label>超时(秒) <input id="em_api_timeout" class="text_pole" type="number" min="5"></label>
+                        <div class="menu_button" id="em_open">打开记忆面板</div>
+                        <div class="menu_button" id="em_open_cfg">副 API 设置</div>
                     </div>
-                    <div class="menu_button" id="em_test">测试连接</div>
-                    <hr>
-                    <b>窗口与注入</b>
-                    <div class="em-row">
-                        <label>正文窗口 <input id="em_window" class="text_pole" type="number" min="2" max="40" title="与预设 6🌸 的 minDepth 保持一致"></label>
-                        <label>注入深度 <input id="em_depth" class="text_pole" type="number" min="0" max="40"></label>
-                        <label>注入上限(字) <input id="em_maxchars" class="text_pole" type="number" min="1000" step="500"></label>
-                        <label>单次补齐楼数 <input id="em_batch" class="text_pole" type="number" min="1" max="200"></label>
-                    </div>
-                    <b>记忆导演指令</b>（附加到每次摘要，可空）
-                    <textarea id="em_directive" class="text_pole" rows="3" placeholder="例：重点记录承诺与信息差"></textarea>
-                    <label class="checkbox_label"><input type="checkbox" id="em_debug"><span>控制台调试日志</span></label>
-                    <hr>
-                    <div class="menu_button" id="em_open">打开记忆面板</div>
-                    <div id="em_status" class="em-status"></div>
+                    <div class="em-status"></div>
                 </div>
             </div>
         </div>`;
         $('#extensions_settings2').append(html);
 
-        $('#em_enabled').prop('checked', settings.enabled).on('change', function () {
-            settings.enabled = this.checked; saveSettings(); applyInjection(); refreshStatus();
+        $('#em_enabled_d').prop('checked', settings.enabled).on('change', function () {
+            settings.enabled = this.checked; saveSettings();
+            $('#em_enabled').prop('checked', settings.enabled);
+            applyInjection(); refreshStatus();
         });
-        $('#em_auto').prop('checked', settings.autoIngest).on('change', function () {
-            settings.autoIngest = this.checked; saveSettings();
-        });
-        const bindApi = (id, key, num) => $(id).val(settings.api[key]).on('change', function () {
-            settings.api[key] = num ? Number(this.value) : this.value.trim(); saveSettings();
-        });
-        bindApi('#em_api_url', 'url'); bindApi('#em_api_key', 'key'); bindApi('#em_api_model', 'model');
-        bindApi('#em_api_temp', 'temperature', true); bindApi('#em_api_max', 'maxTokens', true); bindApi('#em_api_timeout', 'timeoutSec', true);
-        const bindNum = (id, key, after) => $(id).val(settings[key]).on('change', function () {
-            settings[key] = Number(this.value); saveSettings(); after?.();
-        });
-        bindNum('#em_window', 'contentWindow', applyInjection);
-        bindNum('#em_depth', 'injectDepth', applyInjection);
-        bindNum('#em_maxchars', 'maxInjectChars', applyInjection);
-        bindNum('#em_batch', 'ingestBatch');
-        $('#em_directive').val(settings.directive).on('change', function () { settings.directive = this.value; saveSettings(); });
-        $('#em_debug').prop('checked', settings.debug).on('change', function () { settings.debug = this.checked; saveSettings(); });
-        $('#em_open').on('click', () => togglePanel(true));
-        $('#em_test').on('click', async () => {
-            if (!apiConfigured()) return toast('warning', '请先填写副 API 地址与密钥');
-            toast('info', '正在测试副 API…');
-            try {
-                const r = await callApi([{ role: 'user', content: '请只回复「连接成功」四个字。' }], 50);
-                toast('success', `副 API 可用：${r.slice(0, 60)}`);
-            } catch (err) {
-                toast('error', `副 API 失败：${err.message}`);
-            }
-        });
+        $('#em_open').on('click', () => togglePanel(true, 'mem'));
+        $('#em_open_cfg').on('click', () => togglePanel(true, 'cfg'));
     }
 
     /* ================= 记忆面板 ================= */
 
     let panelOpen = false;
+    let panelTab = 'mem';
     const expanded = new Set();
     const filter = { grade: '', type: '', status: '', q: '' };
 
@@ -704,35 +815,47 @@ C = 日常、闲聊、氛围、无后果的互动。
         const html = `
         <div id="em_panel" class="em-panel" style="display:none">
             <div class="em-head">
-                <div class="em-title">🧠 记忆面板 <span id="em_stat" class="em-stat"></span></div>
+                <div class="em-title">🧠 Erato Memory <span id="em_stat" class="em-stat"></span></div>
+                <div class="em-tabs">
+                    <div class="em-tab active" data-tab="mem">记忆</div>
+                    <div class="em-tab" data-tab="cfg">设置</div>
+                </div>
                 <div id="em_close" class="em-close fa-solid fa-xmark interactable" tabindex="0"></div>
             </div>
-            <div id="em_alert" class="em-alert" style="display:none"></div>
-            <div class="em-filters">
-                <select id="em_f_grade"><option value="">全部等级</option>${GRADES.map(g => `<option value="${g}">${g}</option>`).join('')}</select>
-                <select id="em_f_type"><option value="">全部类型</option>${TYPES.map(t => `<option value="${t}">${TYPE_LABEL[t]}</option>`).join('')}</select>
-                <select id="em_f_status">
-                    <option value="">全部状态</option>
-                    <option value="ok">正常</option><option value="pending">待处理</option><option value="failed">失败</option>
-                    <option value="refused">拒答</option><option value="stale">过期</option><option value="orphan">孤立</option>
-                    <option value="fallback">兜底抠取</option><option value="pinned">已钉</option>
-                </select>
-                <input id="em_f_q" class="text_pole" placeholder="搜索标题 / 摘要 / 标签">
+            <div id="em_tab_mem" class="em-tabpane">
+                <div id="em_alert" class="em-alert" style="display:none"></div>
+                <div class="em-filters">
+                    <select id="em_f_grade"><option value="">全部等级</option>${GRADES.map(g => `<option value="${g}">${g}</option>`).join('')}</select>
+                    <select id="em_f_type"><option value="">全部类型</option>${TYPES.map(t => `<option value="${t}">${TYPE_LABEL[t]}</option>`).join('')}</select>
+                    <select id="em_f_status">
+                        <option value="">全部状态</option>
+                        <option value="ok">正常</option><option value="pending">待处理</option><option value="failed">失败</option>
+                        <option value="refused">拒答</option><option value="stale">过期</option><option value="orphan">孤立</option>
+                        <option value="fallback">兜底抠取</option><option value="pinned">已钉</option>
+                    </select>
+                    <input id="em_f_q" class="text_pole" placeholder="搜索标题 / 摘要 / 标签">
+                </div>
+                <div id="em_list" class="em-list"></div>
+                <div class="em-foot">
+                    <div class="menu_button" data-act="ingest">补齐</div>
+                    <div class="menu_button" data-act="reconcile">对账</div>
+                    <div class="menu_button" data-act="retry">重试失败</div>
+                    <div class="menu_button" data-act="export">导出</div>
+                    <div class="menu_button" data-act="import">导入</div>
+                    <div class="menu_button em-danger" data-act="clear">清空</div>
+                    <input type="file" id="em_import_file" accept="application/json" hidden>
+                </div>
             </div>
-            <div id="em_list" class="em-list"></div>
-            <div class="em-foot">
-                <div class="menu_button" data-act="ingest">补齐</div>
-                <div class="menu_button" data-act="reconcile">对账</div>
-                <div class="menu_button" data-act="retry">重试失败</div>
-                <div class="menu_button" data-act="export">导出</div>
-                <div class="menu_button" data-act="import">导入</div>
-                <div class="menu_button em-danger" data-act="clear">清空</div>
-                <input type="file" id="em_import_file" accept="application/json" hidden>
+            <div id="em_tab_cfg" class="em-tabpane em-cfg" style="display:none">
+                ${settingsFormHtml()}
             </div>
         </div>`;
         $('body').append(html);
 
         $('#em_close').on('click', () => togglePanel(false));
+        $('#em_panel .em-tab').on('click', function () { showTab($(this).data('tab')); });
+        $('#em_alert').on('click', () => showTab('cfg'));
+        bindSettingsForm();
         $('#em_f_grade, #em_f_type, #em_f_status').on('change', function () {
             filter[this.id.replace('em_f_', '')] = this.value; renderPanel();
         });
@@ -766,10 +889,23 @@ C = 日常、闲聊、氛围、无后果的互动。
         });
     }
 
-    function togglePanel(force) {
+    function showTab(name) {
+        panelTab = name === 'cfg' ? 'cfg' : 'mem';
+        $('#em_panel .em-tab').removeClass('active').filter(`[data-tab="${panelTab}"]`).addClass('active');
+        $('#em_tab_mem').toggle(panelTab === 'mem');
+        $('#em_tab_cfg').toggle(panelTab === 'cfg');
+        if (panelTab === 'cfg') renderModelSelect();
+    }
+
+    // 未配副 API 且还没有条目时，打开面板直接落到设置页
+    function togglePanel(force, tab) {
         panelOpen = force === undefined ? !panelOpen : !!force;
         $('#em_panel').toggle(panelOpen);
-        if (panelOpen) { reconcile(); renderPanel(); refreshStatus(); }
+        $('#em_icon').toggleClass('openIcon', panelOpen).toggleClass('closedIcon', !panelOpen);
+        if (!panelOpen) return;
+        if (!tab && !apiConfigured() && !(getData()?.entries.length)) tab = 'cfg';
+        showTab(tab || panelTab);
+        reconcile(); renderPanel(); refreshStatus();
     }
 
     function matchFilter(e) {
@@ -843,7 +979,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (bad) {
             alert.show().text(`${bad} 楼摘要失败（其中拒答 ${c.refused}）${data.stats.lastError ? '：' + data.stats.lastError : ''}`);
         } else if (!apiConfigured()) {
-            alert.show().text('尚未配置副 API，条目不会自动入库');
+            alert.show().text('尚未配置副 API，条目不会自动入库（点此去设置页）');
         } else {
             alert.hide();
         }
@@ -991,13 +1127,14 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
 
     // 控制台排障入口（手机上可配合 Eruda）：eratoMemory_debug.buildBlock() 等
-    window.eratoMemory_debug = { extractContent, extractRecap, parseJson, buildBlock, reconcile, ingest, getData, counts, settings };
+    window.eratoMemory_debug = { extractContent, extractRecap, parseJson, buildBlock, reconcile, ingest, fetchModels, getData, counts, settings };
 
     jQuery(() => {
         try {
             addSettingsUI();
             addTopIcon();
             addPanel();
+            addWandEntry();
             bindEvents();
             setTimeout(() => { reconcile(); applyInjection(); refreshStatus(); }, 2000);
             log('Erato Memory 已加载');

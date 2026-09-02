@@ -4,12 +4,33 @@
 #em_icon.em-warn { color: #e6a23c; }
 #em_icon.em-busy { color: #7ec8ff; animation: em-pulse 1.1s ease-in-out infinite; }
 @keyframes em-pulse { 50% { transform: scale(1.2); opacity: .7; } }
+#em_drawer .em-toggle { cursor: pointer; display: flex; align-items: center; justify-content: center; }
 
-.em-settings .em-row { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 4px 0; }
-.em-settings .em-row label { display: flex; flex-direction: column; font-size: .85em; flex: 1 1 120px; }
-.em-settings .em-row input { width: 100%; }
-.em-settings textarea { width: 100%; box-sizing: border-box; }
-.em-settings .em-status { font-size: .8em; opacity: .75; margin-top: 6px; white-space: pre-wrap; }
+.em-settings .em-row, .em-form .em-row { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 4px 0; }
+.em-settings .em-row label, .em-form .em-row label { display: flex; flex-direction: column; font-size: .85em; flex: 1 1 120px; }
+.em-settings .em-row input, .em-form .em-row input { width: 100%; }
+.em-settings .em-row .menu_button { flex: 1 1 40%; text-align: center; }
+.em-settings textarea, .em-form textarea { width: 100%; box-sizing: border-box; }
+.em-status { font-size: .8em; opacity: .75; margin-top: 6px; white-space: pre-wrap; }
+.em-hint { font-size: .8em; opacity: .7; margin: 4px 0; }
+
+/* 设置页表单 */
+.em-form { display: flex; flex-direction: column; gap: 6px; }
+.em-form > label:not(.checkbox_label) { display: flex; flex-direction: column; font-size: .85em; }
+.em-form > label:not(.checkbox_label) input { width: 100%; box-sizing: border-box; }
+.em-form .em-sec { font-weight: bold; margin-top: 4px; }
+.em-form hr { width: 100%; margin: 6px 0; opacity: .4; }
+.em-form .menu_button { text-align: center; }
+.em-form .menu_button.disabled { opacity: .5; pointer-events: none; }
+.em-model-row { align-items: flex-end; }
+.em-model-row .em-grow { flex: 1 1 200px; }
+.em-model-row .menu_button { flex: 0 0 auto; min-width: 90px; }
+.em-form select {
+    width: 100%; padding: 6px; border-radius: 6px; margin-top: 2px;
+    background: var(--black30a, rgba(0,0,0,.3)); color: inherit;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3));
+}
+.em-form select option { color: initial; }
 
 .em-panel {
     position: fixed; inset: 0; z-index: 5000;
@@ -18,11 +39,16 @@
     color: var(--SmartThemeBodyColor, #ddd);
     backdrop-filter: blur(6px);
 }
-.em-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
-.em-title { font-weight: bold; }
+.em-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
+.em-title { font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .em-stat { font-weight: normal; opacity: .7; font-size: .85em; margin-left: 6px; }
+.em-tabs { display: flex; gap: 2px; border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); border-radius: 8px; overflow: hidden; margin-left: auto; }
+.em-tab { padding: 5px 14px; cursor: pointer; font-size: .9em; opacity: .7; user-select: none; }
+.em-tab.active { opacity: 1; background: var(--black30a, rgba(0,0,0,.3)); font-weight: bold; }
+.em-tabpane { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.em-cfg { overflow-y: auto; padding: 10px 14px; -webkit-overflow-scrolling: touch; display: block; }
 .em-close { font-size: 1.3em; padding: 6px 10px; cursor: pointer; }
-.em-alert { padding: 8px 14px; background: rgba(230, 80, 80, .18); border-bottom: 1px solid rgba(230, 80, 80, .4); font-size: .9em; }
+.em-alert { padding: 8px 14px; background: rgba(230, 80, 80, .18); border-bottom: 1px solid rgba(230, 80, 80, .4); font-size: .9em; cursor: pointer; }
 .em-filters { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
 .em-filters select { flex: 1 1 28%; min-width: 90px; padding: 6px; border-radius: 6px; background: var(--black30a, rgba(0,0,0,.3)); color: inherit; border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
 .em-filters input { flex: 1 1 100%; }
