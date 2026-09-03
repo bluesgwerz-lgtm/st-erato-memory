@@ -26,10 +26,16 @@
     const GRADE_HALFLIFE = { S: Infinity, A: 200, B: 60, C: 20 };
 
     // 人物志 / 物件档案的字段（值带来源楼层号）；主角只记一行「关系现状」，不建档
-    const PERSON_FIELDS = ['role', 'age', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows'];
-    const PERSON_LABEL = { role: '身份', age: '年龄', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情' };
+    // arc = 此人此刻处在什么阶段（一句）；views = 对任意他人的看法（另存 p.views，不在此表）
+    const PERSON_FIELDS = ['role', 'age', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows', 'arc'];
+    const PERSON_LABEL = { role: '身份', age: '年龄', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情', arc: '阶段' };
     const ITEM_FIELDS = ['holder', 'status', 'meaning'];
     const ITEM_LABEL = { holder: '持有者', status: '状态', meaning: '意义' };
+    // 点名表档位：按对剧情的影响判，不按是否在场；龙套只留在面板里，不进注入块
+    const TIERS = ['主', '配', '龙套'];
+    const TRENDS = ['破裂', '厌恶', '反感', '陌生', '投缘', '亲密', '交融'];
+    const RAW_LOG_MAX = 3;      // 保留最近几次副 API 原始回复供诊断
+    const RAW_LOG_CHARS = 6000;
 
     // 面板与设置里的「楼」都按酒馆楼层计（你一条 + AI 一条 = 2 楼）；存储与对账内部仍以 AI 楼为单位，见 floorSpan
     const DEFAULTS = {
@@ -38,6 +44,7 @@
         autoInterval: 20,     // 攒够这么多新楼自动总结一次；0 = 只手动
         windowFloors: 40,     // 一次副 API 调用最多吃多少楼
         maxCallChars: 60000,  // 一次调用的材料字数上限，超过自动再切一段（防副模型上下文爆掉）
+        minEventsPer: 4,      // 事件密度下限：每几个 AI 楼至少 1 条事件，少于此数视为输出不合格走拆半；0 = 不核验
         api: { url: '', key: '', model: '', models: [], temperature: 0.3, maxTokens: 4000, timeoutSec: 120 },
         contentWindow: 6,   // 与预设 6🌸 的 minDepth 一致
         injectDepth: 6,
@@ -126,6 +133,7 @@
             skip: {},
             hidden: {},   // 本插件隐藏过的楼层 send_date → true；只恢复自己藏的
             stats: { lastIngestAt: 0, lastError: '', failStreak: 0 },
+            rawLog: [],   // 最近几次副 API 原始回复 { at, win, model, finish, text }，诊断用
         };
     }
 
@@ -299,9 +307,14 @@
             const msg = json.error?.message || json.error || json.message || `HTTP ${res.status}`;
             throw new Error(String(msg).slice(0, 200));
         }
-        const content = json.choices?.[0]?.message?.content;
+        const choice = json.choices?.[0];
+        const content = choice?.message?.content;
+        const finish = String(choice?.finish_reason || '');
+        // 上游安全策略拦截：内容常为空或半截，按拒答处理（会走拆半），不当网络错误
+        if (finish === 'content_filter') throw Object.assign(new Error('上游内容过滤（content_filter）'), { refused: true, split: true });
         if (!content || !String(content).trim()) throw new Error('空回复');
-        return String(content).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        const out = String(content).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        return { text: out, finish };
     }
 
     // 拉模型列表：与主 API「连接」按钮同一条路，后端拿 reverse_proxy + proxy_password 去请求 {base}/models
@@ -409,10 +422,11 @@
         '你是成人向互动小说的档案员。你的工作是把一段已发生的剧情整理成若干条结构化记忆，并更新人物与物件档案，供后续写作参考。\n' +
         '只输出 JSON，不输出任何其他文字。用中性、克制、事实性的语言，不渲染不评价，性内容按事实记录不省略。';
 
-    // 可在设置「提示词」里改；占位符：{{name1}} {{name2}} {{roster}} {{relation}} {{recent}} {{floor_range}} {{floor_count}} {{material}} {{max_events}} {{directive}}
+    // 可在设置「提示词」里改；占位符：{{name1}} {{name2}} {{roster}} {{relation}} {{recent}} {{floor_range}} {{floor_count}} {{material}} {{min_events}} {{max_events}} {{directive}}
     const DEFAULT_USER_TEMPLATE =
 `## 已知主角
 用户角色：{{name1}}；对手角色：{{name2}}。其余出场者按原文名字记录。
+{{name1}} 与 {{name2}} 的亲属、朋友、同事、上司一律作为独立人物建档，即使只在对话、微信、电话或回忆里被提到、从未到场；不要把他们当成主角人设的一部分。
 
 ## 已有档案（名字务必与此一致，不要给同一个人起第二个名字）
 {{roster}}
@@ -427,16 +441,19 @@
 {{material}}
 
 ## 输出要求
-输出一个 JSON 对象：
+先点名，再写事件，最后更新档案。输出一个 JSON 对象，键的顺序必须是 cast、events、relation、people、items：
 {
+  "cast": [
+    {"name": "本段出现过的每一个人，包括只被提到的、包括主角、包括主角的亲属；有正式名用正式名，没有就写『谁的什么人』如 {{name1}}的母亲；宁多勿漏", "aliases": ["原文里对此人的称呼/昵称/别称，如 母亲、老陆、张姐"], "tier": "主 | 配 | 龙套", "role": "一句身份", "seen": [出现或被提到的楼层号]}
+  ],
   "events": [
     {
       "floors": [本事件来自哪几楼，只填楼层号数字],
       "story_time": "沿用该楼作者摘要的『日期 · 时段 · 场景』原文；没有则从正文推断；推断不出写（未知），禁止编造",
       "type": "plot | emotion | intimacy | relationship | setting 之一。setting=新角色登场/世界观揭示/规则确立",
       "title": "≤8字，意象或事件名，不用『之后』『开始』这类空词",
-      "summary": "≤150字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。可保留1句决定走向的原台词。去掉感官修辞。",
-      "characters": ["在场且有行动的人"],
+      "summary": "80–200字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。必须保留正式人名、原文称呼、地点、关键物件和具体动作；禁止『两人发生冲突』『关系升温』这类不带主语宾语的空话；未来只凭一句口语提法也要能认出这条。可保留1句决定走向的原台词。去掉感官修辞。",
+      "characters": ["与本事件有关的人：在场有行动的，以及不在场但影响了走向的（打电话、发消息、被转述、被提醒的人）。只用正式名，不用代词，不用别称"],
       "emotion_shift": "『角色：A→B』格式，一人一句，无变化留空",
       "known_by": ["知道这件事的角色。若是秘密/信息差，只列知情者；全员在场则留空数组"],
       "tags": ["3-6个检索词：人名/地点/物件/情绪/主题"],
@@ -448,7 +465,7 @@
   ],
   "relation": "{{name2}} 此刻对 {{name1}} 的态度与关系，一句话 ≤40 字，写现状不写过程；本段没有变化则留空字符串",
   "people": [
-    {"name": "配角名（不含 {{name1}} 与 {{name2}}）", "aliases": ["别称/称呼"], "role": "身份/职业", "age": "", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "status": "现状：在场/离开/死亡等", "knows": "知情范围：知道哪些秘密", "floor": 该信息来自哪一楼的楼层号}
+    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "status": "现状：在场/离开/死亡等", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
   "items": [
     {"name": "物件名", "holder": "现在在谁手里", "status": "状态", "meaning": "对剧情或人物的意义", "floor": 楼层号}
@@ -456,8 +473,14 @@
 }
 
 切分规则：
-- 按事件切，不按楼切。同一件事跨多楼（一场争吵、一次亲密、一段对话）合成一条；一楼里有两件独立的事就拆两条。本段通常 1–{{max_events}} 条。
-- people / items 只填本段出现了新信息或有变化的，某字段没有新信息就留空字符串；没有就给空数组。已有档案里的人，名字要写得一模一样。
+- 按事件切，不按楼切。同一件事跨多楼（一场争吵、一次亲密、一段对话）合成一条；一楼里有两件独立的事就拆两条。本段 {{floor_count}} 楼，事件应有 {{min_events}}–{{max_events}} 条；宁可多切几条具体的，不要合成一条概括的。
+
+档案规则：
+- cast 是点名表：本段每一个有名字或固定称呼的人都要在，包括只被提到、没到场的。漏一个人比多写十个龙套更糟。
+- tier 按对剧情的影响判，不按是否在场：不在场但影响了事件走向的人（打电话提醒、发消息、被反复提起的亲属）算主或配；在场但只提供服务、没有自己意图的人（店员、司机、随从）算龙套。
+- people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键。没变化的人不必出现在 people 里，但必须出现在 cast 里。
+- 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
+- views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
 
 等级标准（按语义重要度，不按篇幅）：
 S = 不可逆事实：死亡/告白成立/关系定名/身份揭露/立誓承诺/任何『第一次』。永不遗忘。
@@ -477,7 +500,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     const personLabel = k => PERSON_LABEL[k].replace('{{user}}', getCtx().name1 || '{{user}}').replace('{{char}}', getCtx().name2 || '{{char}}');
 
     function rosterText(data) {
-        const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
+        const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${x.tier ? `[${x.tier}]` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
         const i = data.items.map(x => x.name);
         return [p.length ? `人物：${p.join('、')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
     }
@@ -505,6 +528,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             floor_range: n ? (n > 1 ? `#${floors[0].idx}–#${floors[n - 1].idx}` : `#${floors[0].idx}`) : '',
             floor_count: String(n),
             material: floors.map(floorMaterial).join('\n\n'),
+            min_events: String(minEventsFor(n)),
             max_events: String(clamp(Math.ceil(n / 2), 2, 12)),
             directive: settings.directive?.trim() ? `\n\n## 额外要求\n${settings.directive.trim()}` : '',
         };
@@ -517,6 +541,8 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     const asArr = v => Array.isArray(v) ? v.map(x => String(x).trim()).filter(Boolean) : [];
     const norm = s => String(s || '').trim().toLowerCase();
+    // 事件密度下限：每 minEventsPer 个 AI 楼至少 1 条；0 = 不核验
+    const minEventsFor = n => { const per = Number(settings.minEventsPer) || 0; return per > 0 ? Math.max(1, Math.ceil(n / per)) : 1; };
 
     function applyEvent(e, obj, recap, recentIds) {
         e.story_time = String(obj.story_time || '').trim() || recap.storyTime || '';
@@ -548,34 +574,71 @@ C = 日常、闲聊、氛围、无后果的互动。
     const findItem = (data, name) => { const n = norm(name); return n ? data.items.find(x => norm(x.name) === n) || null : null; };
 
     // 人物志/物件/关系现状合并：同实体同字段，新的非空值覆盖旧值并更新来源楼层号；主角不建档，{{char}} 只更新关系行
-    function mergeEntities(data, obj, w, byIdx) {
+    // 顺序：cast 点名表（建档 + 档位 + 别称）→ people 字段更新（含 arc / views）→ items → 事件 characters 反哺（漏点名的也建档）
+    function mergeEntities(data, obj, w, byIdx, made = []) {
         const ctx = getCtx();
         const lastIdx = w.floors[w.floors.length - 1];
         const floorOf = v => { const n = Number(v); return byIdx.has(n) ? n : lastIdx; };
         const dateOf = i => byIdx.get(i)?.send_date || '';
         const setF = (ent, key, val, idx) => { const v = String(val || '').trim(); if (v) ent.f[key] = { v, idx, date: dateOf(idx) }; };
         const me = norm(ctx.name1), them = norm(ctx.name2);
+        const isLead = n => n === me || n === them;
+        const touch = (ent, idx) => { ent.last_idx = Math.max(ent.last_idx || 0, idx); if (ent.first_idx == null || idx < ent.first_idx) { ent.first_idx = idx; ent.first_date = dateOf(idx); } ent.updated_at = Date.now(); };
+        const addAliases = (ent, list) => { for (const a of list) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a)) && !isLead(norm(a))) ent.aliases.push(a); };
+        // 找到或新建；若按别称命中且模型明确把档案里的旧名列为别称，则升级为真名（「陆母」→「王秀英」）
+        const upsertPerson = (name, aliases, idx) => {
+            const n = norm(name);
+            if (!n || isLead(n)) return null;
+            let ent = findPerson(data, name);
+            if (!ent) {
+                for (const a of aliases) { ent = findPerson(data, a); if (ent) break; }
+                if (ent) { addAliases(ent, [ent.name]); ent.name = name; }   // 新名字带着旧档案的名字/别称来 → 改名
+            }
+            if (!ent) {
+                ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', seen: 0, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                data.people.push(ent);
+            }
+            if (!ent.views || typeof ent.views !== 'object') ent.views = {};
+            addAliases(ent, aliases);
+            touch(ent, idx);
+            return ent;
+        };
         const rel = String(obj.relation || '').trim();
         if (rel) data.relation = { v: rel, idx: lastIdx, date: dateOf(lastIdx) };
+        const seenThisWin = new Set();
+        for (const c of (Array.isArray(obj.cast) ? obj.cast : [])) {
+            const name = String(c?.name || '').trim();
+            if (!name) continue;
+            const seen = asArr(c.seen).map(Number).filter(i => byIdx.has(i));
+            const idx = seen.length ? Math.max(...seen) : lastIdx;
+            const ent = upsertPerson(name, asArr(c.aliases), idx);
+            if (!ent) continue;
+            if (seen.length) { const first = Math.min(...seen); if (first < ent.first_idx) { ent.first_idx = first; ent.first_date = dateOf(first); } }
+            const tier = String(c.tier || '').trim();
+            if (TIERS.includes(tier)) ent.tier = tier;
+            if (!fv(ent, 'role')) setF(ent, 'role', c.role, idx);
+            seenThisWin.add(ent.id);
+        }
         for (const p of (Array.isArray(obj.people) ? obj.people : [])) {
             const name = String(p?.name || '').trim();
             if (!name) continue;
             const n = norm(name);
-            if (n === me) continue;
             if (n === them) {
                 const r = String(p.rel_user || '').trim();
                 if (!rel && r) data.relation = { v: r, idx: floorOf(p.floor), date: dateOf(floorOf(p.floor)) };
                 continue;
             }
             const idx = floorOf(p.floor);
-            let ent = findPerson(data, name);
-            if (!ent) {
-                ent = { id: uid('p'), name, aliases: [], f: {}, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
-                data.people.push(ent);
-            }
-            for (const a of asArr(p.aliases)) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a))) ent.aliases.push(a);
+            const ent = upsertPerson(name, asArr(p.aliases), idx);
+            if (!ent) continue;
             for (const k of PERSON_FIELDS) setF(ent, k, p[k], idx);
-            ent.last_idx = Math.max(ent.last_idx || 0, idx); ent.updated_at = Date.now();
+            for (const v of (Array.isArray(p.views) ? p.views : [])) {
+                const to = String(v?.to || '').trim(), text = String(v?.v || '').trim();
+                if (!to || !text || norm(to) === norm(ent.name)) continue;
+                const trend = TRENDS.includes(String(v.trend || '').trim()) ? String(v.trend).trim() : '';
+                ent.views[to] = { v: text, trend, idx, date: dateOf(idx) };
+            }
+            seenThisWin.add(ent.id);
         }
         for (const it of (Array.isArray(obj.items) ? obj.items : [])) {
             const name = String(it?.name || '').trim();
@@ -589,9 +652,44 @@ C = 日常、闲聊、氛围、无后果的互动。
             for (const k of ITEM_FIELDS) setF(ent, k, it[k], idx);
             ent.last_idx = Math.max(ent.last_idx || 0, idx); ent.updated_at = Date.now();
         }
+        // 事件里点到的人，点名表漏了也建档（只有名字和楼层）
+        for (const e of made) {
+            const idx = e.src?.idx ?? lastIdx;
+            for (const name of (e.characters || [])) {
+                const ent = upsertPerson(name, [], idx);
+                if (ent) seenThisWin.add(ent.id);
+            }
+        }
+        for (const id of seenThisWin) { const ent = data.people.find(p => p.id === id); if (ent) ent.seen = (ent.seen || 0) + 1; }
     }
 
-    // 一个窗口的返回：events → 条目（替换该窗口旧条目），再合并档案
+    // 零网络补档：把已有事件条目里点到的非主角名字全部建档（老聊天不重跑也能先把名单补齐）
+    function backfillPeople() {
+        const data = getData(); if (!data) return 0;
+        const ctx = getCtx();
+        const me = norm(ctx.name1), them = norm(ctx.name2);
+        const chat = ctx.chat || [];
+        const before = data.people.length;
+        for (const e of data.entries) {
+            if (e.status !== 'ok') continue;
+            const idx = e.src?.idx ?? 0;
+            for (const name of (e.characters || [])) {
+                const n = norm(name);
+                if (!n || n === me || n === them) continue;
+                let ent = findPerson(data, name);
+                if (!ent) {
+                    ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                    data.people.push(ent);
+                }
+                ent.seen = (ent.seen || 0) + 1;
+                if (idx < ent.first_idx) ent.first_idx = idx;
+                ent.last_idx = Math.max(ent.last_idx || 0, idx);
+            }
+        }
+        return data.people.length - before;
+    }
+
+    // 一个窗口的返回：events → 条目（替换该窗口旧条目），再合并档案；事件太少视为输出不合格（走拆半）
     function applyWindowResult(w, obj, inputs, recent) {
         const data = getData();
         const events = Array.isArray(obj.events) ? obj.events : Array.isArray(obj.entries) ? obj.entries : null;
@@ -611,9 +709,11 @@ C = 日常、闲聊、氛围、无后果的互动。
             made.push(e);
         });
         if (!made.length) throw Object.assign(new Error('事件摘要全部过短'), { split: true });
+        const need = minEventsFor(inputs.length);
+        if (made.length < need && inputs.length > 1) throw Object.assign(new Error(`事件太少（${made.length}/${need}），材料被过度压缩`), { split: true });
         data.entries = data.entries.filter(e => e.win !== w.id).concat(made);
         sortEntries(data);
-        mergeEntities(data, obj, w, byIdx);
+        mergeEntities(data, obj, w, byIdx, made);
     }
 
     /* ================= 入库（窗口切分 / 一次跑到底） ================= */
@@ -710,8 +810,30 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!inputs.length) { w.status = 'orphan'; w.last_error = '楼层已不存在'; return; }
         if (!inputs.some(f => f.content)) { w.status = 'failed'; w.last_error = '正文为空'; w.attempts = MAX_ATTEMPTS; return; }
         const recent = data.entries.filter(x => x.status === 'ok' && !x.manual && x.src.idx < w.floors[0]).slice(-3);
+        // 最近几次原始回复留档，诊断「模型到底返回了什么」
+        const keepRaw = (r, note) => {
+            if (!Array.isArray(data.rawLog)) data.rawLog = [];
+            data.rawLog.unshift({ at: Date.now(), win: winLabel(w), model: settings.api.model, finish: r.finish || '', note: note || '', text: String(r.text || '').slice(0, RAW_LOG_CHARS) });
+            data.rawLog.length = Math.min(data.rawLog.length, RAW_LOG_MAX);
+        };
         try {
-            const raw = await callApi(buildMessages({ floors: inputs, recent, data }));
+            const messages = buildMessages({ floors: inputs, recent, data });
+            let r = await callApi(messages);
+            // 库在调用期间被清空/切换（清空按钮、切聊天）：结果作废，不写进新库
+            if (getData() !== data) { w.status = 'pending'; w.last_error = '库已重置，本次结果作废'; return; }
+            keepRaw(r);
+            if (r.finish === 'length') {
+                // 输出撞上限：先带长度约束重来一次，仍截断再交给拆半
+                log('输出被截断，压缩重试', winLabel(w));
+                r = await callApi(messages.concat([
+                    { role: 'assistant', content: r.text.slice(0, 2000) },
+                    { role: 'user', content: '上面的输出被截断了。重新输出完整的 JSON：键的顺序与内容要求不变，每条 summary 压到 100 字以内，cast 一个都不能少；只输出 JSON。' },
+                ]));
+                if (getData() !== data) { w.status = 'pending'; w.last_error = '库已重置，本次结果作废'; return; }
+                keepRaw(r, '压缩重试');
+                if (r.finish === 'length') throw Object.assign(new Error('输出两次被截断（max_tokens 太小或窗口太大）'), { split: true });
+            }
+            const raw = r.text;
             const obj = parseJson(raw);
             if (!obj) {
                 if (isRefusal(raw)) throw Object.assign(new Error('疑似拒答：' + raw.slice(0, 80)), { refused: true, split: true });
@@ -767,9 +889,10 @@ C = 日常、闲聊、氛围、无后果的互动。
             log('总结', source, queue.length, '个窗口', run.total, '楼');
             refreshStatus();
             while (queue.length) {
-                if (run.stop || getCtx().chatId !== chatId) break;
+                if (run.stop || getCtx().chatId !== chatId || getData() !== data) break;
                 const w = queue.shift();
                 await runWindow(w);
+                if (getData() !== data) break;   // 调用期间库被清空：窗口已作废，不再计数
                 const span = spanOf(chat, w.floors);
                 if (w.status === 'ok') { okWins++; floorsOk += span; floorsDone += span; }
                 else if (w.split && w.floors.length > 1) { queue.unshift(...splitWindow(data, w)); split++; log('拆分重试', winLabel(w)); }
@@ -845,6 +968,15 @@ C = 日常、闲聊、氛围、无后果的互动。
             else if (w.status === 'orphan') { w.status = winEntries(data, w.id).length ? 'ok' : 'stale'; changed = true; }
         }
         const max = Math.max(0, chat.length - 1);
+        // 窗口已不存在的条目：其楼层若已被别的正常窗口覆盖，就是清空/重跑留下的残影，直接删；否则保留为孤立
+        const cov = coverage(data);
+        const before = data.entries.length;
+        data.entries = data.entries.filter(e => {
+            if (e.manual || !e.win || winById(data, e.win)) return true;
+            const dates = e.src?.dates || [];
+            return !(dates.length && dates.every(d => cov.has(d)));
+        });
+        if (data.entries.length !== before) { changed = true; log('清理残影条目', before - data.entries.length); }
         for (const e of data.entries) {
             if (e.manual) {
                 if ((e.src?.idx ?? 0) > max) { e.src.idx = max; changed = true; }
@@ -965,11 +1097,14 @@ C = 日常、闲聊、氛围、无后果的互动。
         const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
         if (!full) return `${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}`;
         const parts = PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`);
+        const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
+        if (views.length) parts.push(`看法：${views.join('；')}`);
         return `- ${head}${parts.length ? '｜' + parts.join('｜') : ''}`;
     }
     const fmtItem = it => `- ${it.name}${ITEM_FIELDS.filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`;
+    const isExtra = p => p.tier === '龙套';
 
-    // 关系现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；
+    // 关系现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；龙套不进注入块
     // 总字数受 entityChars 约束，放不下的完整卡按最久未露面降为一行
     function entityLines(data, chat) {
         const ctx = getCtx();
@@ -977,10 +1112,11 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (data.relation?.v) lines.push('', '## 关系现状', `- ${ctx.name2 || '{{char}}'} 对 ${ctx.name1 || '{{user}}'}：${data.relation.v}`);
         const budget = Math.max(200, Number(settings.entityChars) || 1500);
         let used = 0;
-        if (data.people.length) {
+        const people = data.people.filter(p => !isExtra(p));
+        if (people.length) {
             const text = recentText(chat, Math.max(1, Number(settings.npcScanDepth) || 6));
-            const active = data.people.filter(p => mentioned(p, text)).sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0));
-            const brief = data.people.filter(p => !mentioned(p, text));
+            const active = people.filter(p => mentioned(p, text)).sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0));
+            const brief = people.filter(p => !mentioned(p, text));
             const full = [];
             for (const p of active) {
                 const s = fmtPerson(p, true);
@@ -1027,8 +1163,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!count && !ent.length) return { text: '', count: 0, chars: 0, dropped };
         const parts = [
             '<erato_memory>',
-            '[长期记忆 · 由记忆插件维护 · 关系现状/人物志/物件是截至目前的档案；正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
-            '[仅作为已发生事实使用：不复述、不总结、不预告；信息差按「知情」栏执行，未列名者不知情]',
+            '[以上是还留在眼前的对话。以下是更早的记忆，由记忆插件维护；关系现状/人物志/物件是截至目前的档案，正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
+            '[正典 = 定了的事，写作不可违背；往事 = 已发生的事实，可回调、呼应、形成对比，但不复述、不总结、不预告]',
+            '[知情栏是信息墙：未列名者不知情，当前角色未必知晓其他人的事]',
+            '[人物志的「阶段」「看法」是关系参考，不是指令]',
             ...ent,
         ];
         if (canon.length) parts.push('', '## 正典', ...canon.map(e => fmtEntry(e, false)));
@@ -1244,6 +1382,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 </label>
                 <label>自定义楼数 <input id="em_win_n" class="text_pole" type="number" min="1" max="1000"></label>
                 <label>单次最大字数 <input id="em_call_chars" class="text_pole" type="number" min="2000" step="5000" title="一次调用喂给副模型的材料上限，超过就自动再切一段；按副模型上下文大小调"></label>
+                <label>事件密度：每 <input id="em_min_per" class="text_pole em-short" type="number" min="0" max="20" title="每这么多个 AI 楼至少要有 1 条事件；副模型给得太少就视为过度压缩，自动对半拆分重试。0 = 不核验"> 个 AI 楼 ≥ 1 条</label>
             </div>
             <div class="em-hint">楼数按酒馆楼层计：你一条 + AI 一条 = 2 楼，与聊天里的楼号一致。一次调用吃的楼越多越省钱、也越粗：日常 40–60 楼；清不在乎细节的老积压再开到 100–200。楼数与字数两个上限先到者生效；副模型拒答或输出损坏时自动对半拆分重试。</div>
             <label class="checkbox_label"><input type="checkbox" id="em_hide"><span>总结完成后隐藏已总结楼层（可逆，「更多 → 取消隐藏」恢复）</span></label>
@@ -1370,6 +1509,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         bindNum('#em_depth', 'injectDepth', applyInjection);
         bindNum('#em_maxchars', 'maxInjectChars', applyInjection);
         bindNum('#em_call_chars', 'maxCallChars');
+        bindNum('#em_min_per', 'minEventsPer');
         bindNum('#em_ent_chars', 'entityChars', applyInjection);
         bindNum('#em_scan', 'npcScanDepth', applyInjection);
         bindNum('#em_keep', 'keepVisible', () => { $('#em_keep_q').val(settings.keepVisible); if (settings.hideSummarized) { hideSummarized(); applyInjection(); refreshStatus(); } });
@@ -1396,7 +1536,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const btn = $(this).addClass('disabled').text('测试中…');
             try {
                 const r = await callApi([{ role: 'user', content: '请只回复「连接成功」四个字。' }], 50);
-                toast('success', `副 API 可用：${r.slice(0, 60)}`);
+                toast('success', `副 API 可用：${r.text.slice(0, 60)}`);
             } catch (err) {
                 toast('error', `副 API 失败：${err.message}`);
             } finally {
@@ -1451,7 +1591,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     let addingManual = false;
     const expanded = new Set();
     const filter = { grade: '', type: '', status: '', q: '' };
-    const sections = { entities: true, timeline: true, preview: false };
+    const sections = { entities: true, timeline: true, preview: false, raw: false };
 
     function addPanel() {
         const html = `
@@ -1481,6 +1621,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 </div>
                 <div id="em_more_menu" class="em-menu" style="display:none">
                     <div class="em-menu-item" data-act="add">手动新增一条记忆</div>
+                    <div class="em-menu-item" data-act="backfill">从事件补人物（零网络，把事件里点到的人建档）</div>
                     <div class="em-menu-item" data-act="retry">重试失败的段落</div>
                     <div class="em-menu-item" data-act="unhide">取消隐藏（恢复本插件藏起来的楼层）</div>
                     <div class="em-menu-item" data-act="export">导出 JSON</div>
@@ -1517,6 +1658,10 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <div class="em-section" data-sec="preview">
                     <div class="em-sec-head"><span>本轮注入预览</span><span class="em-sec-arrow"></span></div>
                     <div class="em-sec-body"><pre id="em_preview" class="em-preview"></pre></div>
+                </div>
+                <div class="em-section" data-sec="raw">
+                    <div class="em-sec-head"><span>副 API 最近的原始回复（诊断用）</span><span class="em-sec-arrow"></span></div>
+                    <div class="em-sec-body"><pre id="em_raw" class="em-preview"></pre></div>
                 </div>
             </div>
             <div id="em_view_cfg" class="em-view em-cfg" style="display:none">
@@ -1748,16 +1893,21 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (!f?.v) return '';
             return `<div class="em-ent-row"><span class="em-ent-k">${esc(label(k))}</span><span class="em-ent-v">${esc(f.v)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
         }).join('');
+        const views = kind === 'p' ? Object.entries(x.views || {}).filter(([, v]) => v?.v) : [];
+        const viewRows = open ? '' : views.map(([to, v]) => `<div class="em-ent-row"><span class="em-ent-k">对${esc(to)}</span><span class="em-ent-v">${v.trend ? `[${esc(v.trend)}] ` : ''}${esc(v.v)}</span><span class="em-floor em-jump" data-idx="${v.idx}" title="点击跳到该楼">#${v.idx}</span></div>`).join('');
         const alias = kind === 'p' && x.aliases?.length ? `<span class="em-ent-alias">（${esc(x.aliases.join('/'))}）</span>` : '';
+        const tier = kind === 'p' && x.tier ? `<span class="em-tier em-tier-${x.tier === '龙套' ? 'x' : x.tier === '主' ? 'a' : 'b'}">${esc(x.tier)}</span>` : '';
         return `
-        <div class="em-ent" data-id="${x.id}">
-            <div class="em-ent-head"><span class="em-ent-name">${kind === 'p' ? '👤' : '📦'} ${esc(x.name)}${alias}</span><span class="em-floor">首见 #${x.first_idx ?? '?'}</span></div>
+        <div class="em-ent${kind === 'p' && x.tier === '龙套' ? ' em-ent-extra' : ''}" data-id="${x.id}">
+            <div class="em-ent-head"><span class="em-ent-name">${kind === 'p' ? '👤' : '📦'} ${esc(x.name)}${alias}${tier}</span><span class="em-floor">首见 #${x.first_idx ?? '?'}${x.seen ? ` · ${x.seen} 段` : ''}</span></div>
             ${open ? `<div class="em-ent-body">
                 <label>名字<input class="text_pole em-x-name" value="${esc(x.name)}"></label>
-                ${kind === 'p' ? `<label>别称（顿号分隔）<input class="text_pole em-x-alias" value="${esc((x.aliases || []).join('、'))}"></label>` : ''}
+                ${kind === 'p' ? `<label>别称（顿号分隔）<input class="text_pole em-x-alias" value="${esc((x.aliases || []).join('、'))}"></label>
+                <label>档位<select class="em-x-tier"><option value="">（未定）</option>${TIERS.map(t => `<option value="${t}" ${x.tier === t ? 'selected' : ''}>${t}${t === '龙套' ? '（不注入）' : ''}</option>`).join('')}</select></label>` : ''}
                 ${rows}
+                ${kind === 'p' ? `<label>对他人的看法（每行：对象｜趋势｜一句话；趋势可空）<textarea class="text_pole em-x-views" rows="3">${esc(views.map(([to, v]) => `${to}｜${v.trend || ''}｜${v.v}`).join('\n'))}</textarea></label>` : ''}
                 <div class="em-actions"><div class="menu_button" data-xact="save">保存</div><div class="menu_button em-danger" data-xact="del">删除</div></div>
-            </div>` : `<div class="em-ent-rows">${rows}</div>`}
+            </div>` : `<div class="em-ent-rows">${rows}${viewRows}</div>`}
         </div>`;
     }
 
@@ -1834,7 +1984,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const data = getData();
         const list = $('#em_list');
         const form = $('#em_manual_form');
-        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_ents').html(''); $('#em_preview').text(''); return; }
+        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_ents').html(''); $('#em_preview').text(''); $('#em_raw').text(''); return; }
         const chat = getCtx().chat || [];
         const depths = visibleDepths(chat);
         renderEntities(data);
@@ -1853,6 +2003,9 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (addingManual) form.show().html(manualFormHtml()); else form.hide().empty();
 
         $('#em_preview').text(lastInject.text || '（本轮没有可注入的内容）');
+        $('#em_raw').text((data.rawLog || []).length
+            ? data.rawLog.map(r => `[${new Date(r.at).toLocaleString()}] ${r.win} · ${r.model || ''}${r.finish ? ` · finish=${r.finish}` : ''}${r.note ? ` · ${r.note}` : ''}\n${r.text}`).join('\n\n========\n\n')
+            : '（还没有调用记录）');
 
         const c = counts();
         const alert = $('#em_alert');
@@ -1958,7 +2111,20 @@ C = 日常、闲聊、氛围、无后果的互动。
         const el = $(`#em_ents .em-ent[data-id="${id}"]`);
         if (act === 'save') {
             x.name = el.find('.em-x-name').val().trim() || x.name;
-            if (kind === 'p') x.aliases = el.find('.em-x-alias').val().split(/[、,，/]/).map(s => s.trim()).filter(Boolean);
+            if (kind === 'p') {
+                x.aliases = el.find('.em-x-alias').val().split(/[、,，/]/).map(s => s.trim()).filter(Boolean);
+                const tier = String(el.find('.em-x-tier').val() || '');
+                x.tier = TIERS.includes(tier) ? tier : '';
+                const views = {};
+                for (const line of String(el.find('.em-x-views').val() || '').split('\n')) {
+                    const [to, trend, ...rest] = line.split(/[｜|]/).map(s => s.trim());
+                    const v = rest.join('｜').trim();
+                    if (!to || !v) continue;
+                    const old = x.views?.[to];
+                    views[to] = { v, trend: TRENDS.includes(trend) ? trend : '', idx: old?.idx ?? x.last_idx ?? 0, date: old?.date || '', manual: true };
+                }
+                x.views = views;
+            }
             el.find('.em-x-f').each(function () {
                 const k = $(this).data('k');
                 const v = this.value.trim();
@@ -1983,6 +2149,11 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (act === 'cfg') return showTab('cfg');
         if (!data) return toast('warning', '当前没有打开聊天');
         if (act === 'add') { addingManual = true; sections.timeline = true; applySections(); renderPanel(); }
+        else if (act === 'backfill') {
+            const n = backfillPeople();
+            saveData(); applyInjection(); renderPanel(); refreshStatus();
+            toast(n ? 'success' : 'info', n ? `已从事件补出 ${n} 个人物（只有名字和楼层，档位与字段等下次总结补全）` : '事件里点到的人都已有档案');
+        }
         else if (act === 'retry') {
             let n = 0;
             for (const w of data.windows) if (['failed', 'refused'].includes(w.status)) { w.attempts = 0; n++; }
@@ -2007,6 +2178,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             $('#em_import_file').val('').trigger('click');
         } else if (act === 'clear') {
             if (!await confirmBox(`清空当前聊天的全部记忆（${data.entries.length} 条、${data.people.length} 个人物、${data.items.length} 件物件）？不可恢复（建议先导出）。本插件隐藏的楼层会一并恢复显示`)) return;
+            run.stop = true;   // 正在飞的调用返回后会发现库已换，结果作废
             unhideAll();
             getCtx().chatMetadata[META_KEY] = defaultData();
             saveData(); applyInjection(); renderPanel(); refreshStatus();
@@ -2100,8 +2272,8 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 控制台排障入口（手机上可配合 Eruda）：eratoMemory_debug.buildBlock() 等
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
-        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, mergeEntities, coverage, floorSpan, spanOf, winFloors,
-        visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings,
+        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, mergeEntities, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
+        visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
     };
 
     jQuery(() => {

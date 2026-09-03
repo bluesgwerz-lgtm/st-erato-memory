@@ -1,4 +1,4 @@
-// Erato Memory v0.3.2 桩环境冒烟测试：不依赖酒馆，只验证纯逻辑（楼数口径 / 窗口切分 / 拆半重试 / 档案合并 / 对账 / 隐藏 / 注入 / 迁移）
+// Erato Memory v0.3.3 桩环境冒烟测试：不依赖酒馆，只验证纯逻辑（楼数口径 / 窗口切分 / 拆半重试 / 点名表与档案合并 / 事件密度 / 截断重试 / 清空世代 / 残影清理 / 对账 / 隐藏 / 注入 / 迁移）
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -34,27 +34,41 @@ global.window = global;
 global.innerWidth = 400; global.innerHeight = 800;
 global.addEventListener = () => {};
 
-// ---- 假副 API：材料里超过 2 楼就「拒答」（逼出拆半重试），否则每楼回一条事件 + 档案 ----
+// ---- 假副 API：材料里超过 2 楼就「拒答」（逼出拆半重试），否则每楼回一条事件 + 点名表 + 档案 ----
+// mode.fewEvents：只回 1 条事件（测密度下限）；mode.finishLength：前 N 次回 finish_reason=length（测截断重试）；
+// mode.clearDuring：调用期间把库换掉（测清空世代）
 const apiLog = [];
+const mode = { fewEvents: false, finishLength: 0, clearDuring: false };
 global.fetch = async (url, opt) => {
     const body = JSON.parse(opt.body);
     const user = body.messages[1].content;
     const floors = [...user.matchAll(/【#(\d+)】/g)].map(m => Number(m[1]));
-    apiLog.push(floors);
-    let content;
+    apiLog.push({ floors, msgs: body.messages.length, retry: body.messages.length > 2 && /截断/.test(body.messages[body.messages.length - 1].content) });
+    if (mode.clearDuring) { mode.clearDuring = false; ctx.chatMetadata.eratoMemory = { version: 2 }; }
+    let content, finish = 'stop';
+    const ev = i => ({ floors: [i], story_time: `3月${i}日 · 午后 · 厨房`, type: 'plot', title: `题${i}`, summary: `第${i}楼发生的事情，陆衍在厨房里做了决定。`, characters: ['陆衍', i === 2 ? '小刘' : '用户'], grade: i === 2 ? 'S' : 'B', tags: ['厨房'] });
     if (floors.length > 2) content = '抱歉，我无法协助处理这段内容。';
+    else if (mode.finishLength > 0) { mode.finishLength--; finish = 'length'; content = '{"cast": [{"name": "陆衍"'; }
     else content = JSON.stringify({
-        events: floors.map(i => ({ floors: [i], story_time: `3月${i}日 · 午后 · 厨房`, type: 'plot', title: `题${i}`, summary: `第${i}楼发生的事情，陆衍在厨房里做了决定。`, characters: ['陆衍'], grade: i === 2 ? 'S' : 'B', tags: ['厨房'] })),
+        cast: [
+            { name: '陆衍', aliases: ['小衍'], tier: '配', role: '邻居', seen: floors },
+            { name: '周远', tier: '配', role: '医生', seen: [floors[0]] },
+            { name: '司机老王', tier: '龙套', role: '司机', seen: [floors[0]] },
+            { name: 'Char', tier: '主' }, { name: '用户', tier: '主' },
+            floors[0] <= 5 ? { name: '陆母', aliases: ['母亲'], tier: '配', role: '用户的母亲', seen: [floors[0]] }
+                : { name: '王秀英', aliases: ['陆母'], tier: '配', seen: [floors[0]] },
+        ],
+        events: (mode.fewEvents ? [floors[0]] : floors).map(ev),
         relation: `对用户从戒备转为依赖（#${floors[floors.length - 1]}）`,
         people: [
-            { name: '陆衍', aliases: ['小衍'], role: '邻居', rel_user: '暧昧', status: '在场', floor: floors[0] },
+            { name: '陆衍', aliases: ['小衍'], role: '邻居', rel_user: '暧昧', status: '在场', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
             { name: '周远', role: '医生', floor: floors[0] },
             { name: 'Char', rel_user: '不该建档' },
             { name: '用户', role: '不该建档' },
         ],
         items: [{ name: '牛皮笔袋', holder: '陆衍', status: '完好', floor: floors[0] }],
     });
-    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content }, finish_reason: finish }] }) };
 };
 
 // ---- 假酒馆 ----
@@ -143,7 +157,8 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const wins = D.planWindows(chat, data, [2, 5]);
         const floors = wins[0].floors.map(i => ({ idx: i, userText: 'U', content: 'C正文' + i, recap: { storyTime: '3月1日', narrative: 'N' } }));
         const msgs = D.buildMessages({ floors, recent: [], data });
-        assert.ok(!/\{\{(name1|name2|roster|relation|recent|floor_range|floor_count|material|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
+        assert.ok(!/\{\{(name1|name2|roster|relation|recent|floor_range|floor_count|material|min_events|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
+        assert.ok(msgs[1].content.includes('"cast"') && msgs[1].content.includes('亲属'), '模板应含点名表与亲属明文');
         assert.ok(msgs[1].content.includes('【#2】') && msgs[1].content.includes('【#5】') && msgs[1].content.includes('#2–#5') && msgs[1].content.includes('用户角色：用户'));
     });
     t('自定义模板缺 {{material}} 时退回默认', () => {
@@ -160,27 +175,42 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         await D.ingest('manual');
         assert.ok(data.windows.every(w => w.status === 'ok'), '窗口应全部 ok：' + data.windows.map(w => w.status).join(','));
         assert.deepStrictEqual(data.windows.map(w => w.floors), [[0, 2], [5], [7, 9], [11, 13], [15, 17], [19]]);
-        assert.ok(apiLog.some(f => f.length === 5), '应先尝试过 5 个 AI 楼（8 楼）的窗口');
+        assert.ok(apiLog.some(f => f.floors.length === 5), '应先尝试过 5 个 AI 楼（8 楼）的窗口');
         assert.strictEqual(D.uncoveredFloors(chat, data, true).length, 0);
         assert.strictEqual(data.entries.length, 10);
         assert.ok(data.entries.every(e => e.status === 'ok' && e.win && e.src.floors.length === 1));
         assert.strictEqual(data.entries.find(e => e.src.idx === 2).grade, 'S');
     });
-    t('档案合并：主角不建档，关系现状取最后一窗，同实体覆盖并记楼层号', () => {
-        assert.strictEqual(data.people.length, 2, '只有两个 NPC：' + data.people.map(p => p.name).join(','));
+    t('档案合并：主角不建档，点名表建档带档位，事件里点到的人也建档，别称升级真名，views/arc 落地', () => {
+        const names = data.people.map(p => p.name);
+        assert.deepStrictEqual(names.sort(), ['司机老王', '周远', '小刘', '王秀英', '陆衍'].sort(), '人物：' + names.join(','));
         const lu = data.people.find(p => p.name === '陆衍');
         assert.deepStrictEqual(lu.aliases, ['小衍']);
+        assert.strictEqual(lu.tier, '配');
         assert.strictEqual(lu.f.role.v, '邻居');
         assert.strictEqual(lu.f.role.idx, 19, '最后一窗覆盖后来源楼应为 19');
+        assert.strictEqual(lu.f.arc.v, '试探期');
+        assert.strictEqual(lu.views['用户'].trend, '亲密'); assert.strictEqual(lu.views['周远'].v, '提防');
+        assert.ok(!lu.views['陆衍'], '对自己的看法不记');
         assert.strictEqual(lu.first_idx, 0);
+        assert.ok(lu.seen >= 6, '登场段数应累计：' + lu.seen);
+        const mom = data.people.find(p => p.name === '王秀英');
+        assert.ok(mom, '真名出现后应改名');
+        assert.ok(mom.aliases.includes('陆母') && mom.aliases.includes('母亲'), '旧写法与称呼都进别称：' + mom.aliases.join(','));
+        assert.strictEqual(mom.f.role.v, '用户的母亲', '点名表只在 role 为空时补');
+        assert.strictEqual(mom.first_idx, 0);
+        const liu = data.people.find(p => p.name === '小刘');
+        assert.ok(liu && liu.first_idx === 2 && !liu.tier, '事件 characters 反哺建档，只有名字与楼层');
+        assert.strictEqual(data.people.find(p => p.name === '司机老王').tier, '龙套');
         assert.strictEqual(data.items.length, 1);
         assert.strictEqual(data.items[0].f.holder.v, '陆衍');
         assert.ok(data.relation.v.includes('#19'), '关系现状来自最后一窗');
         assert.strictEqual(data.relation.idx, 19);
+        assert.ok(data.rawLog.length === 3 && data.rawLog[0].finish === 'stop', '原始回复留档 3 条');
     });
     t('计数：已总结 18 楼（10 个 AI 楼）/ 10 条，待总结 0', () => {
         const c = D.counts();
-        assert.strictEqual(c.done, 18); assert.strictEqual(c.events, 10); assert.strictEqual(c.todo, 0); assert.strictEqual(c.people, 2);
+        assert.strictEqual(c.done, 18); assert.strictEqual(c.events, 10); assert.strictEqual(c.todo, 0); assert.strictEqual(c.people, 5);
     });
     await ta('自动模式：未攒够间隔不开新窗口，攒够才开（间隔按酒馆楼层计）', async () => {
         chat.push(mkMsg(21, true), mkMsg(22, false), mkMsg(23, true), mkMsg(24, false));  // AI 22(depth 2), 24(depth 0)
@@ -247,14 +277,18 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(ctx.savedChat, 1, '保存一次聊天');
     });
     t('再次调用幂等', () => { assert.strictEqual(D.hideSummarized(), 0); assert.strictEqual(ctx.savedChat, 1); });
-    t('注入：隐藏楼层的条目全部注入，S 进正典；关系现状/人物志/物件在前，提到的人物出完整卡，其余只列名', () => {
+    t('注入：隐藏楼层的条目全部注入，S 进正典；档案在前，提到的人物出完整卡（含阶段/看法），其余只列名，龙套不注入', () => {
         D.applyInjection?.();
         const b = D.buildBlock();
         assert.ok(b.text.includes('题13') && b.text.includes('题2'), '隐藏楼层条目应注入');
         assert.ok(b.text.includes('## 正典') && b.text.includes('## 关系现状') && b.text.includes('## 人物志') && b.text.includes('## 物件'));
         assert.ok(b.text.indexOf('## 人物志') < b.text.indexOf('## 正典'));
+        assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙'), '块首四行');
         assert.ok(/- 陆衍（小衍）｜身份：邻居/.test(b.text), '陆衍在最近楼层出现，出完整卡');
-        assert.ok(b.text.includes('其他已登场：周远·医生'), '周远没露面，只列名');
+        assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
+        const brief = /其他已登场：([^\n]*)/.exec(b.text)?.[1] || '';
+        assert.ok(brief.includes('周远·医生') && brief.includes('王秀英（母亲/陆母）·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带别称）：' + brief);
+        assert.ok(!b.text.includes('司机老王'), '龙套不进注入块');
         assert.ok(b.text.includes('牛皮笔袋｜持有者：陆衍'));
         assert.ok(!b.text.includes('题22'), '#22 在正文窗口内不注入');
     });
@@ -274,6 +308,65 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(e.status, 'ok');
         assert.ok(D.buildBlock().text.includes('手动记的事'));
         e.src.idx = 999; D.reconcile(); assert.strictEqual(e.src.idx, chat.length - 1);
+    });
+
+    console.log('== 事件密度 / 截断重试 / 清空世代 / 残影清理 / 补人物 ==');
+    t('密度下限换算', () => {
+        D.settings.minEventsPer = 4;
+        assert.strictEqual(D.minEventsFor(16), 4); assert.strictEqual(D.minEventsFor(5), 2); assert.strictEqual(D.minEventsFor(1), 1);
+        D.settings.minEventsPer = 0; assert.strictEqual(D.minEventsFor(16), 1);
+        D.settings.minEventsPer = 4;
+    });
+    await ta('事件太少 → 视为过度压缩走拆半，切到单楼后通过', async () => {
+        chat.push(mkMsg(25, true), mkMsg(26, false), mkMsg(27, true), mkMsg(28, false));   // 未入库 AI 楼：24, 26, 28
+        D.settings.minEventsPer = 1; mode.fewEvents = true;
+        const n0 = apiLog.length;
+        await D.ingest('manual');
+        mode.fewEvents = false; D.settings.minEventsPer = 4;
+        const ws = data.windows.filter(w => w.floors.some(i => i >= 24));
+        assert.ok(ws.every(w => w.status === 'ok' && w.floors.length === 1), '应全部切到单楼：' + ws.map(w => w.floors.join('+') + ':' + w.status).join(' '));
+        assert.ok(apiLog.slice(n0).some(f => f.floors.length === 2), '应先试过 2 楼窗口');
+        assert.strictEqual(D.uncoveredFloors(chat, data, true).length, 0);
+    });
+    await ta('finish_reason=length → 带长度约束重来一次，成功入库并留档', async () => {
+        chat.push(mkMsg(29, true), mkMsg(30, false));
+        mode.finishLength = 1;
+        const n0 = apiLog.length;
+        await D.ingest('manual');
+        const calls = apiLog.slice(n0);
+        assert.strictEqual(calls.length, 2, '应恰好两次调用：' + calls.length);
+        assert.ok(!calls[0].retry && calls[1].retry && calls[1].msgs === 4, '第二次带截断提示');
+        const w = data.windows.find(w => w.floors.includes(30));
+        assert.strictEqual(w.status, 'ok');
+        assert.strictEqual(data.rawLog[0].note, '压缩重试'); assert.strictEqual(data.rawLog[1].finish, 'length');
+    });
+    await ta('调用期间库被清空：结果作废，不写进新库', async () => {
+        chat.push(mkMsg(31, true), mkMsg(32, false));
+        const old = D.getData();
+        mode.clearDuring = true;
+        await D.ingest('manual');
+        const fresh = D.getData();
+        assert.notStrictEqual(fresh, old, '库应已换');
+        assert.strictEqual(fresh.entries.length, 0); assert.strictEqual(fresh.windows.length, 0); assert.strictEqual(fresh.people.length, 0);
+        ctx.chatMetadata.eratoMemory = old;
+        old.windows = old.windows.filter(w => !w.floors.includes(32));
+        old.entries = old.entries.filter(e => !e.src.floors?.includes(32));
+    });
+    t('残影清理：窗口不存在且楼层已被正常窗口覆盖的条目删除；未覆盖的保留为孤立', () => {
+        const mk = (id, win, idx, dates) => ({ id, win, ord: 0, status: 'ok', manual: false, title: id, summary: id + ' 的摘要文字', grade: 'B', type: 'plot', characters: [], src: { idx, floors: [idx], dates } });
+        data.entries.push(mk('ghost', 'gone', 2, [chat[2].send_date]), mk('lonely', 'gone2', 2, ['dZ']));
+        D.reconcile();
+        assert.ok(!data.entries.some(e => e.id === 'ghost'), '残影应删除');
+        const lonely = data.entries.find(e => e.id === 'lonely');
+        assert.ok(lonely && lonely.status === 'orphan', '未覆盖的保留为孤立');
+        data.entries = data.entries.filter(e => e.id !== 'lonely');
+    });
+    t('从事件补人物：删掉的人按事件 characters 重建', () => {
+        data.people = data.people.filter(p => p.name !== '小刘');
+        assert.strictEqual(D.backfillPeople(), 1);
+        const liu = data.people.find(p => p.name === '小刘');
+        assert.ok(liu && liu.first_idx === 2 && liu.seen === 1);
+        assert.strictEqual(D.backfillPeople(), 0, '幂等');
     });
 
     console.log('== 迁移 v1 → v2 ==');
