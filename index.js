@@ -1,6 +1,6 @@
 // Erato Memory — SillyTavern 第三方扩展
 // 为 Erato 预设提供结构化长期记忆：
-//   把一段楼层（窗口，默认最多 20 楼）的正文+recap 一次交给副 API，按事件切成若干条记忆，
+//   把一段楼层（窗口，默认最多 40 楼）的正文+recap 一次交给副 API，按事件切成若干条记忆，
 //   同一次调用顺手更新人物志/物件/主角关系现状 → 存进聊天元数据随聊天文件走
 //   → 已总结的旧楼层自动隐藏（可逆），由条目按时间顺序注入回上下文
 //
@@ -31,10 +31,12 @@
     const ITEM_FIELDS = ['holder', 'status', 'meaning'];
     const ITEM_LABEL = { holder: '持有者', status: '状态', meaning: '意义' };
 
+    // 面板与设置里的「楼」都按酒馆楼层计（你一条 + AI 一条 = 2 楼）；存储与对账内部仍以 AI 楼为单位，见 floorSpan
     const DEFAULTS = {
         enabled: true,
-        autoInterval: 10,     // 攒够这么多新楼自动总结一次；0 = 只手动
-        windowFloors: 20,     // 一次副 API 调用最多吃多少楼
+        floorUnit: 'chat',    // 楼数单位标记：旧设置（AI 楼计）加载时翻倍成酒馆楼层
+        autoInterval: 20,     // 攒够这么多新楼自动总结一次；0 = 只手动
+        windowFloors: 40,     // 一次副 API 调用最多吃多少楼
         maxCallChars: 60000,  // 一次调用的材料字数上限，超过自动再切一段（防副模型上下文爆掉）
         api: { url: '', key: '', model: '', models: [], temperature: 0.3, maxTokens: 4000, timeoutSec: 120 },
         contentWindow: 6,   // 与预设 6🌸 的 minDepth 一致
@@ -56,6 +58,9 @@
     const ctx0 = getCtx();
     if (!ctx0.extensionSettings[EXT]) ctx0.extensionSettings[EXT] = {};
     const settings = ctx0.extensionSettings[EXT];
+    // v0.3.1 及之前的楼数按 AI 楼计；v0.3.2 起按酒馆楼层计，旧值翻倍才等于原来的实际行为
+    const legacyFloorUnit = Object.keys(settings).length > 0 && settings.floorUnit === undefined;
+    const hadAuto = settings.autoInterval !== undefined, hadWin = settings.windowFloors !== undefined;
     for (const key of Object.keys(DEFAULTS)) {
         if (settings[key] === undefined) settings[key] = structuredClone(DEFAULTS[key]);
     }
@@ -71,6 +76,11 @@
     if (Number(settings.api.maxTokens) <= 900) settings.api.maxTokens = DEFAULTS.api.maxTokens;
     if (Number(settings.api.timeoutSec) === 60) settings.api.timeoutSec = DEFAULTS.api.timeoutSec;
     if (settings.promptTemplate && !settings.promptTemplate.includes('{{material}}')) settings.promptTemplate = '';
+    if (legacyFloorUnit) {
+        if (hadAuto && Number(settings.autoInterval) > 0) settings.autoInterval = Number(settings.autoInterval) * 2;
+        if (hadWin) settings.windowFloors = Math.max(1, Number(settings.windowFloors) || 20) * 2;
+        settings.floorUnit = 'chat';
+    }
     const saveSettings = () => getCtx().saveSettingsDebounced();
 
     /* ================= 工具 ================= */
@@ -165,7 +175,11 @@
     const winById = (data, id) => data.windows.find(w => w.id === id) || null;
     const winEntries = (data, id) => data.entries.filter(e => e.win === id);
     const winLabel = w => w.floors.length > 1 ? `#${w.floors[0]}–#${w.floors[w.floors.length - 1]}` : `#${w.floors[0] ?? '?'}`;
-    const winFloors = ws => ws.reduce((n, w) => n + w.floors.length, 0);
+    // 一个 AI 楼在酒馆里的跨度 = 它自己 + 紧挨着前面那条用户楼（材料就是这么配对的，隐藏也是一起藏）；
+    // 开场白、续写出来的连续 AI 回复前面没有用户楼，只算 1。面板上所有「N 楼」都是跨度之和，与酒馆楼号口径一致
+    const floorSpan = (chat, idx) => (idx > 0 && chat[idx - 1]?.is_user ? 2 : 1);
+    const spanOf = (chat, idxs) => idxs.reduce((n, i) => n + floorSpan(chat, i), 0);
+    const winFloors = (ws, chat = getCtx().chat || []) => ws.reduce((n, w) => n + spanOf(chat, w.floors), 0);
 
     /* ================= 楼层文本抠取 ================= */
 
@@ -647,15 +661,15 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 要（重）跑的旧窗口：过期、排队中断的、失败/拒答且未超次数
     const retryWindows = data => data.windows.filter(w => w.status === 'stale' || (['pending', 'failed', 'refused'].includes(w.status) && w.attempts < MAX_ATTEMPTS));
 
-    // 把未入库楼层切成窗口：按顺序、不超 windowFloors 楼、材料不超 maxCallChars 字；中间隔着已入库楼层就断开。正文为空的楼直接标不入库
+    // 把未入库楼层切成窗口：按顺序、不超 windowFloors 楼（酒馆楼层计）、材料不超 maxCallChars 字；中间隔着已入库楼层就断开。正文为空的楼直接标不入库
     function planWindows(chat, data, floors) {
-        const W = Math.max(1, Number(settings.windowFloors) || 20);
+        const W = Math.max(1, Number(settings.windowFloors) || 40);
         const C = Math.max(2000, Number(settings.maxCallChars) || 60000);
         const cov = coverage(data);
         const ctx = getCtx();
         const wins = [];
-        let cur = [], chars = 0, last = -1;
-        const flush = () => { if (cur.length) wins.push(cur); cur = []; chars = 0; };
+        let cur = [], chars = 0, span = 0, last = -1;
+        const flush = () => { if (cur.length) wins.push(cur); cur = []; chars = 0; span = 0; };
         for (const idx of floors) {
             const f = floorInput(chat, idx);
             if (!f.content) { data.skip[f.send_date] = true; log('正文为空，不入库', idx); continue; }
@@ -663,8 +677,9 @@ C = 日常、闲聊、氛围、无后果的互动。
             for (let j = last + 1; last >= 0 && j < idx; j++) if (isAiFloor(chat[j], ctx) && cov.has(chat[j].send_date)) { broken = true; break; }
             if (broken) flush();
             const n = f.content.length + f.userText.length + (f.recap.narrative?.length || 0) + 40;
-            if (cur.length && (cur.length >= W || chars + n > C)) flush();
-            cur.push(f); chars += n; last = idx;
+            const s = floorSpan(chat, idx);
+            if (cur.length && (span + s > W || chars + n > C)) flush();
+            cur.push(f); chars += n; span += s; last = idx;
         }
         flush();
         return wins.map(fs => newWindow(fs.map(f => f.idx), fs.map(f => f.send_date), fs.map(f => f.hash), fs.some(f => f.fallback)));
@@ -739,7 +754,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const queue = retryWindows(data);
             const fresh = uncoveredFloors(chat, data, manual);
             const N = Math.max(0, Number(settings.autoInterval) || 0);
-            if (fresh.length && (manual || (N > 0 && fresh.length >= N))) {
+            if (fresh.length && (manual || (N > 0 && spanOf(chat, fresh) >= N))) {
                 for (const w of planWindows(chat, data, fresh)) { data.windows.push(w); queue.push(w); }
                 sortWindows(data);
             }
@@ -748,16 +763,17 @@ C = 日常、闲聊、氛围、无后果的互动。
                 if (verbose) toast('warning', '请先在设置里填写副 API 地址与密钥');
                 return;
             }
-            run.total = winFloors(queue);
+            run.total = winFloors(queue, chat);
             log('总结', source, queue.length, '个窗口', run.total, '楼');
             refreshStatus();
             while (queue.length) {
                 if (run.stop || getCtx().chatId !== chatId) break;
                 const w = queue.shift();
                 await runWindow(w);
-                if (w.status === 'ok') { okWins++; floorsOk += w.floors.length; floorsDone += w.floors.length; }
+                const span = spanOf(chat, w.floors);
+                if (w.status === 'ok') { okWins++; floorsOk += span; floorsDone += span; }
                 else if (w.split && w.floors.length > 1) { queue.unshift(...splitWindow(data, w)); split++; log('拆分重试', winLabel(w)); }
-                else { failed++; floorsDone += w.floors.length; }
+                else { failed++; floorsDone += span; }
                 run.done = floorsDone;
                 saveData();
                 refreshStatus();
@@ -792,12 +808,13 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!settings.enabled) return toast('warning', '插件已禁用，请先在设置里启用');
         if (!apiConfigured()) { togglePanel(true, 'cfg'); return toast('warning', '请先填写副 API 地址与密钥'); }
         reconcile();
-        const fresh = uncoveredFloors(getCtx().chat || [], data, true).length;
+        const chat = getCtx().chat || [];
+        const fresh = spanOf(chat, uncoveredFloors(chat, data, true));
         const retry = retryWindows(data);
         if (!fresh && !retry.length) return toast('info', '没有需要总结的楼层');
-        const W = Math.max(1, Number(settings.windowFloors) || 20);
+        const W = Math.max(1, Number(settings.windowFloors) || 40);
         const calls = Math.ceil(fresh / W) + retry.length;
-        const msg = `将总结 ${fresh} 楼${retry.length ? `，另重跑 ${winFloors(retry)} 楼` : ''}，约 ${calls} 次副 API 调用（每次最多 ${W} 楼）。继续？`;
+        const msg = `将总结 ${fresh} 楼${retry.length ? `，另重跑 ${winFloors(retry, chat)} 楼` : ''}，约 ${calls} 次副 API 调用（每次最多 ${W} 楼）。继续？`;
         if (!await confirmBox(msg)) return;
         ingest('manual');
     }
@@ -1048,10 +1065,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         const c = { events: 0, done: 0, todo: 0, todoAuto: 0, failed: 0, refused: 0, pending: 0, stale: 0, orphan: 0, hidden: 0, people: 0, items: 0 };
         if (!data) return c;
         c.events = data.entries.filter(e => e.status === 'ok').length;
-        for (const w of data.windows) { if (w.status === 'ok') c.done += w.floors.length; else if (c[w.status] !== undefined) c[w.status]++; }
         const chat = getCtx().chat || [];
-        c.todo = uncoveredFloors(chat, data, true).length + winFloors(retryWindows(data));
-        c.todoAuto = uncoveredFloors(chat, data, false).length;
+        for (const w of data.windows) { if (w.status === 'ok') c.done += spanOf(chat, w.floors); else if (c[w.status] !== undefined) c[w.status]++; }
+        c.todo = spanOf(chat, uncoveredFloors(chat, data, true)) + winFloors(retryWindows(data), chat);
+        c.todoAuto = spanOf(chat, uncoveredFloors(chat, data, false));
         for (const m of chat) if (m?.is_system && m.send_date && data.hidden[m.send_date]) c.hidden++;
         c.people = data.people.length; c.items = data.items.length;
         return c;
@@ -1062,7 +1079,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const bad = c.failed + c.refused;
         const N = Math.max(0, Number(settings.autoInterval) || 0);
         const injectLine = `本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（预算裁掉 ${lastInject.dropped}）` : ''}`;
-        const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}），单次最多 ${Math.max(1, Number(settings.windowFloors) || 20)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 20)} 楼`;
+        const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}），单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼`;
         $('.em-status').text(`已总结 ${c.done} 楼 / ${c.events} 条 · 待总结 ${c.todo} 楼 · 失败 ${bad} 段 · 人物 ${c.people} · 物件 ${c.items} · 已隐藏 ${c.hidden} · ${injectLine}`);
 
         $('#em_n_ok').text(c.done); $('#em_n_todo').text(c.todo); $('#em_n_hidden').text(c.hidden); $('#em_n_bad').text(bad);
@@ -1212,23 +1229,23 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <label>自动总结
                     <select id="em_auto_sel">
                         <option value="0">手动（只在点按钮时总结）</option>
-                        <option value="10">每 10 楼</option><option value="15">每 15 楼</option><option value="20">每 20 楼</option>
+                        <option value="20">每 20 楼</option><option value="30">每 30 楼</option><option value="40">每 40 楼</option>
                         <option value="custom">自定义…</option>
                     </select>
                 </label>
-                <label>自定义楼数（0 = 手动） <input id="em_auto_n" class="text_pole" type="number" min="0" max="500"></label>
+                <label>自定义楼数（0 = 手动） <input id="em_auto_n" class="text_pole" type="number" min="0" max="1000"></label>
             </div>
             <div class="em-row">
                 <label>单次总结最大楼层
                     <select id="em_win_sel">
-                        <option value="20">20 楼</option><option value="30">30 楼</option><option value="50">50 楼</option><option value="100">100 楼</option>
+                        <option value="40">40 楼</option><option value="60">60 楼</option><option value="100">100 楼</option><option value="200">200 楼</option>
                         <option value="custom">自定义…</option>
                     </select>
                 </label>
-                <label>自定义楼数 <input id="em_win_n" class="text_pole" type="number" min="1" max="500"></label>
+                <label>自定义楼数 <input id="em_win_n" class="text_pole" type="number" min="1" max="1000"></label>
                 <label>单次最大字数 <input id="em_call_chars" class="text_pole" type="number" min="2000" step="5000" title="一次调用喂给副模型的材料上限，超过就自动再切一段；按副模型上下文大小调"></label>
             </div>
-            <div class="em-hint">一次调用吃的楼越多越省钱、也越粗：日常 20–30 楼；清不在乎细节的老积压再开到 50–100。楼数与字数两个上限先到者生效；副模型拒答或输出损坏时自动对半拆分重试。</div>
+            <div class="em-hint">楼数按酒馆楼层计：你一条 + AI 一条 = 2 楼，与聊天里的楼号一致。一次调用吃的楼越多越省钱、也越粗：日常 40–60 楼；清不在乎细节的老积压再开到 100–200。楼数与字数两个上限先到者生效；副模型拒答或输出损坏时自动对半拆分重试。</div>
             <label class="checkbox_label"><input type="checkbox" id="em_hide"><span>总结完成后隐藏已总结楼层（可逆，「更多 → 取消隐藏」恢复）</span></label>
             <div class="em-row">
                 <label>保留可见楼数 <input id="em_keep" class="text_pole" type="number" min="2" max="40" title="从最新一条往前数，这么多条消息不隐藏；6 = 三回合"></label>
@@ -1316,8 +1333,8 @@ C = 日常、闲聊、氛围、无后果的互动。
             });
             num.on('change', function () { settings[key] = Math.max(min, Number(this.value) || 0); saveSettings(); sync(); refreshStatus(); });
         };
-        bindPick('#em_auto_sel', '#em_auto_n', 'autoInterval', [0, 10, 15, 20], 0);
-        bindPick('#em_win_sel', '#em_win_n', 'windowFloors', [20, 30, 50, 100], 1);
+        bindPick('#em_auto_sel', '#em_auto_n', 'autoInterval', [0, 20, 30, 40], 0);
+        bindPick('#em_win_sel', '#em_win_n', 'windowFloors', [40, 60, 100, 200], 1);
         $('#em_hide').prop('checked', settings.hideSummarized).on('change', function () { setHideSummarized(this.checked); });
         const bindApi = (id, key, num) => $(id).val(settings.api[key]).on('change', function () {
             settings.api[key] = num ? Number(this.value) : this.value.trim(); saveSettings();
@@ -1698,7 +1715,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     // 失败/拒答/排队中的段落在时间线顶部显示为一张卡，能重试、拆半、标不入库
     function winCardHtml(w) {
-        const n = w.floors.length;
+        const n = spanOf(getCtx().chat || [], w.floors);
         return `
         <div class="em-card em-dim em-wcard" data-wid="${w.id}">
             <div class="em-card-head">
@@ -1898,7 +1915,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (!apiConfigured()) return toast('warning', '请先配置副 API');
             if (run.busy) return toast('info', '正在总结中，稍后再试');
             const n = winEntries(data, w.id).length;
-            if (!await confirmBox(`重跑 ${winLabel(w)} 共 ${w.floors.length} 楼（一次副 API 调用），该段现有 ${n} 条记忆会被替换。继续？`)) return;
+            if (!await confirmBox(`重跑 ${winLabel(w)} 共 ${winFloors([w])} 楼（一次副 API 调用），该段现有 ${n} 条记忆会被替换。继续？`)) return;
             w.status = 'stale'; w.attempts = 0; saveData();
             run.failToasted = false;
             ingest('retry');
@@ -1925,7 +1942,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             run.failToasted = false;
             ingest('retry');
         } else if (act === 'skip') {
-            if (!await confirmBox(`把 ${winLabel(w)} 共 ${w.floors.length} 楼标记为「不入库」并删除其记忆？`)) return;
+            if (!await confirmBox(`把 ${winLabel(w)} 共 ${winFloors([w])} 楼标记为「不入库」并删除其记忆？`)) return;
             for (const d of w.dates) data.skip[d] = true;
             data.windows = data.windows.filter(x => x.id !== wid);
             data.entries = data.entries.filter(x => x.win !== wid);
@@ -2083,7 +2100,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 控制台排障入口（手机上可配合 Eruda）：eratoMemory_debug.buildBlock() 等
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
-        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, mergeEntities, coverage,
+        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, mergeEntities, coverage, floorSpan, spanOf, winFloors,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings,
     };
 

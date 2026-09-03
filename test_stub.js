@@ -1,4 +1,4 @@
-// Erato Memory v0.3.0 桩环境冒烟测试：不依赖酒馆，只验证纯逻辑（窗口切分 / 拆半重试 / 档案合并 / 对账 / 隐藏 / 注入 / 迁移）
+// Erato Memory v0.3.2 桩环境冒烟测试：不依赖酒馆，只验证纯逻辑（楼数口径 / 窗口切分 / 拆半重试 / 档案合并 / 对账 / 隐藏 / 注入 / 迁移）
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -106,13 +106,21 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(d[20], 0); assert.strictEqual(d[19], 1);
         assert.strictEqual(d[1], 18);
     });
+    t('楼数口径：AI 楼 + 前一条用户楼 = 2 楼；开场白 / 前面是旁白的只算 1', () => {
+        assert.strictEqual(D.floorSpan(chat, 0), 1, '开场白没有用户楼');
+        assert.strictEqual(D.floorSpan(chat, 2), 2);
+        assert.strictEqual(D.floorSpan(chat, 5), 1, '#4 是旁白不是用户楼');
+        assert.strictEqual(D.spanOf(chat, [0, 2, 5, 7, 9, 11, 13, 15, 17, 19]), 18, '10 个 AI 楼 = 18 个酒馆楼层');
+        assert.strictEqual(D.counts().todo, 18, '待总结按酒馆楼层计');
+    });
 
     console.log('== 窗口切分 ==');
-    t('按单次最大楼层切窗口', () => {
-        D.settings.windowFloors = 4; D.settings.maxCallChars = 60000;
+    t('按单次最大楼层切窗口（酒馆楼层计：8 楼 = 5 个 AI 楼，因 #0/#5 前面没有用户楼）', () => {
+        D.settings.windowFloors = 8; D.settings.maxCallChars = 60000;
         const wins = D.planWindows(chat, data, D.uncoveredFloors(chat, data, true));
-        assert.deepStrictEqual(wins.map(w => w.floors), [[0, 2, 5, 7], [9, 11, 13, 15], [17, 19]]);
-        assert.ok(wins[0].dates.length === 4 && wins[0].hashes.every(h => h.length === 8));
+        assert.deepStrictEqual(wins.map(w => w.floors), [[0, 2, 5, 7, 9], [11, 13, 15, 17], [19]]);
+        assert.deepStrictEqual(wins.map(w => D.spanOf(chat, w.floors)), [8, 8, 2]);
+        assert.ok(wins[0].dates.length === 5 && wins[0].hashes.every(h => h.length === 8));
     });
     t('单次最大字数先到者生效：超长楼单独成窗', () => {
         const saved = chat[9].mes;
@@ -147,12 +155,12 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
 
     console.log('== 入库（假副 API：>2 楼拒答 → 拆半） ==');
     D.settings.api.url = 'https://x/v1'; D.settings.api.key = 'k'; D.settings.api.model = 'm';
-    D.settings.autoInterval = 10; D.settings.windowFloors = 4; D.settings.hideSummarized = false;
+    D.settings.autoInterval = 20; D.settings.windowFloors = 8; D.settings.hideSummarized = false;
     await ta('手动总结到当前：拒答窗口对半拆，最终全部楼层入库', async () => {
         await D.ingest('manual');
         assert.ok(data.windows.every(w => w.status === 'ok'), '窗口应全部 ok：' + data.windows.map(w => w.status).join(','));
-        assert.deepStrictEqual(data.windows.map(w => w.floors), [[0, 2], [5, 7], [9, 11], [13, 15], [17, 19]]);
-        assert.ok(apiLog.some(f => f.length === 4), '应先尝试过 4 楼窗口');
+        assert.deepStrictEqual(data.windows.map(w => w.floors), [[0, 2], [5], [7, 9], [11, 13], [15, 17], [19]]);
+        assert.ok(apiLog.some(f => f.length === 5), '应先尝试过 5 个 AI 楼（8 楼）的窗口');
         assert.strictEqual(D.uncoveredFloors(chat, data, true).length, 0);
         assert.strictEqual(data.entries.length, 10);
         assert.ok(data.entries.every(e => e.status === 'ok' && e.win && e.src.floors.length === 1));
@@ -163,28 +171,32 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const lu = data.people.find(p => p.name === '陆衍');
         assert.deepStrictEqual(lu.aliases, ['小衍']);
         assert.strictEqual(lu.f.role.v, '邻居');
-        assert.strictEqual(lu.f.role.idx, 17, '最后一窗覆盖后来源楼应为 17');
+        assert.strictEqual(lu.f.role.idx, 19, '最后一窗覆盖后来源楼应为 19');
         assert.strictEqual(lu.first_idx, 0);
         assert.strictEqual(data.items.length, 1);
         assert.strictEqual(data.items[0].f.holder.v, '陆衍');
         assert.ok(data.relation.v.includes('#19'), '关系现状来自最后一窗');
         assert.strictEqual(data.relation.idx, 19);
     });
-    t('计数：已总结 10 楼 / 10 条，待总结 0', () => {
+    t('计数：已总结 18 楼（10 个 AI 楼）/ 10 条，待总结 0', () => {
         const c = D.counts();
-        assert.strictEqual(c.done, 10); assert.strictEqual(c.events, 10); assert.strictEqual(c.todo, 0); assert.strictEqual(c.people, 2);
+        assert.strictEqual(c.done, 18); assert.strictEqual(c.events, 10); assert.strictEqual(c.todo, 0); assert.strictEqual(c.people, 2);
     });
-    await ta('自动模式：未攒够间隔不开新窗口，攒够才开', async () => {
+    await ta('自动模式：未攒够间隔不开新窗口，攒够才开（间隔按酒馆楼层计）', async () => {
         chat.push(mkMsg(21, true), mkMsg(22, false), mkMsg(23, true), mkMsg(24, false));  // AI 22(depth 2), 24(depth 0)
         const before = data.windows.length;
         await D.ingest('auto');
-        assert.strictEqual(data.windows.length, before, '1 楼 < 10 不应开窗');
-        D.settings.autoInterval = 1;
+        assert.strictEqual(data.windows.length, before, '2 楼 < 20 不应开窗');
+        assert.strictEqual(D.counts().todoAuto, 2, '#21 用户 + #22 AI = 已攒 2 楼');
+        D.settings.autoInterval = 3;
+        await D.ingest('auto');
+        assert.strictEqual(data.windows.length, before, '2 楼 < 3 仍不开窗');
+        D.settings.autoInterval = 2;
         await D.ingest('auto');
         assert.strictEqual(data.windows.length, before + 1);
         assert.deepStrictEqual(data.windows[data.windows.length - 1].floors, [22]);
         assert.ok(D.uncoveredFloors(chat, data, true).includes(24), 'depth 0 的 24 楼留着');
-        D.settings.autoInterval = 10;
+        D.settings.autoInterval = 20;
     });
 
     console.log('== 对账 ==');
@@ -202,22 +214,22 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(data.entries.filter(e => e.win === w.id).every(e => e.status === 'ok'));
     });
     t('删掉窗口里一楼 → 窗口缩到剩下的楼并过期，条目跟着过期；楼回来后恢复', () => {
-        const d9 = chat[9].send_date, d11 = chat[11].send_date;
-        const w = data.windows.find(w => w.dates.includes(d11));
+        const d7 = chat[7].send_date, d9 = chat[9].send_date, d11 = chat[11].send_date;
+        const w = data.windows.find(w => w.dates.includes(d9));   // 窗口 [7, 9]
         const keep = { dates: w.dates.slice(), hashes: w.hashes.slice() };
         const removed = chat.splice(9, 2);          // 删 AI 9 + 用户 10
         D.reconcile();
-        assert.deepStrictEqual(w.dates, [d11]);
+        assert.deepStrictEqual(w.dates, [d7]);
         assert.strictEqual(w.status, 'stale');
-        assert.strictEqual(w.floors[0], 9, '11 楼前移成 9');
+        assert.deepStrictEqual(w.floors, [7]);
         const e11 = data.entries.find(e => e.src.dates[0] === d11);
-        assert.strictEqual(e11.src.idx, 9);
+        assert.strictEqual(e11.src.idx, 9, '11 楼前移成 9');
         assert.strictEqual(data.entries.find(e => e.src.dates[0] === d9).status, 'stale', '楼没了但窗口还在，跟窗口一起等重跑');
         assert.ok(D.uncoveredFloors(chat, data, true).every(i => i !== 9), '缩窗后 9 楼（原 11）仍被窗口覆盖');
         chat.splice(9, 0, ...removed);
         w.dates = keep.dates; w.hashes = keep.hashes; w.status = 'ok';
         D.reconcile();
-        assert.strictEqual(w.status, 'ok'); assert.deepStrictEqual(w.floors, [9, 11]);
+        assert.strictEqual(w.status, 'ok'); assert.deepStrictEqual(w.floors, [7, 9]);
         assert.strictEqual(e11.src.idx, 11);
     });
 
@@ -290,6 +302,21 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     t('说戏 COT 不进正文', () => { const c = D.extractContent(chat[2].mes); assert.ok(!c.text.includes('备选走向') && c.text.includes('正文第2楼') && !c.fallback); });
     t('缺 </content> 走兜底', () => { const c = D.extractContent('<think>x</think><content>正文<details>d</details>'); assert.ok(c.fallback && c.text === '正文'); });
     t('JSON 修复链', () => { assert.strictEqual(D.parseJson('```json\n{"summary": "a\nb", "grade": "S",}\n```').summary, 'a\nb'); assert.strictEqual(D.parseJson('{"summary": "截断').summary, '截断'); });
+
+    console.log('== 设置迁移：楼数单位 ==');
+    t('v0.3.1 旧设置（AI 楼计）加载时翻倍；新装用新默认；已迁移的不重复翻倍；v0.2 直升不把默认值翻倍', () => {
+        const load = saved => { ctx.extensionSettings = saved ? { 'erato-memory': saved } : {}; new Function(src)(); return ctx.extensionSettings['erato-memory']; };
+        let s = load({ autoInterval: 10, windowFloors: 20, enabled: true });
+        assert.strictEqual(s.autoInterval, 20); assert.strictEqual(s.windowFloors, 40); assert.strictEqual(s.floorUnit, 'chat');
+        s = load({ autoInterval: 0, windowFloors: 50, enabled: true });
+        assert.strictEqual(s.autoInterval, 0, '手动模式保持 0'); assert.strictEqual(s.windowFloors, 100);
+        s = load(null);
+        assert.strictEqual(s.autoInterval, 20); assert.strictEqual(s.windowFloors, 40); assert.strictEqual(s.floorUnit, 'chat');
+        s = load({ autoInterval: 30, windowFloors: 60, floorUnit: 'chat' });
+        assert.strictEqual(s.autoInterval, 30); assert.strictEqual(s.windowFloors, 60);
+        s = load({ autoIngest: true, enabled: true });
+        assert.strictEqual(s.autoInterval, 20, 'v0.2 没有间隔设置，用新默认不翻倍'); assert.strictEqual(s.windowFloors, 40);
+    });
 
     console.log(`\n${pass} passed${process.exitCode ? ' (有失败)' : ''}`);
     setTimeout(() => process.exit(process.exitCode || 0), 50);
