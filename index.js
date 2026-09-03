@@ -1,6 +1,7 @@
 // Erato Memory — SillyTavern 第三方扩展
 // 为 Erato 预设提供结构化长期记忆：
-//   逐楼把正文+recap 交给副 API 摘要成条目 → 存进聊天元数据随聊天文件走
+//   把一段楼层（窗口，默认最多 20 楼）的正文+recap 一次交给副 API，按事件切成若干条记忆，
+//   同一次调用顺手更新人物志/物件/主角关系现状 → 存进聊天元数据随聊天文件走
 //   → 已总结的旧楼层自动隐藏（可逆），由条目按时间顺序注入回上下文
 //
 // 扩展跑在打开酒馆页面的浏览器里，手机/电脑都可用；同一酒馆实例两端共享记忆。
@@ -9,7 +10,7 @@
     const EXT = 'erato-memory';
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
-    const DATA_VERSION = 1;
+    const DATA_VERSION = 2;
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -24,14 +25,23 @@
     const GRADE_BASE = { S: Infinity, A: 1, B: 0.6, C: 0.3 };
     const GRADE_HALFLIFE = { S: Infinity, A: 200, B: 60, C: 20 };
 
+    // 人物志 / 物件档案的字段（值带来源楼层号）；主角只记一行「关系现状」，不建档
+    const PERSON_FIELDS = ['role', 'age', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows'];
+    const PERSON_LABEL = { role: '身份', age: '年龄', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情' };
+    const ITEM_FIELDS = ['holder', 'status', 'meaning'];
+    const ITEM_LABEL = { holder: '持有者', status: '状态', meaning: '意义' };
+
     const DEFAULTS = {
         enabled: true,
-        autoIngest: true,
-        api: { url: '', key: '', model: '', models: [], temperature: 0.3, maxTokens: 900, timeoutSec: 60 },
+        autoInterval: 10,     // 攒够这么多新楼自动总结一次；0 = 只手动
+        windowFloors: 20,     // 一次副 API 调用最多吃多少楼
+        maxCallChars: 60000,  // 一次调用的材料字数上限，超过自动再切一段（防副模型上下文爆掉）
+        api: { url: '', key: '', model: '', models: [], temperature: 0.3, maxTokens: 4000, timeoutSec: 120 },
         contentWindow: 6,   // 与预设 6🌸 的 minDepth 一致
         injectDepth: 6,
         maxInjectChars: 9000,
-        ingestBatch: 20,
+        entityChars: 1500,    // 人物志+物件在注入块里的字数上限
+        npcScanDepth: 6,      // 最近几条可见消息里提到的人物出完整档案，其余只列名字
         hideSummarized: true,
         keepVisible: 6,
         ball: { enabled: true, color: '', opacity: 0.4, size: 40, pos: null },
@@ -55,6 +65,12 @@
             if (settings[group][key] === undefined) settings[group][key] = structuredClone(DEFAULTS[group][key]);
         }
     }
+    // v0.2 → v0.3：逐楼开关变间隔；一次调用的回复更长、更慢，旧默认值跟着抬；旧模板占位符已不兼容
+    if (settings.autoIngest !== undefined) { if (settings.autoIngest === false) settings.autoInterval = 0; delete settings.autoIngest; }
+    delete settings.ingestBatch;
+    if (Number(settings.api.maxTokens) <= 900) settings.api.maxTokens = DEFAULTS.api.maxTokens;
+    if (Number(settings.api.timeoutSec) === 60) settings.api.timeoutSec = DEFAULTS.api.timeoutSec;
+    if (settings.promptTemplate && !settings.promptTemplate.includes('{{material}}')) settings.promptTemplate = '';
     const saveSettings = () => getCtx().saveSettingsDebounced();
 
     /* ================= 工具 ================= */
@@ -90,7 +106,11 @@
     function defaultData() {
         return {
             version: DATA_VERSION,
-            entries: [],
+            entries: [],      // 记忆条目（事件）；自动条目通过 win 挂在窗口下
+            windows: [],      // 窗口 = 一次副 API 调用覆盖的楼层段，是入库/对账的单位
+            people: [],       // 人物志（配角）
+            items: [],        // 物件
+            relation: { v: '', idx: null, date: '' },   // {{char}} 对 {{user}} 的关系现状
             archives: [],
             canon: { text: '', builtFrom: [], builtAt: 0 },
             skip: {},
@@ -106,18 +126,46 @@
         if (!d || typeof d !== 'object') d = ctx.chatMetadata[META_KEY] = defaultData();
         const def = defaultData();
         for (const k of Object.keys(def)) if (d[k] === undefined) d[k] = def[k];
-        if (!Array.isArray(d.entries)) d.entries = [];
+        for (const k of ['entries', 'windows', 'people', 'items']) if (!Array.isArray(d[k])) d[k] = [];
+        if (!d.relation || typeof d.relation !== 'object') d.relation = def.relation;
+        if ((Number(d.version) || 1) < 2) migrateV1(d);
         return d;
+    }
+
+    // v0.2 一楼一条目 → 窗口制：每个自动条目变成单楼窗口，失败/重试状态搬到窗口上；没摘要的占位条目丢掉
+    function migrateV1(d) {
+        for (const k of ['entries', 'windows', 'people', 'items']) if (!Array.isArray(d[k])) d[k] = [];
+        const keep = [];
+        for (const e of d.entries) {
+            if (e.manual || !e.src?.send_date) { keep.push(e); continue; }
+            const idx = e.src.idx ?? 0;
+            const w = newWindow([idx], [e.src.send_date], [e.src.hash || ''], !!e.src.fallback);
+            w.status = e.status === 'archived' ? 'ok' : (e.status || 'pending');
+            w.attempts = e.attempts || 0; w.last_error = e.last_error || ''; w.model = e.model || '';
+            d.windows.push(w);
+            if (!e.summary) continue;
+            e.win = w.id; e.ord = 0;
+            e.src = { idx, floors: [idx], dates: [e.src.send_date], fallback: !!e.src.fallback };
+            e.status = w.status;
+            keep.push(e);
+        }
+        d.entries = keep;
+        d.version = DATA_VERSION;
+        log('数据已从 v1 迁移：', d.windows.length, '个单楼窗口');
     }
 
     const saveData = () => getCtx().saveMetadataDebounced();
 
-    const sortEntries = data => data.entries.sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0));
+    const sortEntries = data => data.entries.sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0) || (a.ord ?? 0) - (b.ord ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0));
+    const sortWindows = data => data.windows.sort((a, b) => (a.floors[0] ?? 0) - (b.floors[0] ?? 0));
 
-    function findEntry(data, m) {
-        if (!m?.send_date) return null;
-        return data.entries.find(e => e.src?.send_date === m.send_date) || null;
+    function newWindow(floors, dates, hashes, fallback) {
+        return { id: uid('w'), floors, dates, hashes, fallback: !!fallback, status: 'pending', attempts: 0, last_error: '', model: '', created_at: Date.now(), updated_at: Date.now() };
     }
+    const winById = (data, id) => data.windows.find(w => w.id === id) || null;
+    const winEntries = (data, id) => data.entries.filter(e => e.win === id);
+    const winLabel = w => w.floors.length > 1 ? `#${w.floors[0]}–#${w.floors[w.floors.length - 1]}` : `#${w.floors[0] ?? '?'}`;
+    const winFloors = ws => ws.reduce((n, w) => n + w.floors.length, 0);
 
     /* ================= 楼层文本抠取 ================= */
 
@@ -270,7 +318,7 @@
     }
 
     const isRefusal = raw =>
-        !/"summary"\s*:/.test(raw) &&
+        !/"(events|summary)"\s*:/.test(raw) &&
         /无法(协助|提供|生成|完成|继续)|不能(协助|提供|生成)|违反|不适合|抱歉|I can(?:'|’)?t\b|I cannot|I'm unable|not able to|as an AI/i.test(raw);
 
     /* ---- JSON 修复链：代码块 → 最外层大括号 → 引号/换行修复 → 截断补闭合 ---- */
@@ -344,43 +392,58 @@
     /* ================= 摘要提示词 ================= */
 
     const DEFAULT_SYSTEM_PROMPT =
-        '你是成人向互动小说的档案员。你的工作是把一段已发生的剧情整理成一条结构化记忆，供后续写作参考。\n' +
+        '你是成人向互动小说的档案员。你的工作是把一段已发生的剧情整理成若干条结构化记忆，并更新人物与物件档案，供后续写作参考。\n' +
         '只输出 JSON，不输出任何其他文字。用中性、克制、事实性的语言，不渲染不评价，性内容按事实记录不省略。';
 
-    // 可在设置「提示词」里改；占位符：{{name1}} {{name2}} {{recent}} {{user_text}} {{content}} {{recap}} {{directive}}
+    // 可在设置「提示词」里改；占位符：{{name1}} {{name2}} {{roster}} {{relation}} {{recent}} {{floor_range}} {{floor_count}} {{material}} {{max_events}} {{directive}}
     const DEFAULT_USER_TEMPLATE =
 `## 已知主角
 用户角色：{{name1}}；对手角色：{{name2}}。其余出场者按原文名字记录。
 
-## 最近三条记忆（供承接因果与去重，不要重复其中已记录的事实）
+## 已有档案（名字务必与此一致，不要给同一个人起第二个名字）
+{{roster}}
+
+## {{name2}} 对 {{name1}} 的关系现状（上次记录）
+{{relation}}
+
+## 之前的最近三条记忆（供承接因果与去重，不要重复其中已记录的事实）
 {{recent}}
 
-## 本楼材料
-### 用户的行动（括号内的 OOC 指令不是剧情，忽略）
-{{user_text}}
-
-### 正文
-{{content}}
-
-### 作者摘要（日期·时段·场景 与 叙述，若有）
-{{recap}}
+## 本段材料（{{floor_range}}，共 {{floor_count}} 楼；每楼以【#楼层号】开头，含用户行动、正文、作者摘要）
+{{material}}
 
 ## 输出要求
 输出一个 JSON 对象：
 {
-  "story_time": "沿用作者摘要的『日期 · 时段 · 场景』原文；没有则从正文推断；推断不出写（未知），禁止编造",
-  "type": "plot | emotion | intimacy | relationship | setting 之一。setting=新角色登场/世界观揭示/规则确立",
-  "title": "≤8字，意象或事件名，不用『之后』『开始』这类空词",
-  "summary": "≤120字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。可保留1句决定走向的原台词。去掉感官修辞。",
-  "characters": ["在场且有行动的人"],
-  "emotion_shift": "『角色：A→B』格式，一人一句，无变化留空",
-  "known_by": ["知道这件事的角色。若是秘密/信息差，只列知情者；全员在场则留空数组"],
-  "tags": ["3-6个检索词：人名/地点/物件/情绪/主题"],
-  "intimacy": null 或 {"acts": "行为要点，事实性", "consent": "同意状态与主动方", "firsts": "第一次的事项，没有留空", "aftermath": "事后状态与余波"},
-  "related_to": ["最近三条记忆里与本楼有因果关系的 id，没有留空数组"],
-  "grade": "S | A | B | C",
-  "grade_reason": "≤20字"
+  "events": [
+    {
+      "floors": [本事件来自哪几楼，只填楼层号数字],
+      "story_time": "沿用该楼作者摘要的『日期 · 时段 · 场景』原文；没有则从正文推断；推断不出写（未知），禁止编造",
+      "type": "plot | emotion | intimacy | relationship | setting 之一。setting=新角色登场/世界观揭示/规则确立",
+      "title": "≤8字，意象或事件名，不用『之后』『开始』这类空词",
+      "summary": "≤150字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。可保留1句决定走向的原台词。去掉感官修辞。",
+      "characters": ["在场且有行动的人"],
+      "emotion_shift": "『角色：A→B』格式，一人一句，无变化留空",
+      "known_by": ["知道这件事的角色。若是秘密/信息差，只列知情者；全员在场则留空数组"],
+      "tags": ["3-6个检索词：人名/地点/物件/情绪/主题"],
+      "intimacy": null 或 {"acts": "行为要点，事实性", "consent": "同意状态与主动方", "firsts": "第一次的事项，没有留空", "aftermath": "事后状态与余波"},
+      "related_to": ["之前记忆里与本事件有因果关系的 id，没有留空数组"],
+      "grade": "S | A | B | C",
+      "grade_reason": "≤20字"
+    }
+  ],
+  "relation": "{{name2}} 此刻对 {{name1}} 的态度与关系，一句话 ≤40 字，写现状不写过程；本段没有变化则留空字符串",
+  "people": [
+    {"name": "配角名（不含 {{name1}} 与 {{name2}}）", "aliases": ["别称/称呼"], "role": "身份/职业", "age": "", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "status": "现状：在场/离开/死亡等", "knows": "知情范围：知道哪些秘密", "floor": 该信息来自哪一楼的楼层号}
+  ],
+  "items": [
+    {"name": "物件名", "holder": "现在在谁手里", "status": "状态", "meaning": "对剧情或人物的意义", "floor": 楼层号}
+  ]
 }
+
+切分规则：
+- 按事件切，不按楼切。同一件事跨多楼（一场争吵、一次亲密、一段对话）合成一条；一楼里有两件独立的事就拆两条。本段通常 1–{{max_events}} 条。
+- people / items 只填本段出现了新信息或有变化的，某字段没有新信息就留空字符串；没有就给空数组。已有档案里的人，名字要写得一模一样。
 
 等级标准（按语义重要度，不按篇幅）：
 S = 不可逆事实：死亡/告白成立/关系定名/身份揭露/立誓承诺/任何『第一次』。永不遗忘。
@@ -390,25 +453,45 @@ C = 日常、闲聊、氛围、无后果的互动。
 拿不准时降一级，不要升级。{{directive}}`;
 
     const systemPromptText = () => settings.systemPrompt?.trim() || DEFAULT_SYSTEM_PROMPT;
-    // 用户模板缺 {{content}} 就不可用，静默退回默认，免得摘要出来全是空
+    // 用户模板缺 {{material}} 就不可用，静默退回默认，免得摘要出来全是空
     const userTemplateText = () => {
         const t = settings.promptTemplate || '';
-        return t.includes('{{content}}') ? t : DEFAULT_USER_TEMPLATE;
+        return t.includes('{{material}}') ? t : DEFAULT_USER_TEMPLATE;
     };
 
+    const fv = (ent, k) => ent?.f?.[k]?.v || '';
+    const personLabel = k => PERSON_LABEL[k].replace('{{user}}', getCtx().name1 || '{{user}}').replace('{{char}}', getCtx().name2 || '{{char}}');
+
+    function rosterText(data) {
+        const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
+        const i = data.items.map(x => x.name);
+        return [p.length ? `人物：${p.join('、')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
+    }
+
+    function floorMaterial(f) {
+        const parts = [`【#${f.idx}】`, `用户行动（括号内的 OOC 指令不是剧情，忽略）：${f.userText || '（无）'}`, `正文：\n${f.content}`];
+        const recap = [f.recap?.storyTime, f.recap?.narrative].filter(Boolean).join('\n');
+        if (recap) parts.push(`作者摘要：${recap}`);
+        return parts.join('\n');
+    }
+
+    // input = { floors: [{ idx, userText, content, recap }], recent: [Entry], data }
     function buildMessages(input) {
         const ctx = getCtx();
+        const floors = input.floors || [];
+        const n = floors.length;
         const vars = {
             name1: ctx.name1 || '{{user}}',
             name2: ctx.name2 || '{{char}}',
-            recent: input.recent.length
+            roster: input.data ? rosterText(input.data) : '（无）',
+            relation: input.data?.relation?.v || '（尚无记录）',
+            recent: input.recent?.length
                 ? input.recent.map(e => `[${e.id}] ${e.story_time || '（时间未知）'} | ${e.title} | ${e.summary}`).join('\n')
                 : '（无）',
-            user_text: input.userText || '（无）',
-            content: input.content,
-            recap: (input.recap.storyTime || input.recap.narrative)
-                ? `${input.recap.storyTime ? input.recap.storyTime + '\n' : ''}${input.recap.narrative}`.trim()
-                : '（无）',
+            floor_range: n ? (n > 1 ? `#${floors[0].idx}–#${floors[n - 1].idx}` : `#${floors[0].idx}`) : '',
+            floor_count: String(n),
+            material: floors.map(floorMaterial).join('\n\n'),
+            max_events: String(clamp(Math.ceil(n / 2), 2, 12)),
             directive: settings.directive?.trim() ? `\n\n## 额外要求\n${settings.directive.trim()}` : '',
         };
         const user = userTemplateText().replace(/\{\{(\w+)\}\}/g, (m, k) => (k in vars ? vars[k] : m));
@@ -419,16 +502,14 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
 
     const asArr = v => Array.isArray(v) ? v.map(x => String(x).trim()).filter(Boolean) : [];
+    const norm = s => String(s || '').trim().toLowerCase();
 
-    function applyResult(e, obj, recap, recent) {
-        const summary = String(obj.summary || '').trim();
-        if (summary.length < 10) throw new Error('摘要过短或缺失');
-        const recentIds = new Set(recent.map(x => x.id));
+    function applyEvent(e, obj, recap, recentIds) {
         e.story_time = String(obj.story_time || '').trim() || recap.storyTime || '';
         if (/^（?未知）?$/.test(e.story_time)) e.story_time = recap.storyTime || '';
         e.type = TYPES.includes(obj.type) ? obj.type : 'plot';
         e.title = String(obj.title || '').trim().slice(0, 12) || '（无题）';
-        e.summary = summary;
+        e.summary = String(obj.summary || '').trim();
         e.characters = asArr(obj.characters);
         e.emotion_shift = String(obj.emotion_shift || '').trim();
         e.known_by = asArr(obj.known_by);
@@ -449,82 +530,197 @@ C = 日常、闲聊、氛围、无后果的互动。
         }
     }
 
-    /* ================= 入库（幂等补齐 / 总结前文） ================= */
+    const findPerson = (data, name) => { const n = norm(name); return n ? data.people.find(p => norm(p.name) === n || (p.aliases || []).some(a => norm(a) === n)) || null : null; };
+    const findItem = (data, name) => { const n = norm(name); return n ? data.items.find(x => norm(x.name) === n) || null : null; };
+
+    // 人物志/物件/关系现状合并：同实体同字段，新的非空值覆盖旧值并更新来源楼层号；主角不建档，{{char}} 只更新关系行
+    function mergeEntities(data, obj, w, byIdx) {
+        const ctx = getCtx();
+        const lastIdx = w.floors[w.floors.length - 1];
+        const floorOf = v => { const n = Number(v); return byIdx.has(n) ? n : lastIdx; };
+        const dateOf = i => byIdx.get(i)?.send_date || '';
+        const setF = (ent, key, val, idx) => { const v = String(val || '').trim(); if (v) ent.f[key] = { v, idx, date: dateOf(idx) }; };
+        const me = norm(ctx.name1), them = norm(ctx.name2);
+        const rel = String(obj.relation || '').trim();
+        if (rel) data.relation = { v: rel, idx: lastIdx, date: dateOf(lastIdx) };
+        for (const p of (Array.isArray(obj.people) ? obj.people : [])) {
+            const name = String(p?.name || '').trim();
+            if (!name) continue;
+            const n = norm(name);
+            if (n === me) continue;
+            if (n === them) {
+                const r = String(p.rel_user || '').trim();
+                if (!rel && r) data.relation = { v: r, idx: floorOf(p.floor), date: dateOf(floorOf(p.floor)) };
+                continue;
+            }
+            const idx = floorOf(p.floor);
+            let ent = findPerson(data, name);
+            if (!ent) {
+                ent = { id: uid('p'), name, aliases: [], f: {}, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                data.people.push(ent);
+            }
+            for (const a of asArr(p.aliases)) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a))) ent.aliases.push(a);
+            for (const k of PERSON_FIELDS) setF(ent, k, p[k], idx);
+            ent.last_idx = Math.max(ent.last_idx || 0, idx); ent.updated_at = Date.now();
+        }
+        for (const it of (Array.isArray(obj.items) ? obj.items : [])) {
+            const name = String(it?.name || '').trim();
+            if (!name) continue;
+            const idx = floorOf(it.floor);
+            let ent = findItem(data, name);
+            if (!ent) {
+                ent = { id: uid('i'), name, f: {}, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                data.items.push(ent);
+            }
+            for (const k of ITEM_FIELDS) setF(ent, k, it[k], idx);
+            ent.last_idx = Math.max(ent.last_idx || 0, idx); ent.updated_at = Date.now();
+        }
+    }
+
+    // 一个窗口的返回：events → 条目（替换该窗口旧条目），再合并档案
+    function applyWindowResult(w, obj, inputs, recent) {
+        const data = getData();
+        const events = Array.isArray(obj.events) ? obj.events : Array.isArray(obj.entries) ? obj.entries : null;
+        if (!events || !events.length) throw Object.assign(new Error('没有返回事件'), { split: true });
+        const byIdx = new Map(inputs.map(f => [f.idx, f]));
+        const recentIds = new Set(recent.map(x => x.id));
+        const made = [];
+        events.forEach((ev, k) => {
+            if (!ev || typeof ev !== 'object' || String(ev.summary || '').trim().length < 10) return;
+            let floors = asArr(ev.floors).map(Number).filter(n => byIdx.has(n)).sort((a, b) => a - b);
+            if (!floors.length) floors = [w.floors[w.floors.length - 1]];
+            const e = newEntry();
+            e.win = w.id; e.ord = k;
+            e.src = { idx: floors[floors.length - 1], floors, dates: floors.map(i => byIdx.get(i).send_date), fallback: floors.some(i => byIdx.get(i).fallback) };
+            applyEvent(e, ev, byIdx.get(floors[0]).recap || {}, recentIds);
+            e.status = 'ok'; e.model = settings.api.model;
+            made.push(e);
+        });
+        if (!made.length) throw Object.assign(new Error('事件摘要全部过短'), { split: true });
+        data.entries = data.entries.filter(e => e.win !== w.id).concat(made);
+        sortEntries(data);
+        mergeEntities(data, obj, w, byIdx);
+    }
+
+    /* ================= 入库（窗口切分 / 一次跑到底） ================= */
 
     const run = { busy: false, again: false, chatId: null, manual: false, stop: false, done: 0, total: 0, failToasted: false };
 
     function newEntry() {
         return {
-            id: uid('em'), src: {}, story_time: '', type: 'plot', title: '', summary: '',
+            id: uid('em'), win: null, ord: 0, src: {}, story_time: '', type: 'plot', title: '', summary: '',
             characters: [], emotion_shift: '', known_by: [], tags: [], intimacy: null, related_to: [],
-            grade: 'B', pinned: false, status: 'pending', attempts: 0, last_error: '',
-            model: '', created_at: Date.now(), updated_at: Date.now(),
+            grade: 'B', pinned: false, status: 'pending', model: '', created_at: Date.now(), updated_at: Date.now(),
         };
     }
 
-    // depth≥2 的 AI 楼层才入库：depth 0/1 还可能被 swipe 或重 roll
-    function pendingFloors(chat, data) {
-        const out = [];
+    // 一楼的材料 = 前一条用户消息 + 正文 + recap
+    function floorInput(chat, idx) {
+        const m = chat[idx];
+        const content = extractContent(m?.mes);
+        const prev = chat[idx - 1];
+        return { idx, send_date: m?.send_date, userText: prev?.is_user ? cleanUser(prev.mes) : '', content: content.text, fallback: content.fallback, recap: extractRecap(m?.mes), hash: hash(content.text) };
+    }
+
+    // 楼层覆盖表：send_date → 窗口（孤立窗口不算覆盖）
+    function coverage(data) {
+        const map = new Map();
+        for (const w of data.windows) { if (w.status === 'orphan') continue; for (const d of w.dates) map.set(d, w); }
+        return map;
+    }
+
+    // 未入库楼层：AI 楼、未标不入库、不在任何窗口里；all=false 时只取 depth≥2（0/1 还可能被 swipe 或重 roll）
+    function uncoveredFloors(chat, data, all = false) {
         const ctx = getCtx();
+        const cov = coverage(data);
+        const out = [];
         for (let i = 0; i < chat.length; i++) {
             const m = chat[i];
             if (!isAiFloor(m, ctx)) continue;
-            if (chat.length - 1 - i < 2) continue;
-            if (data.skip[m.send_date]) continue;
-            const e = findEntry(data, m);
-            if (!e) { out.push(i); continue; }
-            if (e.status === 'stale') { out.push(i); continue; }
-            if (['pending', 'failed', 'refused'].includes(e.status) && e.attempts < MAX_ATTEMPTS) out.push(i);
+            if (!all && chat.length - 1 - i < 2) continue;
+            if (data.skip[m.send_date] || cov.has(m.send_date)) continue;
+            out.push(i);
         }
         return out;
     }
 
-    async function ingestFloor(idx) {
+    // 要（重）跑的旧窗口：过期、排队中断的、失败/拒答且未超次数
+    const retryWindows = data => data.windows.filter(w => w.status === 'stale' || (['pending', 'failed', 'refused'].includes(w.status) && w.attempts < MAX_ATTEMPTS));
+
+    // 把未入库楼层切成窗口：按顺序、不超 windowFloors 楼、材料不超 maxCallChars 字；中间隔着已入库楼层就断开。正文为空的楼直接标不入库
+    function planWindows(chat, data, floors) {
+        const W = Math.max(1, Number(settings.windowFloors) || 20);
+        const C = Math.max(2000, Number(settings.maxCallChars) || 60000);
+        const cov = coverage(data);
+        const ctx = getCtx();
+        const wins = [];
+        let cur = [], chars = 0, last = -1;
+        const flush = () => { if (cur.length) wins.push(cur); cur = []; chars = 0; };
+        for (const idx of floors) {
+            const f = floorInput(chat, idx);
+            if (!f.content) { data.skip[f.send_date] = true; log('正文为空，不入库', idx); continue; }
+            let broken = false;
+            for (let j = last + 1; last >= 0 && j < idx; j++) if (isAiFloor(chat[j], ctx) && cov.has(chat[j].send_date)) { broken = true; break; }
+            if (broken) flush();
+            const n = f.content.length + f.userText.length + (f.recap.narrative?.length || 0) + 40;
+            if (cur.length && (cur.length >= W || chars + n > C)) flush();
+            cur.push(f); chars += n; last = idx;
+        }
+        flush();
+        return wins.map(fs => newWindow(fs.map(f => f.idx), fs.map(f => f.send_date), fs.map(f => f.hash), fs.some(f => f.fallback)));
+    }
+
+    // 拒答/解析失败时对半切，切到单楼还失败才算真失败；原窗口及其条目删掉
+    function splitWindow(data, w) {
+        const h = Math.ceil(w.floors.length / 2);
+        const mk = (s, e) => newWindow(w.floors.slice(s, e), w.dates.slice(s, e), w.hashes.slice(s, e), w.fallback);
+        const a = mk(0, h), b = mk(h, w.floors.length);
+        data.windows = data.windows.filter(x => x.id !== w.id).concat(a, b);
+        data.entries = data.entries.filter(e => e.win !== w.id);
+        sortWindows(data);
+        return [a, b];
+    }
+
+    async function runWindow(w) {
         const ctx = getCtx();
         const data = getData();
-        const m = ctx.chat[idx];
-        if (!m || !data) return;
-        const content = extractContent(m.mes);
-        const recap = extractRecap(m.mes);
-        const prev = ctx.chat[idx - 1];
-        const userText = prev?.is_user ? cleanUser(prev.mes) : '';
-
-        let e = findEntry(data, m);
-        if (!e) { e = newEntry(); data.entries.push(e); }
-        if (e.status === 'stale') e.attempts = 0;
-        e.src = { idx, send_date: m.send_date, hash: hash(content.text), fallback: content.fallback, user_idx: userText ? idx - 1 : null };
-        e.status = 'pending';
-        sortEntries(data);
-
-        if (!content.text) {
-            e.status = 'failed'; e.last_error = '正文为空'; e.attempts = MAX_ATTEMPTS;
-            return;
-        }
-        const recent = data.entries.filter(x => x.status === 'ok' && !x.manual && x.src.idx < idx).slice(-3);
+        const chat = ctx.chat || [];
+        if (!data) return;
+        const byDate = new Map();
+        chat.forEach((m, i) => { if (m?.send_date) byDate.set(m.send_date, i); });
+        const inputs = [];
+        w.dates.forEach(d => { const i = byDate.get(d); if (i !== undefined && chat[i]?.mes) inputs.push(floorInput(chat, i)); });
+        w.floors = inputs.map(f => f.idx); w.dates = inputs.map(f => f.send_date); w.hashes = inputs.map(f => f.hash); w.fallback = inputs.some(f => f.fallback);
+        w.status = 'pending'; w.split = false; w.updated_at = Date.now();
+        if (!inputs.length) { w.status = 'orphan'; w.last_error = '楼层已不存在'; return; }
+        if (!inputs.some(f => f.content)) { w.status = 'failed'; w.last_error = '正文为空'; w.attempts = MAX_ATTEMPTS; return; }
+        const recent = data.entries.filter(x => x.status === 'ok' && !x.manual && x.src.idx < w.floors[0]).slice(-3);
         try {
-            const raw = await callApi(buildMessages({ userText, content: content.text, recap, recent }));
+            const raw = await callApi(buildMessages({ floors: inputs, recent, data }));
             const obj = parseJson(raw);
             if (!obj) {
-                if (isRefusal(raw)) throw Object.assign(new Error('疑似拒答：' + raw.slice(0, 80)), { refused: true });
-                throw new Error('无法解析 JSON：' + raw.slice(0, 80));
+                if (isRefusal(raw)) throw Object.assign(new Error('疑似拒答：' + raw.slice(0, 80)), { refused: true, split: true });
+                throw Object.assign(new Error('无法解析 JSON：' + raw.slice(0, 80)), { split: true });
             }
-            applyResult(e, obj, recap, recent);
-            e.status = 'ok'; e.last_error = ''; e.attempts = 0;
-            e.model = settings.api.model; e.updated_at = Date.now();
+            applyWindowResult(w, obj, inputs, recent);
+            w.status = 'ok'; w.last_error = ''; w.attempts = 0;
+            w.model = settings.api.model; w.updated_at = Date.now();
             data.stats.failStreak = 0;
-            log('入库', idx, e.grade, e.title);
+            log('入库', winLabel(w), winEntries(data, w.id).length, '条');
         } catch (err) {
-            e.attempts++;
-            e.status = err.refused ? 'refused' : 'failed';
-            e.last_error = err.message;
+            w.attempts++;
+            w.status = err.refused ? 'refused' : 'failed';
+            w.last_error = err.message;
+            w.split = !!err.split;
             data.stats.failStreak++;
             data.stats.lastError = err.message;
-            warn('楼层', idx, '摘要失败：', err.message);
-            if (!run.failToasted) { run.failToasted = true; toast('error', `第 ${idx} 楼摘要失败：${err.message.slice(0, 60)}`); }
+            warn('窗口', winLabel(w), '摘要失败：', err.message);
+            if (!run.failToasted && !(w.split && w.floors.length > 1)) { run.failToasted = true; toast('error', `${winLabel(w)} 摘要失败：${err.message.slice(0, 60)}`); }
         }
     }
 
-    // source: auto / chat_changed / again = 每次最多 ingestBatch 楼，静默；manual = 一次跑到底，带进度，可停
+    // source: auto / chat_changed / again = 攒够 autoInterval 楼才开新窗口，静默；
+    // manual = 全部未总结楼层（含最新楼）跑到底；retry = 只重跑旧窗口；后两者带进度与提示，可停
     async function ingest(source = 'auto') {
         if (!settings.enabled) return;
         if (run.busy) { run.again = true; return; }
@@ -533,30 +729,39 @@ C = 日常、闲聊、氛围、无后果的互动。
         const data = getData();
         if (!chatId || !data) return;
         const manual = source === 'manual';
+        const verbose = manual || source === 'retry';
 
-        run.busy = true; run.chatId = chatId; run.again = false; run.manual = manual; run.stop = false; run.done = 0; run.total = 0;
-        let done = 0, failed = 0;
+        run.busy = true; run.chatId = chatId; run.again = false; run.manual = verbose; run.stop = false; run.done = 0; run.total = 0;
+        let okWins = 0, failed = 0, floorsOk = 0, floorsDone = 0, split = 0;
         try {
             reconcile();
-            let todo = pendingFloors(ctx.chat || [], data);
-            if (!manual) todo = todo.slice(0, Math.max(1, Number(settings.ingestBatch) || 20));
-            if (!todo.length) return;
+            const chat = ctx.chat || [];
+            const queue = retryWindows(data);
+            const fresh = uncoveredFloors(chat, data, manual);
+            const N = Math.max(0, Number(settings.autoInterval) || 0);
+            if (fresh.length && (manual || (N > 0 && fresh.length >= N))) {
+                for (const w of planWindows(chat, data, fresh)) { data.windows.push(w); queue.push(w); }
+                sortWindows(data);
+            }
+            if (!queue.length) return;
             if (!apiConfigured()) {
-                if (manual) toast('warning', '请先在设置里填写副 API 地址与密钥');
+                if (verbose) toast('warning', '请先在设置里填写副 API 地址与密钥');
                 return;
             }
-            run.total = todo.length;
-            log('总结', source, todo.length, '楼');
+            run.total = winFloors(queue);
+            log('总结', source, queue.length, '个窗口', run.total, '楼');
             refreshStatus();
-            for (const idx of todo) {
+            while (queue.length) {
                 if (run.stop || getCtx().chatId !== chatId) break;
-                await ingestFloor(idx);
-                done++; run.done = done;
-                const e = findEntry(data, getCtx().chat[idx]);
-                if (e && e.status !== 'ok') failed++;
+                const w = queue.shift();
+                await runWindow(w);
+                if (w.status === 'ok') { okWins++; floorsOk += w.floors.length; floorsDone += w.floors.length; }
+                else if (w.split && w.floors.length > 1) { queue.unshift(...splitWindow(data, w)); split++; log('拆分重试', winLabel(w)); }
+                else { failed++; floorsDone += w.floors.length; }
+                run.done = floorsDone;
                 saveData();
                 refreshStatus();
-                if (manual && done % 10 === 0 && done < todo.length) toast('info', `正在总结 ${done}/${todo.length}`);
+                if (verbose && queue.length && okWins && okWins % 5 === 0) toast('info', `正在总结 ${floorsDone}/${run.total} 楼`);
                 await sleep(150);
             }
             data.stats.lastIngestAt = Date.now();
@@ -569,17 +774,17 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (getCtx().chatId === chatId) {
                 const hid = hideSummarized();
                 applyInjection(); renderPanel(); refreshStatus();
-                if (manual) {
-                    if (!done) toast('info', '没有需要总结的楼层');
+                if (verbose) {
+                    if (!floorsDone && !failed) toast('info', '没有需要总结的楼层');
                     else toast(failed ? 'warning' : 'success',
-                        `${stopped ? '已停止，' : ''}已总结 ${done - failed} 楼${failed ? `，${failed} 楼失败` : ''}${hid ? `，隐藏 ${hid} 条消息` : ''}，注入 ≈ ${lastInject.chars} 字`);
+                        `${stopped ? '已停止，' : ''}已总结 ${floorsOk} 楼 / ${okWins} 次调用${split ? `（拆分 ${split} 次）` : ''}${failed ? `，${failed} 段失败` : ''}${hid ? `，隐藏 ${hid} 条消息` : ''}，注入 ≈ ${lastInject.chars} 字`);
                 }
             }
             if (run.again) { run.again = false; setTimeout(() => ingest('again'), 500); }
         }
     }
 
-    // 「总结前文」入口：确认楼数后跑到底
+    // 「总结到当前」入口：确认楼数与调用次数后跑到底
     async function summarizeAll() {
         const data = getData();
         if (!data) return toast('warning', '当前没有打开聊天');
@@ -587,13 +792,17 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!settings.enabled) return toast('warning', '插件已禁用，请先在设置里启用');
         if (!apiConfigured()) { togglePanel(true, 'cfg'); return toast('warning', '请先填写副 API 地址与密钥'); }
         reconcile();
-        const n = pendingFloors(getCtx().chat || [], data).length;
-        if (!n) return toast('info', '没有需要总结的楼层');
-        if (!await confirmBox(`将总结 ${n} 楼，每楼调用一次副 API。继续？`)) return;
+        const fresh = uncoveredFloors(getCtx().chat || [], data, true).length;
+        const retry = retryWindows(data);
+        if (!fresh && !retry.length) return toast('info', '没有需要总结的楼层');
+        const W = Math.max(1, Number(settings.windowFloors) || 20);
+        const calls = Math.ceil(fresh / W) + retry.length;
+        const msg = `将总结 ${fresh} 楼${retry.length ? `，另重跑 ${winFloors(retry)} 楼` : ''}，约 ${calls} 次副 API 调用（每次最多 ${W} 楼）。继续？`;
+        if (!await confirmBox(msg)) return;
         ingest('manual');
     }
 
-    // 对账：删楼 → 孤立；编辑正文 → 过期；分支/检查点 → 越界条目孤立；手动条目只校正楼层号
+    // 对账：删楼 → 窗口缩到剩下的楼并重跑，全没了 → 孤立；编辑正文 → 过期；条目状态跟着窗口走；手动条目只校正楼层号
     function reconcile() {
         const ctx = getCtx();
         const data = getData();
@@ -602,27 +811,37 @@ C = 日常、闲聊、氛围、无后果的互动。
         const byDate = new Map();
         chat.forEach((m, i) => { if (m && !m.is_user && m.send_date) byDate.set(m.send_date, i); });
         let changed = false;
+        for (const w of data.windows) {
+            const idxs = [], dates = [], hashes = [];
+            let missing = 0, edited = false;
+            w.dates.forEach((d, k) => {
+                const i = byDate.get(d);
+                if (i === undefined) { missing++; return; }
+                idxs.push(i); dates.push(d); hashes.push(w.hashes[k] || '');
+                if (hash(extractContent(chat[i].mes).text) !== (w.hashes[k] || '')) edited = true;
+            });
+            if (!idxs.length) { if (w.status !== 'orphan') { w.status = 'orphan'; changed = true; } continue; }
+            if (missing) { w.floors = idxs; w.dates = dates; w.hashes = hashes; edited = true; changed = true; }
+            else if (idxs.some((i, k) => w.floors[k] !== i)) { w.floors = idxs; changed = true; }
+            if (['pending', 'failed', 'refused'].includes(w.status)) continue;
+            if (edited) { if (w.status !== 'stale') { w.status = 'stale'; changed = true; } }
+            else if (w.status === 'orphan') { w.status = winEntries(data, w.id).length ? 'ok' : 'stale'; changed = true; }
+        }
+        const max = Math.max(0, chat.length - 1);
         for (const e of data.entries) {
             if (e.manual) {
-                const max = Math.max(0, chat.length - 1);
                 if ((e.src?.idx ?? 0) > max) { e.src.idx = max; changed = true; }
                 continue;
             }
-            const i = byDate.get(e.src?.send_date);
-            if (i === undefined) {
-                if (e.status !== 'orphan') { e.status = 'orphan'; changed = true; }
-                continue;
-            }
-            if (e.src.idx !== i) { e.src.idx = i; changed = true; }
-            if (['pending', 'failed', 'refused'].includes(e.status)) continue;
-            const h = hash(extractContent(chat[i].mes).text);
-            if (h !== e.src.hash) {
-                if (e.status !== 'stale') { e.status = 'stale'; changed = true; }
-            } else if (e.status === 'orphan') {
-                e.status = e.summary ? 'ok' : 'pending'; changed = true;
+            const w = e.win ? winById(data, e.win) : null;
+            const st = !w ? 'orphan' : ['ok', 'stale', 'orphan'].includes(w.status) ? w.status : 'stale';
+            if (e.status !== st) { e.status = st; changed = true; }
+            const floors = (e.src?.dates || []).map(d => byDate.get(d)).filter(i => i !== undefined).sort((a, b) => a - b);
+            if (floors.length && (floors.length !== e.src.floors?.length || floors.some((i, k) => e.src.floors[k] !== i))) {
+                e.src.floors = floors; e.src.idx = floors[floors.length - 1]; changed = true;
             }
         }
-        if (changed) { sortEntries(data); saveData(); }
+        if (changed) { sortEntries(data); sortWindows(data); saveData(); }
     }
 
     /* ================= 隐藏已总结楼层（可逆） ================= */
@@ -647,7 +866,8 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (++seen > keep) { cut = i; break; }
         }
         if (cut < 0) return 0;
-        const okDates = new Set(data.entries.filter(e => e.status === 'ok' && !e.manual && e.src?.send_date).map(e => e.src.send_date));
+        const okDates = new Set();
+        for (const w of data.windows) if (w.status === 'ok') for (const d of w.dates) okDates.add(d);
         let n = 0;
         for (let i = 0; i <= cut; i++) {
             const m = chat[i];
@@ -711,6 +931,60 @@ C = 日常、闲聊、氛围、无后果的互动。
         return line;
     }
 
+    function recentText(chat, n) {
+        const out = [];
+        let c = 0;
+        for (let i = chat.length - 1; i >= 0 && c < n; i--) {
+            const m = chat[i];
+            if (!m || m.is_system) continue;
+            out.push(m.is_user ? String(m.mes || '') : extractContent(m.mes).text);
+            c++;
+        }
+        return out.join('\n').toLowerCase();
+    }
+    const mentioned = (p, text) => [p.name, ...(p.aliases || [])].some(a => a && text.includes(String(a).toLowerCase()));
+
+    function fmtPerson(p, full) {
+        const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
+        if (!full) return `${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}`;
+        const parts = PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`);
+        return `- ${head}${parts.length ? '｜' + parts.join('｜') : ''}`;
+    }
+    const fmtItem = it => `- ${it.name}${ITEM_FIELDS.filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`;
+
+    // 关系现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；
+    // 总字数受 entityChars 约束，放不下的完整卡按最久未露面降为一行
+    function entityLines(data, chat) {
+        const ctx = getCtx();
+        const lines = [];
+        if (data.relation?.v) lines.push('', '## 关系现状', `- ${ctx.name2 || '{{char}}'} 对 ${ctx.name1 || '{{user}}'}：${data.relation.v}`);
+        const budget = Math.max(200, Number(settings.entityChars) || 1500);
+        let used = 0;
+        if (data.people.length) {
+            const text = recentText(chat, Math.max(1, Number(settings.npcScanDepth) || 6));
+            const active = data.people.filter(p => mentioned(p, text)).sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0));
+            const brief = data.people.filter(p => !mentioned(p, text));
+            const full = [];
+            for (const p of active) {
+                const s = fmtPerson(p, true);
+                if (used + s.length <= budget) { full.push(s); used += s.length; } else brief.push(p);
+            }
+            brief.sort((a, b) => (a.first_idx || 0) - (b.first_idx || 0));
+            lines.push('', '## 人物志', ...full);
+            if (brief.length) lines.push(`- 其他已登场：${brief.map(p => fmtPerson(p, false)).join('、')}`);
+        }
+        if (data.items.length) {
+            const full = [], rest = [];
+            for (const it of data.items.slice().sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0))) {
+                const s = fmtItem(it);
+                if (used + s.length <= budget) { full.push(s); used += s.length; } else rest.push(it.name);
+            }
+            lines.push('', '## 物件', ...full);
+            if (rest.length) lines.push(`- 其他：${rest.join('、')}`);
+        }
+        return lines;
+    }
+
     function buildBlock() {
         const ctx = getCtx();
         const data = getData();
@@ -731,12 +1005,14 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (k < 0) break;
             past.splice(k, 1); dropped++;
         }
+        const ent = entityLines(data, chat);
         const count = canon.length + past.length;
-        if (!count) return { text: '', count: 0, chars: 0, dropped };
+        if (!count && !ent.length) return { text: '', count: 0, chars: 0, dropped };
         const parts = [
             '<erato_memory>',
-            '[长期记忆 · 由记忆插件维护 · 覆盖最近三回合之前的全部剧情，按时间顺序]',
+            '[长期记忆 · 由记忆插件维护 · 关系现状/人物志/物件是截至目前的档案；正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
             '[仅作为已发生事实使用：不复述、不总结、不预告；信息差按「知情」栏执行，未列名者不知情]',
+            ...ent,
         ];
         if (canon.length) parts.push('', '## 正典', ...canon.map(e => fmtEntry(e, false)));
         if (past.length) parts.push('', '## 往事', ...past.map(e => fmtEntry(e, true)));
@@ -755,7 +1031,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         }
         const b = buildBlock();
         lastInject = b;
-        ctx.setExtensionPrompt(PROMPT_KEY, b.count ? b.text : '', IN_CHAT, depth, false, ROLE_SYSTEM);
+        ctx.setExtensionPrompt(PROMPT_KEY, b.text, IN_CHAT, depth, false, ROLE_SYSTEM);
         log('注入', b.count, '条', b.chars, '字', b.dropped ? `裁掉 ${b.dropped}` : '');
     }
 
@@ -769,37 +1045,43 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function counts() {
         const data = getData();
-        const c = { total: 0, ok: 0, pending: 0, failed: 0, refused: 0, stale: 0, orphan: 0, todo: 0, hidden: 0 };
+        const c = { events: 0, done: 0, todo: 0, todoAuto: 0, failed: 0, refused: 0, pending: 0, stale: 0, orphan: 0, hidden: 0, people: 0, items: 0 };
         if (!data) return c;
-        for (const e of data.entries) { c.total++; if (c[e.status] !== undefined) c[e.status]++; }
+        c.events = data.entries.filter(e => e.status === 'ok').length;
+        for (const w of data.windows) { if (w.status === 'ok') c.done += w.floors.length; else if (c[w.status] !== undefined) c[w.status]++; }
         const chat = getCtx().chat || [];
-        c.todo = pendingFloors(chat, data).length;
+        c.todo = uncoveredFloors(chat, data, true).length + winFloors(retryWindows(data));
+        c.todoAuto = uncoveredFloors(chat, data, false).length;
         for (const m of chat) if (m?.is_system && m.send_date && data.hidden[m.send_date]) c.hidden++;
+        c.people = data.people.length; c.items = data.items.length;
         return c;
     }
 
     function refreshStatus() {
         const c = counts();
         const bad = c.failed + c.refused;
+        const N = Math.max(0, Number(settings.autoInterval) || 0);
         const injectLine = `本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（预算裁掉 ${lastInject.dropped}）` : ''}`;
-        $('.em-status').text(`已总结 ${c.ok} · 待总结 ${c.todo} · 失败 ${bad} · 孤立 ${c.orphan} · 已隐藏 ${c.hidden} · ${injectLine}`);
+        const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}），单次最多 ${Math.max(1, Number(settings.windowFloors) || 20)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 20)} 楼`;
+        $('.em-status').text(`已总结 ${c.done} 楼 / ${c.events} 条 · 待总结 ${c.todo} 楼 · 失败 ${bad} 段 · 人物 ${c.people} · 物件 ${c.items} · 已隐藏 ${c.hidden} · ${injectLine}`);
 
-        $('#em_n_ok').text(c.ok); $('#em_n_todo').text(c.todo); $('#em_n_hidden').text(c.hidden); $('#em_n_bad').text(bad);
+        $('#em_n_ok').text(c.done); $('#em_n_todo').text(c.todo); $('#em_n_hidden').text(c.hidden); $('#em_n_bad').text(bad);
         $('#em_tile_bad').toggle(bad > 0);
         $('#em_inject_line').text(injectLine);
+        $('#em_auto_line').text(autoLine);
 
         const main = $('#em_main');
         if (run.busy && run.manual) main.text(`停止（${run.done}/${run.total}）`).addClass('em-stop');
-        else main.text(c.todo ? `总结前文（${c.todo} 楼）` : '总结前文').removeClass('em-stop');
+        else main.text(c.todo ? `总结到当前（${c.todo} 楼）` : '总结到当前').removeClass('em-stop');
         const prog = $('#em_progress');
         if (run.busy && run.total) {
             prog.show().find('.em-bar').css('width', `${Math.round(run.done / run.total * 100)}%`);
-            prog.find('.em-prog-txt').text(`正在总结 ${run.done}/${run.total}`);
+            prog.find('.em-prog-txt').text(`正在总结 ${run.done}/${run.total} 楼`);
         } else prog.hide();
 
-        const suffix = run.busy ? ' · 处理中' : bad ? ` · ${bad} 条失败` : '';
+        const suffix = run.busy ? ' · 处理中' : bad ? ` · ${bad} 段失败` : '';
         $('#em_wand_txt').text(`记忆面板${suffix}`);
-        $('#em_wand_sum_txt').text(run.busy ? `总结前文 · ${run.done}/${run.total || '?'}` : c.todo ? `总结前文 · 尚有 ${c.todo} 楼` : '总结前文 · 已全部总结');
+        $('#em_wand_sum_txt').text(run.busy ? `总结到当前 · ${run.done}/${run.total || '?'}` : c.todo ? `总结到当前 · 尚有 ${c.todo} 楼` : '总结到当前 · 已全部总结');
         $('#em_wand, #em_wand_sum').toggle(!!settings.enabled);
 
         const ball = $('#em_ball');
@@ -900,7 +1182,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         updateBallVisibility();
     }
 
-    // 输入框左侧魔杖菜单：记忆面板（带状态）+ 总结前文（不开面板直接跑）
+    // 输入框左侧魔杖菜单：记忆面板（带状态）+ 总结到当前（不开面板直接跑）
     function addWandEntries() {
         const menu = $('#extensionsMenu');
         if (!menu.length) return;
@@ -912,7 +1194,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const sumItem = $(`
         <div id="em_wand_sum" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
             <div class="fa-solid fa-book-open extensionsMenuExtensionButton"></div>
-            <span id="em_wand_sum_txt">总结前文</span>
+            <span id="em_wand_sum_txt">总结到当前</span>
         </div>`);
         menu.append(panelItem, sumItem);
         panelItem.on('click', () => togglePanel(true));
@@ -924,18 +1206,39 @@ C = 日常、闲聊、氛围、无后果的互动。
     function settingsFormHtml() {
         return `
         <div class="em-form">
-            <div class="em-sec">总结</div>
+            <div class="em-sec">总结节奏</div>
             <label class="checkbox_label"><input type="checkbox" id="em_enabled"><span>启用记忆（关掉后悬浮球与注入一并停用）</span></label>
-            <label class="checkbox_label"><input type="checkbox" id="em_auto"><span>聊天进行中自动总结新楼层（关掉则只手动「总结前文」）</span></label>
+            <div class="em-row">
+                <label>自动总结
+                    <select id="em_auto_sel">
+                        <option value="0">手动（只在点按钮时总结）</option>
+                        <option value="10">每 10 楼</option><option value="15">每 15 楼</option><option value="20">每 20 楼</option>
+                        <option value="custom">自定义…</option>
+                    </select>
+                </label>
+                <label>自定义楼数（0 = 手动） <input id="em_auto_n" class="text_pole" type="number" min="0" max="500"></label>
+            </div>
+            <div class="em-row">
+                <label>单次总结最大楼层
+                    <select id="em_win_sel">
+                        <option value="20">20 楼</option><option value="30">30 楼</option><option value="50">50 楼</option><option value="100">100 楼</option>
+                        <option value="custom">自定义…</option>
+                    </select>
+                </label>
+                <label>自定义楼数 <input id="em_win_n" class="text_pole" type="number" min="1" max="500"></label>
+                <label>单次最大字数 <input id="em_call_chars" class="text_pole" type="number" min="2000" step="5000" title="一次调用喂给副模型的材料上限，超过就自动再切一段；按副模型上下文大小调"></label>
+            </div>
+            <div class="em-hint">一次调用吃的楼越多越省钱、也越粗：日常 20–30 楼；清不在乎细节的老积压再开到 50–100。楼数与字数两个上限先到者生效；副模型拒答或输出损坏时自动对半拆分重试。</div>
             <label class="checkbox_label"><input type="checkbox" id="em_hide"><span>总结完成后隐藏已总结楼层（可逆，「更多 → 取消隐藏」恢复）</span></label>
             <div class="em-row">
                 <label>保留可见楼数 <input id="em_keep" class="text_pole" type="number" min="2" max="40" title="从最新一条往前数，这么多条消息不隐藏；6 = 三回合"></label>
-                <label>自动模式单次楼数 <input id="em_batch" class="text_pole" type="number" min="1" max="200"></label>
-            </div>
-            <div class="em-row">
                 <label>正文窗口 <input id="em_window" class="text_pole" type="number" min="2" max="40" title="可见楼层里深度不足此数的不注入（与预设 6🌸 的 minDepth 一致）"></label>
                 <label>注入深度 <input id="em_depth" class="text_pole" type="number" min="0" max="40"></label>
-                <label>注入上限(字) <input id="em_maxchars" class="text_pole" type="number" min="1000" step="500"></label>
+            </div>
+            <div class="em-row">
+                <label>记忆注入上限(字) <input id="em_maxchars" class="text_pole" type="number" min="1000" step="500"></label>
+                <label>档案注入上限(字) <input id="em_ent_chars" class="text_pole" type="number" min="200" step="100" title="关系现状 + 人物志 + 物件在注入块里的总字数；放不下的人物降为只列名字"></label>
+                <label>人物激活扫描楼数 <input id="em_scan" class="text_pole" type="number" min="1" max="40" title="最近这么多条可见消息里提到的人物出完整档案，其余只列名字"></label>
             </div>
             <hr>
             <div class="em-sec">副 API（OpenAI 兼容）</div>
@@ -969,7 +1272,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             <div class="em-sec">提示词</div>
             <label>记忆导演指令（附加到每次摘要，可空）<textarea id="em_directive" class="text_pole" rows="2" placeholder="例：重点记录承诺与信息差"></textarea></label>
             <label>系统提示词（留空用默认）<textarea id="em_sys_prompt" class="text_pole" rows="3"></textarea></label>
-            <label>摘要模板（留空用默认；必须含 {{content}}，其余占位符：{{name1}} {{name2}} {{recent}} {{user_text}} {{recap}} {{directive}}）<textarea id="em_tpl" class="text_pole" rows="8"></textarea></label>
+            <label>摘要模板（留空用默认；必须含 {{material}}，其余占位符：{{name1}} {{name2}} {{roster}} {{relation}} {{recent}} {{floor_range}} {{floor_count}} {{max_events}} {{directive}}）<textarea id="em_tpl" class="text_pole" rows="8"></textarea></label>
             <div class="em-row">
                 <div class="menu_button" id="em_tpl_fill">把默认模板填进来改</div>
                 <div class="menu_button" id="em_tpl_reset">恢复默认</div>
@@ -977,7 +1280,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             <hr>
             <div class="em-sec">调试</div>
             <label class="checkbox_label"><input type="checkbox" id="em_debug"><span>控制台调试日志</span></label>
-            <div class="em-hint">斜杠命令：/em-panel 开面板 · /em-summarize 总结前文 · /em-pin 楼层号 钉/取消钉 · /em-note 文字 手动记一条</div>
+            <div class="em-hint">斜杠命令：/em-panel 开面板 · /em-summarize 总结到当前 · /em-pin 楼层号 钉/取消钉 · /em-note 文字 手动记一条</div>
             <div class="em-status"></div>
         </div>`;
     }
@@ -1002,9 +1305,19 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function bindSettingsForm() {
         $('#em_enabled').prop('checked', settings.enabled).on('change', function () { setEnabled(this.checked); });
-        $('#em_auto').prop('checked', settings.autoIngest).on('change', function () {
-            settings.autoIngest = this.checked; saveSettings();
-        });
+        // 下拉给常用档位，数字框可填任意值；两者互相同步
+        const bindPick = (selId, numId, key, quick, min) => {
+            const sel = $(selId), num = $(numId);
+            const sync = () => { const v = Math.max(min, Number(settings[key]) || 0); settings[key] = v; sel.val(quick.includes(v) ? String(v) : 'custom'); num.val(v); };
+            sync();
+            sel.on('change', function () {
+                if (this.value === 'custom') { num.trigger('focus'); return; }
+                settings[key] = Number(this.value); saveSettings(); sync(); refreshStatus();
+            });
+            num.on('change', function () { settings[key] = Math.max(min, Number(this.value) || 0); saveSettings(); sync(); refreshStatus(); });
+        };
+        bindPick('#em_auto_sel', '#em_auto_n', 'autoInterval', [0, 10, 15, 20], 0);
+        bindPick('#em_win_sel', '#em_win_n', 'windowFloors', [20, 30, 50, 100], 1);
         $('#em_hide').prop('checked', settings.hideSummarized).on('change', function () { setHideSummarized(this.checked); });
         const bindApi = (id, key, num) => $(id).val(settings.api[key]).on('change', function () {
             settings.api[key] = num ? Number(this.value) : this.value.trim(); saveSettings();
@@ -1039,7 +1352,9 @@ C = 日常、闲聊、氛围、无后果的互动。
         bindNum('#em_window', 'contentWindow', () => { applyInjection(); renderPanel(); });
         bindNum('#em_depth', 'injectDepth', applyInjection);
         bindNum('#em_maxchars', 'maxInjectChars', applyInjection);
-        bindNum('#em_batch', 'ingestBatch');
+        bindNum('#em_call_chars', 'maxCallChars');
+        bindNum('#em_ent_chars', 'entityChars', applyInjection);
+        bindNum('#em_scan', 'npcScanDepth', applyInjection);
         bindNum('#em_keep', 'keepVisible', () => { $('#em_keep_q').val(settings.keepVisible); if (settings.hideSummarized) { hideSummarized(); applyInjection(); refreshStatus(); } });
 
         $('#em_ball_on').prop('checked', settings.ball.enabled).on('change', function () { settings.ball.enabled = this.checked; saveSettings(); updateBallVisibility(); });
@@ -1053,7 +1368,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_sys_prompt').val(settings.systemPrompt).attr('placeholder', DEFAULT_SYSTEM_PROMPT).on('change', function () { settings.systemPrompt = this.value; saveSettings(); });
         $('#em_tpl').val(settings.promptTemplate).attr('placeholder', '（留空 = 默认模板，点下方按钮可把默认填进来修改）').on('change', function () {
             settings.promptTemplate = this.value; saveSettings();
-            if (this.value.trim() && !this.value.includes('{{content}}')) toast('warning', '模板缺少 {{content}}，摘要时会退回默认模板');
+            if (this.value.trim() && !this.value.includes('{{material}}')) toast('warning', '模板缺少 {{material}}，摘要时会退回默认模板');
         });
         $('#em_tpl_fill').on('click', () => { $('#em_tpl').val(DEFAULT_USER_TEMPLATE); settings.promptTemplate = DEFAULT_USER_TEMPLATE; saveSettings(); });
         $('#em_tpl_reset').on('click', () => { $('#em_tpl').val(''); $('#em_sys_prompt').val(''); settings.promptTemplate = ''; settings.systemPrompt = ''; saveSettings(); toast('info', '已恢复默认提示词'); });
@@ -1096,7 +1411,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 </div>
                 <div class="inline-drawer-content">
                     <label class="checkbox_label"><input type="checkbox" id="em_enabled_d"><span>启用</span></label>
-                    <div class="em-hint">入口：屏幕上的悬浮球，或输入框左侧魔杖菜单里的「记忆面板 / 总结前文」。副 API、隐藏楼层、悬浮球样式等都在面板的设置页。</div>
+                    <div class="em-hint">入口：屏幕上的悬浮球，或输入框左侧魔杖菜单里的「记忆面板 / 总结到当前」。总结节奏、副 API、隐藏楼层、悬浮球样式等都在面板的设置页。</div>
                     <div class="em-row">
                         <div class="menu_button" id="em_open">打开记忆面板</div>
                         <div class="menu_button" id="em_open_cfg">设置</div>
@@ -1119,7 +1434,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     let addingManual = false;
     const expanded = new Set();
     const filter = { grade: '', type: '', status: '', q: '' };
-    const sections = { timeline: true, preview: false };
+    const sections = { entities: true, timeline: true, preview: false };
 
     function addPanel() {
         const html = `
@@ -1132,13 +1447,14 @@ C = 日常、闲聊、氛围、无后果的互动。
             <div id="em_view_mem" class="em-view">
                 <div class="em-stats">
                     <div class="em-tile"><div class="em-num" id="em_n_ok">0</div><div class="em-lbl">已总结楼层</div></div>
-                    <div class="em-tile"><div class="em-num" id="em_n_todo">0</div><div class="em-lbl">待总结</div></div>
+                    <div class="em-tile"><div class="em-num" id="em_n_todo">0</div><div class="em-lbl">待总结楼层</div></div>
                     <div class="em-tile"><div class="em-num" id="em_n_hidden">0</div><div class="em-lbl">已隐藏消息</div></div>
-                    <div class="em-tile em-tile-bad" id="em_tile_bad" style="display:none"><div class="em-num" id="em_n_bad">0</div><div class="em-lbl">失败</div></div>
+                    <div class="em-tile em-tile-bad" id="em_tile_bad" style="display:none"><div class="em-num" id="em_n_bad">0</div><div class="em-lbl">失败段落</div></div>
                 </div>
+                <div class="em-inject-line" id="em_auto_line"></div>
                 <div class="em-inject-line" id="em_inject_line"></div>
                 <div class="em-actbar">
-                    <div class="menu_button em-main" id="em_main">总结前文</div>
+                    <div class="menu_button em-main" id="em_main">总结到当前</div>
                     <div class="em-hide-q">
                         <label class="checkbox_label"><input type="checkbox" id="em_hide_q"><span>隐藏已总结 · 保留</span></label>
                         <input id="em_keep_q" class="text_pole em-keep-q" type="number" min="2" max="40"><span>楼</span>
@@ -1147,7 +1463,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 </div>
                 <div id="em_more_menu" class="em-menu" style="display:none">
                     <div class="em-menu-item" data-act="add">手动新增一条记忆</div>
-                    <div class="em-menu-item" data-act="retry">重试失败的楼层</div>
+                    <div class="em-menu-item" data-act="retry">重试失败的段落</div>
                     <div class="em-menu-item" data-act="unhide">取消隐藏（恢复本插件藏起来的楼层）</div>
                     <div class="em-menu-item" data-act="export">导出 JSON</div>
                     <div class="em-menu-item" data-act="import">导入 JSON</div>
@@ -1158,6 +1474,10 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <div id="em_progress" class="em-progress" style="display:none"><div class="em-bar"></div><div class="em-prog-txt"></div></div>
                 <div id="em_alert" class="em-alert" style="display:none"></div>
 
+                <div class="em-section" data-sec="entities">
+                    <div class="em-sec-head"><span>人物与物件</span><span class="em-sec-arrow"></span></div>
+                    <div class="em-sec-body"><div id="em_ents" class="em-ents"></div></div>
+                </div>
                 <div class="em-section" data-sec="timeline">
                     <div class="em-sec-head"><span>时间线</span><span class="em-sec-arrow"></span></div>
                     <div class="em-sec-body">
@@ -1202,6 +1522,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_more').on('click', ev => { ev.stopPropagation(); $('#em_more_menu').toggle(); });
         $('#em_more_menu').on('click', '.em-menu-item', function () { $('#em_more_menu').hide(); panelAction($(this).data('act')); });
         $('#em_panel').on('click', ev => { if (!$(ev.target).closest('#em_more, #em_more_menu').length) $('#em_more_menu').hide(); });
+        $('#em_panel').on('click', '.em-jump', function (ev) { ev.stopPropagation(); jumpTo(Number($(this).data('idx'))); });
         $('#em_import_file').on('change', importFile);
 
         $('#em_panel .em-sec-head').on('click', function () {
@@ -1218,12 +1539,28 @@ C = 日常、闲聊、氛围、无后果的互动。
 
         $('#em_manual_form').on('click', '[data-mact]', function () { manualFormAction($(this).data('mact')); });
 
-        const list = $('#em_list');
-        list.on('click', '.em-card-head', function () {
-            const id = $(this).closest('.em-card').data('id');
+        const ents = $('#em_ents');
+        ents.on('click', '.em-ent-head', function () {
+            const id = $(this).closest('.em-ent').data('id');
             expanded.has(id) ? expanded.delete(id) : expanded.add(id);
             renderPanel();
         });
+        ents.on('click', '[data-xact]', function (ev) { ev.stopPropagation(); entityAction($(this).data('xact'), $(this).closest('.em-ent').data('id')); });
+        ents.on('change', '#em_rel', function () {
+            const data = getData(); if (!data) return;
+            data.relation.v = this.value.trim(); data.relation.manual = true;
+            saveData(); applyInjection(); toast('success', '关系现状已保存');
+        });
+
+        const list = $('#em_list');
+        list.on('click', '.em-card-head', function () {
+            const card = $(this).closest('.em-card');
+            if (card.hasClass('em-wcard')) return;
+            const id = card.data('id');
+            expanded.has(id) ? expanded.delete(id) : expanded.add(id);
+            renderPanel();
+        });
+        list.on('click', '[data-wact]', function (ev) { ev.stopPropagation(); windowAction($(this).data('wact'), $(this).closest('.em-wcard').data('wid')); });
         // 等级块：点按循环 S→A→B→C，长按钉/取消钉
         let pressTimer = null, longPressed = false;
         list.on('pointerdown', '.em-grade', function () {
@@ -1286,6 +1623,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         return true;
     }
 
+    const floorsLabel = e => {
+        const f = e.src?.floors;
+        if (!f?.length) return `#${e.src?.idx ?? '?'}`;
+        return f.length > 1 ? `#${f[0]}–#${f[f.length - 1]}` : `#${f[0]}`;
+    };
+
     function cardHtml(e, depths) {
         const open = expanded.has(e.id);
         const badges = [];
@@ -1305,12 +1648,11 @@ C = 日常、闲聊、氛围、无后果的互动。
                 ${e.intimacy ? `<div class="em-sub">亲密：${esc([e.intimacy.acts, e.intimacy.consent, e.intimacy.firsts, e.intimacy.aftermath].filter(Boolean).join('；'))}</div>` : ''}
                 ${e.tags?.length ? `<div class="em-sub">标签：${esc(e.tags.join(' / '))}</div>` : ''}
                 ${e.grade_reason ? `<div class="em-sub">定级理由：${esc(e.grade_reason)}</div>` : ''}
-                ${e.last_error ? `<div class="em-sub em-err">错误：${esc(e.last_error)}（已试 ${e.attempts} 次）</div>` : ''}
                 <div class="em-actions">
                     <div class="menu_button" data-eact="save">保存</div>
-                    ${e.manual ? '' : '<div class="menu_button" data-eact="resum">重摘要</div>'}
+                    ${e.manual ? '' : '<div class="menu_button" data-eact="resum">重跑本段</div>'}
                     <div class="menu_button" data-eact="jump">跳到该楼</div>
-                    ${e.manual ? '' : '<div class="menu_button" data-eact="skip">该楼不入库</div>'}
+                    ${e.manual ? '' : '<div class="menu_button" data-eact="skip">本段不入库</div>'}
                     <div class="menu_button em-danger" data-eact="del">删除</div>
                 </div>
             </div>` : '';
@@ -1320,18 +1662,85 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <div class="em-grade" title="点按改等级，长按钉/取消钉">${e.grade}</div>
                 <div class="em-card-main">
                     <div class="em-ttl-row"><span class="em-ttl">${esc(e.title || '（未摘要）')}</span><span class="em-time">${esc(e.story_time || '（时间未知）')}</span></div>
-                    ${!open ? `<div class="em-sum">${esc(e.summary || e.last_error || '…')}</div>` : ''}
+                    ${!open ? `<div class="em-sum">${esc(e.summary || '…')}</div>` : ''}
                     <div class="em-meta">
                         ${e.characters?.length ? `<span>人物：${esc(e.characters.join('、'))}</span>` : ''}
                         ${e.tags?.length ? `<span class="em-tags">${esc(e.tags.slice(0, 4).join(' · '))}</span>` : ''}
                         <span>${TYPE_LABEL[e.type] || e.type}</span>
                         ${badges.join('')}
-                        <span class="em-floor">#${e.src?.idx ?? '?'}${hiddenMark}</span>
+                        <span class="em-floor">${floorsLabel(e)}${hiddenMark}</span>
                     </div>
                 </div>
             </div>
             ${body}
         </div>`;
+    }
+
+    // 失败/拒答/排队中的段落在时间线顶部显示为一张卡，能重试、拆半、标不入库
+    function winCardHtml(w) {
+        const n = w.floors.length;
+        return `
+        <div class="em-card em-dim em-wcard" data-wid="${w.id}">
+            <div class="em-card-head">
+                <div class="em-grade em-grade-bad">!</div>
+                <div class="em-card-main">
+                    <div class="em-ttl-row"><span class="em-ttl">${winLabel(w)} · ${n} 楼 · ${STATUS_LABEL[w.status] || w.status}</span></div>
+                    <div class="em-sum">${esc(w.last_error || (run.busy ? '排队中' : '等待重试'))}</div>
+                    <div class="em-meta">
+                        <span>已试 ${w.attempts} 次</span>
+                        ${w.fallback ? '<span class="em-badge em-st-fallback">兜底抠取</span>' : ''}
+                        <span class="em-floor em-jump" data-idx="${w.floors[0]}">跳到 #${w.floors[0]}</span>
+                    </div>
+                </div>
+            </div>
+            <div class="em-actions em-wact">
+                <div class="menu_button" data-wact="retry">重试</div>
+                ${n > 1 ? '<div class="menu_button" data-wact="split">拆半重试</div>' : ''}
+                <div class="menu_button em-danger" data-wact="skip">本段不入库</div>
+            </div>
+        </div>`;
+    }
+
+    function entHtml(kind, x) {
+        const open = expanded.has(x.id);
+        const fields = kind === 'p' ? PERSON_FIELDS : ITEM_FIELDS;
+        const label = k => kind === 'p' ? personLabel(k) : ITEM_LABEL[k];
+        const rows = fields.map(k => {
+            const f = x.f?.[k];
+            if (open) return `<label>${esc(label(k))}<input class="text_pole em-x-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
+            if (!f?.v) return '';
+            return `<div class="em-ent-row"><span class="em-ent-k">${esc(label(k))}</span><span class="em-ent-v">${esc(f.v)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
+        }).join('');
+        const alias = kind === 'p' && x.aliases?.length ? `<span class="em-ent-alias">（${esc(x.aliases.join('/'))}）</span>` : '';
+        return `
+        <div class="em-ent" data-id="${x.id}">
+            <div class="em-ent-head"><span class="em-ent-name">${kind === 'p' ? '👤' : '📦'} ${esc(x.name)}${alias}</span><span class="em-floor">首见 #${x.first_idx ?? '?'}</span></div>
+            ${open ? `<div class="em-ent-body">
+                <label>名字<input class="text_pole em-x-name" value="${esc(x.name)}"></label>
+                ${kind === 'p' ? `<label>别称（顿号分隔）<input class="text_pole em-x-alias" value="${esc((x.aliases || []).join('、'))}"></label>` : ''}
+                ${rows}
+                <div class="em-actions"><div class="menu_button" data-xact="save">保存</div><div class="menu_button em-danger" data-xact="del">删除</div></div>
+            </div>` : `<div class="em-ent-rows">${rows}</div>`}
+        </div>`;
+    }
+
+    function renderEntities(data) {
+        const ctx = getCtx();
+        const rel = data.relation || {};
+        const parts = [`
+        <div class="em-rel"><label>${esc(ctx.name2 || '{{char}}')} 对 ${esc(ctx.name1 || '{{user}}')} 的关系现状${rel.idx != null ? ` <span class="em-floor em-jump" data-idx="${rel.idx}">#${rel.idx}</span>` : ''}
+            <input id="em_rel" class="text_pole" value="${esc(rel.v || '')}" placeholder="（尚无记录，总结后由副 AI 填写，也可手改）"></label></div>`];
+        const byRecent = (a, b) => (b.last_idx || 0) - (a.last_idx || 0);
+        parts.push(...data.people.slice().sort(byRecent).map(p => entHtml('p', p)));
+        parts.push(...data.items.slice().sort(byRecent).map(i => entHtml('i', i)));
+        if (!data.people.length && !data.items.length) parts.push('<div class="em-empty">还没有人物志或物件，总结后由副 AI 自动建档（不含主角）</div>');
+        $('#em_ents').html(parts.join(''));
+    }
+
+    function jumpTo(idx) {
+        const el = document.querySelector(`#chat .mes[mesid="${idx}"]`);
+        if (!el) return toast('warning', '该楼不在当前视图');
+        togglePanel(false); el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 
     function manualFormHtml() {
@@ -1388,28 +1797,31 @@ C = 日常、闲聊、氛围、无后果的互动。
         const data = getData();
         const list = $('#em_list');
         const form = $('#em_manual_form');
-        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_preview').text(''); return; }
+        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_ents').html(''); $('#em_preview').text(''); return; }
         const chat = getCtx().chat || [];
         const depths = visibleDepths(chat);
+        renderEntities(data);
         const items = data.entries.filter(matchFilter).slice().reverse();
-        if (items.length) {
-            list.html(items.map(e => cardHtml(e, depths)).join(''));
+        const wins = filter.q ? [] : data.windows.filter(w => ['failed', 'refused', 'pending'].includes(w.status) && (!filter.status || filter.status === w.status)).slice().reverse();
+        if (items.length || wins.length) {
+            list.html(wins.map(winCardHtml).join('') + items.map(e => cardHtml(e, depths)).join(''));
         } else {
-            const todo = pendingFloors(chat, data).length;
+            const todo = counts().todo;
+            const N = Math.max(0, Number(settings.autoInterval) || 0);
             const hasFilter = filter.grade || filter.type || filter.status || filter.q;
             list.html(`<div class="em-empty">${hasFilter ? '没有符合筛选的条目'
-                : todo ? `本聊天有 ${todo} 楼尚未总结，点上方「总结前文」开始`
-                    : data.entries.length ? '没有条目' : '还没有记忆。聊到第 4 楼后会自动开始总结，或点上方「总结前文」'}</div>`);
+                : todo ? `本聊天有 ${todo} 楼尚未总结，点上方「总结到当前」开始`
+                    : data.entries.length ? '没有条目' : `还没有记忆。${N ? `攒够 ${N} 楼后会自动总结，` : ''}点上方「总结到当前」可立刻总结`}</div>`);
         }
         if (addingManual) form.show().html(manualFormHtml()); else form.hide().empty();
 
-        $('#em_preview').text(lastInject.text || '（本轮没有可注入的条目）');
+        $('#em_preview').text(lastInject.text || '（本轮没有可注入的内容）');
 
         const c = counts();
         const alert = $('#em_alert');
         const bad = c.failed + c.refused;
         if (bad) {
-            alert.show().text(`${bad} 楼摘要失败（其中拒答 ${c.refused}）${data.stats.lastError ? '：' + data.stats.lastError : ''}。展开条目可看原因，「更多 → 重试失败」可重跑`);
+            alert.show().text(`${bad} 段摘要失败（其中拒答 ${c.refused}）${data.stats.lastError ? '：' + data.stats.lastError : ''}。时间线顶部可重试 / 拆半 / 标不入库，或「更多 → 重试失败」整批重跑`);
         } else if (!apiConfigured()) {
             alert.show().text('尚未配置副 API，不会自动总结（点此去设置）');
         } else {
@@ -1457,33 +1869,75 @@ C = 日常、闲聊、氛围、无后果的互动。
             e.summary = card.find('.em-e-summary').val().trim() || e.summary;
             e.emotion_shift = card.find('.em-e-emotion').val().trim();
             e.known_by = card.find('.em-e-known').val().split(/[、,，]/).map(s => s.trim()).filter(Boolean);
-            if (e.status === 'failed' || e.status === 'refused') e.status = e.summary.length >= 10 ? 'ok' : e.status;
             e.updated_at = Date.now();
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
             toast('success', '已保存');
         } else if (act === 'resum') {
+            const w = e.win ? winById(data, e.win) : null;
+            if (!w) return toast('error', '找不到这条记忆所属的段落');
             if (!apiConfigured()) return toast('warning', '请先配置副 API');
-            const ctx = getCtx();
-            const i = (ctx.chat || []).findIndex(m => m && m.send_date === e.src?.send_date);
-            if (i < 0) return toast('error', '找不到对应楼层');
-            toast('info', `正在重摘要 #${i} 楼…`);
-            e.status = 'stale'; e.attempts = 0;
-            await ingestFloor(i);
-            saveData(); applyInjection(); renderPanel(); refreshStatus();
-            toast(e.status === 'ok' ? 'success' : 'error', e.status === 'ok' ? '重摘要完成' : `失败：${e.last_error}`);
+            if (run.busy) return toast('info', '正在总结中，稍后再试');
+            const n = winEntries(data, w.id).length;
+            if (!await confirmBox(`重跑 ${winLabel(w)} 共 ${w.floors.length} 楼（一次副 API 调用），该段现有 ${n} 条记忆会被替换。继续？`)) return;
+            w.status = 'stale'; w.attempts = 0; saveData();
+            run.failToasted = false;
+            ingest('retry');
         } else if (act === 'jump') {
-            const el = document.querySelector(`#chat .mes[mesid="${e.src?.idx}"]`);
-            if (!el) return toast('warning', '该楼不在当前视图');
-            togglePanel(false); el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            jumpTo(e.src?.idx);
         } else if (act === 'skip') {
-            if (!await confirmBox('把这一楼标记为「不入库」并删除其条目？')) return;
-            if (e.src?.send_date) data.skip[e.src.send_date] = true;
-            data.entries = data.entries.filter(x => x.id !== id);
-            saveData(); applyInjection(); renderPanel(); refreshStatus();
+            if (e.win) return windowAction('skip', e.win);
         } else if (act === 'del') {
-            if (!await confirmBox(e.manual ? '删除这条手动记忆？' : '删除这条记忆？该楼下次总结时会重新入库（除非标记不入库）')) return;
+            if (!await confirmBox(e.manual ? '删除这条手动记忆？' : '删除这条记忆？该段楼层仍算已总结，不会自动重跑；要重新生成请用「重跑本段」')) return;
             data.entries = data.entries.filter(x => x.id !== id);
             saveData(); applyInjection(); renderPanel(); refreshStatus();
+        }
+    }
+
+    async function windowAction(act, wid) {
+        const data = getData(); if (!data) return;
+        const w = winById(data, wid); if (!w) return;
+        if (act === 'retry' || act === 'split') {
+            if (!apiConfigured()) return toast('warning', '请先配置副 API');
+            if (run.busy) return toast('info', '正在总结中，稍后再试');
+            if (act === 'split' && w.floors.length > 1) splitWindow(data, w);
+            else w.attempts = 0;
+            saveData();
+            run.failToasted = false;
+            ingest('retry');
+        } else if (act === 'skip') {
+            if (!await confirmBox(`把 ${winLabel(w)} 共 ${w.floors.length} 楼标记为「不入库」并删除其记忆？`)) return;
+            for (const d of w.dates) data.skip[d] = true;
+            data.windows = data.windows.filter(x => x.id !== wid);
+            data.entries = data.entries.filter(x => x.win !== wid);
+            saveData(); applyInjection(); renderPanel(); refreshStatus();
+        }
+    }
+
+    function entityAction(act, id) {
+        const data = getData(); if (!data) return;
+        const kind = data.people.some(x => x.id === id) ? 'p' : 'i';
+        const list = kind === 'p' ? data.people : data.items;
+        const x = list.find(v => v.id === id); if (!x) return;
+        const el = $(`#em_ents .em-ent[data-id="${id}"]`);
+        if (act === 'save') {
+            x.name = el.find('.em-x-name').val().trim() || x.name;
+            if (kind === 'p') x.aliases = el.find('.em-x-alias').val().split(/[、,，/]/).map(s => s.trim()).filter(Boolean);
+            el.find('.em-x-f').each(function () {
+                const k = $(this).data('k');
+                const v = this.value.trim();
+                if (!v) { delete x.f[k]; return; }
+                if (x.f[k]?.v !== v) x.f[k] = { v, idx: x.f[k]?.idx ?? x.last_idx ?? 0, date: x.f[k]?.date || '', manual: true };
+            });
+            x.updated_at = Date.now();
+            saveData(); applyInjection(); expanded.delete(id); renderPanel();
+            toast('success', '已保存');
+        } else if (act === 'del') {
+            confirmBox(`删除「${x.name}」的档案？下次总结若再出现会重新建档`).then(ok => {
+                if (!ok) return;
+                if (kind === 'p') data.people = data.people.filter(v => v.id !== id);
+                else data.items = data.items.filter(v => v.id !== id);
+                saveData(); applyInjection(); renderPanel(); refreshStatus();
+            });
         }
     }
 
@@ -1494,11 +1948,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (act === 'add') { addingManual = true; sections.timeline = true; applySections(); renderPanel(); }
         else if (act === 'retry') {
             let n = 0;
-            for (const e of data.entries) if (['failed', 'refused'].includes(e.status)) { e.attempts = 0; n++; }
+            for (const w of data.windows) if (['failed', 'refused'].includes(w.status)) { w.attempts = 0; n++; }
             saveData();
-            if (!n) return toast('info', '没有失败条目');
+            if (!n) return toast('info', '没有失败的段落');
+            if (run.busy) return toast('info', '正在总结中，稍后再试');
             run.failToasted = false;
-            ingest('manual');
+            ingest('retry');
         } else if (act === 'unhide') {
             const n = unhideAll();
             applyInjection(); renderPanel(); refreshStatus();
@@ -1514,7 +1969,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         } else if (act === 'import') {
             $('#em_import_file').val('').trigger('click');
         } else if (act === 'clear') {
-            if (!await confirmBox(`清空当前聊天的全部 ${data.entries.length} 条记忆？不可恢复（建议先导出）。本插件隐藏的楼层会一并恢复显示`)) return;
+            if (!await confirmBox(`清空当前聊天的全部记忆（${data.entries.length} 条、${data.people.length} 个人物、${data.items.length} 件物件）？不可恢复（建议先导出）。本插件隐藏的楼层会一并恢复显示`)) return;
             unhideAll();
             getCtx().chatMetadata[META_KEY] = defaultData();
             saveData(); applyInjection(); renderPanel(); refreshStatus();
@@ -1527,20 +1982,29 @@ C = 日常、闲聊、氛围、无后果的互动。
         reader.onload = async () => {
             try {
                 const obj = JSON.parse(String(reader.result));
-                const src = obj?.data?.entries ? obj.data : obj;
-                if (!Array.isArray(src?.entries)) throw new Error('文件里没有 entries');
+                const raw = obj?.data?.entries ? obj.data : obj;
+                if (!Array.isArray(raw?.entries)) throw new Error('文件里没有 entries');
+                const src = Object.assign(defaultData(), raw);
+                for (const k of ['entries', 'windows', 'people', 'items']) if (!Array.isArray(src[k])) src[k] = [];
+                if ((Number(raw.version) || 1) < 2) migrateV1(src);
                 const data = getData();
-                const mode = data.entries.length
-                    ? (await confirmBox(`当前已有 ${data.entries.length} 条。确定=替换，取消=合并（按楼层去重）`) ? 'replace' : 'merge')
+                const has = data.entries.length || data.windows.length || data.people.length || data.items.length;
+                const mode = has
+                    ? (await confirmBox(`当前已有 ${data.entries.length} 条记忆、${data.people.length} 个人物。确定=替换，取消=合并（按 id / 名字去重）`) ? 'replace' : 'merge')
                     : 'replace';
                 if (mode === 'replace') {
-                    data.entries = src.entries; data.skip = src.skip || {}; data.archives = src.archives || []; data.hidden = src.hidden || {};
+                    for (const k of ['entries', 'windows', 'people', 'items', 'relation', 'skip', 'archives', 'hidden']) data[k] = src[k];
                 } else {
-                    const have = new Set(data.entries.map(e => e.src?.send_date));
-                    for (const e of src.entries) if (!have.has(e.src?.send_date)) data.entries.push(e);
+                    const eIds = new Set(data.entries.map(e => e.id)), wIds = new Set(data.windows.map(w => w.id));
+                    for (const w of src.windows) if (!wIds.has(w.id)) data.windows.push(w);
+                    for (const e of src.entries) if (!eIds.has(e.id)) data.entries.push(e);
+                    for (const p of src.people) if (!findPerson(data, p.name)) data.people.push(p);
+                    for (const it of src.items) if (!findItem(data, it.name)) data.items.push(it);
+                    if (!data.relation?.v && src.relation?.v) data.relation = src.relation;
+                    Object.assign(data.skip, src.skip || {});
                 }
-                sortEntries(data); reconcile(); saveData(); applyInjection(); renderPanel(); refreshStatus();
-                toast('success', `已导入，现有 ${data.entries.length} 条`);
+                sortEntries(data); sortWindows(data); reconcile(); saveData(); applyInjection(); renderPanel(); refreshStatus();
+                toast('success', `已导入，现有 ${data.entries.length} 条记忆、${data.people.length} 个人物、${data.items.length} 件物件`);
             } catch (err) {
                 toast('error', `导入失败：${err.message}`);
             }
@@ -1556,15 +2020,15 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!P?.addCommand) return log('酒馆未暴露 SlashCommandParser.addCommand，跳过斜杠命令');
         const reg = (name, cb, help) => { try { P.addCommand(name, cb, [], help); } catch (err) { warn('注册 /' + name + ' 失败：', err); } };
         reg('em-panel', () => { togglePanel(true); return ''; }, '打开 Erato Memory 面板');
-        reg('em-summarize', () => { summarizeAll(); return ''; }, '总结前文：把所有未总结的楼层入库');
+        reg('em-summarize', () => { summarizeAll(); return ''; }, '总结到当前：把所有未总结的楼层入库（含最新楼）');
         reg('em-pin', (args, value) => {
             const data = getData(); if (!data) return '没有打开聊天';
             const idx = Number(String(value || '').trim());
             if (!Number.isInteger(idx)) return '用法：/em-pin 楼层号';
-            const e = data.entries.find(x => !x.manual && x.src?.idx === idx);
+            const e = data.entries.find(x => !x.manual && (x.src?.floors || []).includes(idx)) || data.entries.find(x => !x.manual && x.src?.idx === idx);
             if (!e) return `第 ${idx} 楼还没有记忆条目`;
-            return togglePin(e.id) ? `已钉第 ${idx} 楼为 S` : `已取消钉第 ${idx} 楼`;
-        }, '钉/取消钉某楼的记忆为 S：/em-pin 楼层号');
+            return togglePin(e.id) ? `已钉「${e.title}」为 S` : `已取消钉「${e.title}」`;
+        }, '钉/取消钉某楼所在的记忆为 S：/em-pin 楼层号');
         reg('em-note', (args, value) => {
             const text = String(value || '').trim();
             if (!text) return '用法：/em-note 要记住的内容';
@@ -1582,12 +2046,13 @@ C = 日常、闲聊、氛围、无后果的互动。
     function bindEvents() {
         const ctx = getCtx();
         const es = ctx.eventSource, ET = ctx.eventTypes;
-        const ingestSoon = debounce(() => { if (settings.autoIngest) ingest('auto'); }, 800);
+        const autoOn = () => Number(settings.autoInterval) > 0;
+        const ingestSoon = debounce(() => { if (autoOn()) ingest('auto'); }, 800);
         const resync = () => { reconcile(); applyInjection(); renderPanel(); refreshStatus(); };
 
         es.on(ET.CHAT_CHANGED, () => {
             expanded.clear(); addingManual = false; run.stop = true; run.failToasted = false;
-            setTimeout(() => { resync(); if (settings.autoIngest) ingest('chat_changed'); }, 1500);
+            setTimeout(() => { resync(); if (autoOn()) ingest('chat_changed'); }, 1500);
         });
         es.on(ET.MESSAGE_RECEIVED, ingestSoon);
         es.on(ET.MESSAGE_DELETED, resync);
@@ -1598,7 +2063,8 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 控制台排障入口（手机上可配合 Eruda）：eratoMemory_debug.buildBlock() 等
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
-        getData, counts, pendingFloors, visibleDepths, hideSummarized, unhideAll, addManualEntry, settings,
+        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, mergeEntities, coverage,
+        visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings,
     };
 
     jQuery(() => {

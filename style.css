@@ -161,3 +161,24 @@
 @media (min-width: 800px) {
     .em-panel { inset: 0 0 0 auto; width: 560px; border-left: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
 }
+
+/* ---------- 人物与物件 ---------- */
+.em-ents { display: flex; flex-direction: column; gap: 6px; }
+.em-rel label { display: flex; flex-direction: column; font-size: .8em; gap: 2px; }
+.em-rel input { width: 100%; box-sizing: border-box; }
+.em-ent { border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); border-radius: 8px; background: var(--black30a, rgba(0,0,0,.25)); padding: 6px 10px; }
+.em-ent-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; cursor: pointer; font-weight: bold; }
+.em-ent-alias { font-weight: normal; opacity: .7; font-size: .85em; }
+.em-ent-rows { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; font-size: .82em; }
+.em-ent-row { display: flex; gap: 6px; align-items: baseline; }
+.em-ent-k { opacity: .7; flex: 0 0 4.5em; }
+.em-ent-v { flex: 1 1 auto; min-width: 0; }
+.em-jump { cursor: pointer; text-decoration: underline dotted; }
+.em-ent-body { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.em-ent-body label { display: flex; flex-direction: column; font-size: .8em; opacity: .9; }
+.em-ent-body input { width: 100%; box-sizing: border-box; }
+
+/* ---------- 失败段落卡 ---------- */
+.em-wcard .em-card-head { cursor: default; }
+.em-wcard .em-actions { padding: 0 10px 10px; }
+.em-grade-bad { background: rgba(230,80,80,.6) !important; }
