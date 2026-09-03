@@ -1438,6 +1438,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function addPanel() {
         const html = `
+        <div id="em_backdrop" class="em-backdrop" style="display:none"></div>
         <div id="em_panel" class="em-panel" style="display:none">
             <div class="em-head">
                 <div id="em_back" class="em-back fa-solid fa-chevron-left interactable" tabindex="0" style="display:none"></div>
@@ -1508,6 +1509,8 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('body').append(html);
 
         $('#em_close').on('click', () => togglePanel(false));
+        $('#em_backdrop').on('click', () => togglePanel(false));
+        $(document).on('keydown', ev => { if (ev.key === 'Escape' && panelOpen) togglePanel(false); });
         $('#em_back').on('click', () => showTab('mem'));
         $('#em_alert').on('click', () => { const bad = counts().failed + counts().refused; if (!bad) showTab('cfg'); });
         bindSettingsForm();
@@ -1597,10 +1600,27 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (panelTab === 'cfg') renderModelSelect();
     }
 
+    // 主题的 BlurTint 可能半透明，面板下面先垫一层实底：正文字色亮就垫深色，字色暗就垫浅色
+    function applyPanelBase() {
+        const panel = document.getElementById('em_panel');
+        if (!panel) return;
+        let light = false;
+        try {
+            const raw = getComputedStyle(document.body).getPropertyValue('--SmartThemeBodyColor').trim();
+            let rgb = null;
+            if (/^#[0-9a-f]{6}/i.test(raw)) rgb = [1, 3, 5].map(i => parseInt(raw.slice(i, i + 2), 16));
+            else { const m = raw.match(/\d+(\.\d+)?/g); if (m && m.length >= 3) rgb = m.slice(0, 3).map(Number); }
+            if (rgb) light = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) > 140;
+        } catch { /* 取不到就按深色主题 */ }
+        panel.style.setProperty('--em-panel-base', light ? '#1b1b1b' : '#f4f2ec');
+    }
+
     // 未配副 API 且还没有条目时，打开面板直接落到设置页
     function togglePanel(force, tab) {
         panelOpen = force === undefined ? !panelOpen : !!force;
+        if (panelOpen) applyPanelBase();
         $('#em_panel').toggle(panelOpen);
+        $('#em_backdrop').toggle(panelOpen);
         $('#em_more_menu').hide();
         updateBallVisibility();
         if (!panelOpen) return;

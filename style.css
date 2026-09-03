@@ -1,4 +1,4 @@
-/* Erato Memory — 只用酒馆主题变量，深浅主题通用；手机优先，宽屏改右侧抽屉 */
+/* Erato Memory — 只用酒馆主题变量，深浅主题通用；手机全屏，宽屏改居中弹窗 */
 
 /* ---------- 悬浮球 ---------- */
 .em-ball {
@@ -63,18 +63,24 @@
 .em-form select option, .em-manual select option { color: initial; }
 
 /* ---------- 面板骨架 ---------- */
+/* 酒馆给 html 加了 translateZ(0)，fixed 元素以 html 为基准而非视口；手机端 body 又是 position:fixed，
+   html 高度为 0，所以不能靠 bottom:0/inset 撑高，必须像酒馆自己的抽屉一样写死视口单位。
+   底色：主题的 BlurTint 可能带透明度，先垫一层按主题明暗选的实底（--em-panel-base 由 JS 设）。 */
+.em-backdrop { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; height: 100dvh; z-index: 5999; background: rgba(0, 0, 0, .35); }
 .em-panel {
-    position: fixed; inset: 0; z-index: 5000;
+    position: fixed; top: 0; left: 0; z-index: 6000;
+    width: 100vw; width: 100dvw;
+    height: 100vh; height: 100dvh;
     display: flex; flex-direction: column;
-    background: var(--SmartThemeBlurTintColor, rgba(20, 20, 20, .96));
+    box-sizing: border-box;
+    background: linear-gradient(var(--SmartThemeBlurTintColor, transparent), var(--SmartThemeBlurTintColor, transparent)), var(--em-panel-base, #1c1c1c);
     color: var(--SmartThemeBodyColor, #ddd);
-    backdrop-filter: blur(6px);
 }
-.em-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
+.em-head { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
 .em-title { font-weight: bold; font-size: 1.05em; flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .em-back { font-size: 1.1em; padding: 6px 10px 6px 2px; cursor: pointer; }
 .em-close { font-size: 1.3em; padding: 6px 4px 6px 10px; cursor: pointer; }
-.em-view { flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.em-view { flex: 1 1 0; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; touch-action: pan-y; overscroll-behavior: contain; }
 .em-cfg { padding: 10px 14px; }
 
 /* 顶部数字 */
@@ -86,11 +92,12 @@
 .em-inject-line { font-size: .75em; opacity: .65; padding: 0 14px 6px; }
 
 /* 操作行 */
+/* 第一行：主按钮 + 更多；第二行：隐藏已总结（DOM 顺序不动，用 order 排） */
 .em-actbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 12px 8px; border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
-.em-actbar .em-main { flex: 1 1 140px; text-align: center; font-weight: bold; padding: 8px 12px; }
+.em-actbar .em-main { order: 1; flex: 1 1 140px; text-align: center; font-weight: bold; padding: 8px 12px; white-space: nowrap; }
 .em-actbar .em-main.em-stop { color: #ff9a9a; }
-.em-actbar #em_more { flex: 0 0 auto; }
-.em-hide-q { flex: 1 1 100%; display: flex; align-items: center; gap: 4px; font-size: .85em; }
+.em-actbar #em_more { order: 2; flex: 0 0 auto; white-space: nowrap; }
+.em-hide-q { order: 3; flex: 1 1 100%; display: flex; align-items: center; gap: 4px; font-size: .85em; }
 .em-hide-q .checkbox_label { margin: 0; }
 .em-keep-q { width: 52px !important; flex: 0 0 52px; text-align: center; padding: 2px 4px; }
 .em-menu { margin: 0 12px 6px; border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); border-radius: 8px; background: var(--black30a, rgba(0,0,0,.3)); overflow: hidden; }
@@ -158,8 +165,16 @@
 .em-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .em-actions .menu_button { flex: 1 1 30%; text-align: center; }
 
-@media (min-width: 800px) {
-    .em-panel { inset: 0 0 0 auto; width: 560px; border-left: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
+/* 断点与酒馆 mobile-styles.css 的 1000px 对齐：酒馆按手机排版时本面板也一定是全屏 */
+@media (min-width: 1001px) {
+    .em-panel {
+        top: 4vh; left: 50%; transform: translateX(-50%);
+        width: min(780px, 92vw);
+        height: 92vh; height: 92dvh;
+        border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3));
+        border-radius: 12px; overflow: hidden;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, .45);
+    }
 }
 
 /* ---------- 人物与物件 ---------- */

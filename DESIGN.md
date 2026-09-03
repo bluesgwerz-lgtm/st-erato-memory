@@ -362,7 +362,9 @@ S + pinned 条目 ≤ 25 时逐条注入；超过时副 API 把全部 S 压成 �
 
 失败可见性：有 `failed/refused` 条目时顶部红条常显，点击展开错误原因。
 
-样式：只用酒馆的 CSS 变量（`--SmartThemeBodyColor` 等），适配深浅主题；`@media (min-width: 800px)` 时改为右侧抽屉。
+样式：只用酒馆的 CSS 变量（`--SmartThemeBodyColor` 等），适配深浅主题；手机全屏，`@media (min-width: 1001px)`（与酒馆 mobile-styles 断点对齐）时改为居中弹窗加遮罩，点遮罩或 Esc 关闭。
+
+面板尺寸不能靠 `inset:0` / `bottom:0` 撑：酒馆 `style.css` 给 `html` 加了 `-webkit-transform: translateZ(0)`，fixed 元素以 `html` 为定位基准；手机端 `body` 又是 `position:fixed`，脱流后 `html` 高度为 0，面板会被压成只剩标题条（0.3.0 手机端实测症状）。必须像酒馆自家抽屉一样写死 `100dvh`（`100vh` 兜底）。底色也不能只靠 `--SmartThemeBlurTintColor`（部分主题半透明），打开时按 `--SmartThemeBodyColor` 明暗先垫一层实底；不用 `backdrop-filter`。
 
 ---
 
