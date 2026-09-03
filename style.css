@@ -213,3 +213,22 @@
 .em-wcard .em-card-head { cursor: default; }
 .em-wcard .em-actions { padding: 0 10px 10px; }
 .em-grade-bad { background: rgba(230,80,80,.6) !important; }
+
+/* ---------- v0.4：锁 / 待核 / 墓碑 / 远景 ---------- */
+.em-st-lock { background: transparent; }
+.em-lock { font-size: .8em; opacity: .8; }
+.em-stale { display: inline-block; min-width: 14px; padding: 0 4px; border-radius: 7px; background: #e6a23c; color: #fff; font-size: .75em; text-align: center; cursor: help; }
+.em-tombs { font-size: .78em; opacity: .7; padding: 4px 2px; line-height: 1.8; }
+.em-tomb { display: inline-block; padding: 0 6px; border-radius: 8px; background: rgba(128,128,128,.25); cursor: pointer; margin-right: 4px; }
+.em-tomb:hover { background: rgba(224,82,82,.4); }
+.em-oact { margin: 4px 0 6px; }
+.em-canon { font-size: .82em; line-height: 1.5; margin: 4px 0 8px; padding: 6px 8px; border-radius: 8px; background: rgba(230,160,60,.12); border-left: 3px solid rgba(230,160,60,.6); }
+.em-oline { padding: 6px 8px; margin: 4px 0; border-radius: 8px; background: rgba(128,128,128,.12); border-left: 3px solid rgba(80,150,230,.5); }
+.em-oline-2 { border-left-color: rgba(230,160,60,.7); }
+.em-oline-head { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: .85em; }
+.em-oline-key { font-weight: bold; flex: 1 1 auto; }
+.em-oline-text { font-size: .82em; line-height: 1.5; margin-top: 3px; opacity: .9; }
+.em-oline .em-ent-body { margin-top: 4px; }
+.em-lost { background: rgba(224,82,82,.35); }
+.em-canon-view { cursor: pointer; }
+.em-canon textarea { width: 100%; box-sizing: border-box; margin-top: 4px; }
