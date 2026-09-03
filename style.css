@@ -188,7 +188,17 @@
 .em-tier-a { background: rgba(230,160,60,.45); }
 .em-tier-b { background: rgba(80,150,230,.4); }
 .em-tier-x { background: rgba(128,128,128,.25); opacity: .8; }
+.em-state { background: rgba(160,90,200,.4); }
+.em-state-done { background: rgba(128,128,128,.25); text-decoration: line-through; }
+.em-heat-recent { background: rgba(70,180,110,.4); }
+.em-heat-dormant { background: transparent; border: 1px dashed rgba(128,128,128,.5); opacity: .7; }
 .em-ent-extra { opacity: .7; }
+.em-sec-n { font-weight: normal; font-size: .8em; opacity: .7; }
+.em-ef-bar { padding: 4px 0 8px; }
+.em-ef-bar select { flex: 1 1 40%; }
+.em-ent-2col { display: flex; gap: 8px; }
+.em-ent-2col label { flex: 1 1 50%; min-width: 0; }
+.em-ent-2col select { width: 100%; padding: 4px; border-radius: 6px; background: var(--black30a, rgba(0,0,0,.3)); color: inherit; border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
 .em-short { width: 56px !important; flex: 0 0 56px; text-align: center; padding: 2px 4px; }
 .em-ent-rows { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; font-size: .82em; }
 .em-ent-row { display: flex; gap: 6px; align-items: baseline; }

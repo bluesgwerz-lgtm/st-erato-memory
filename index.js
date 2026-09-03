@@ -29,10 +29,21 @@
     // arc = 此人此刻处在什么阶段（一句）；views = 对任意他人的看法（另存 p.views，不在此表）
     const PERSON_FIELDS = ['role', 'age', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows', 'arc'];
     const PERSON_LABEL = { role: '身份', age: '年龄', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情', arc: '阶段' };
-    const ITEM_FIELDS = ['holder', 'status', 'meaning'];
-    const ITEM_LABEL = { holder: '持有者', status: '状态', meaning: '意义' };
+    const ITEM_FIELDS = ['holder', 'note', 'meaning'];   // v0.3.4：原自由文本 status 改名 note（备注），status 让给枚举状态
+    const ITEM_LABEL = { holder: '持有者', note: '备注', meaning: '意义' };
     // 点名表档位：按对剧情的影响判，不按是否在场；龙套只留在面板里，不进注入块
+    // 档位只升不降（单窗口只看到一个人露一面就降档是错的），面板手改后加锁；龙套/未定进过 S/A 事件或累计露面 ≥3 段自动升配
     const TIERS = ['主', '配', '龙套'];
+    const TIER_RANK = { '主': 3, '配': 2, '龙套': 1 };
+    const PROMOTE_SEEN = 3;
+    // 第二条轴：生命周期。档位=剧情权重（慢变），状态=事件驱动；两轴正交，面板各自可筛
+    const PERSON_STATES = ['在场', '离场', '死亡', '下落不明'];
+    // 物件：关键性三档对应人物三档（摆设=只是道具，不注入）；状态里「已使用」= 一次性物件完成使命
+    const ITEM_TIERS = ['关键', '次要', '摆设'];
+    const ITEM_TIER_RANK = { '关键': 3, '次要': 2, '摆设': 1 };
+    const ITEM_STATES = ['待用', '在用', '已使用', '已转手', '遗失', '损毁', '封存'];
+    const ITEM_SETTLED = ['已使用', '遗失', '损毁', '封存'];   // 终态：仍是要记住的事实，但注入降成一行
+    const DORMANT_FLOORS = 100;   // 面板活跃度：超过这么多楼没露面算「沉寂」；「近期」= 最近 npcScanDepth 楼提到（与注入完整卡同一判断）
     const TRENDS = ['破裂', '厌恶', '反感', '陌生', '投缘', '亲密', '交融'];
     const RAW_LOG_MAX = 3;      // 保留最近几次副 API 原始回复供诊断
     const RAW_LOG_CHARS = 6000;
@@ -147,6 +158,14 @@
         for (const k of ['entries', 'windows', 'people', 'items']) if (!Array.isArray(d[k])) d[k] = [];
         if (!d.relation || typeof d.relation !== 'object') d.relation = def.relation;
         if ((Number(d.version) || 1) < 2) migrateV1(d);
+        // v0.3.4：物件的自由文本 status 改名 note；档位/状态枚举键补空串
+        for (const it of d.items) {
+            if (!it.f || typeof it.f !== 'object') it.f = {};
+            if (it.f.status && !it.f.note) { it.f.note = it.f.status; delete it.f.status; }
+            if (it.tier === undefined) it.tier = '';
+            if (it.state === undefined) it.state = '';
+        }
+        for (const p of d.people) if (p.state === undefined) p.state = '';
         return d;
     }
 
@@ -465,10 +484,10 @@
   ],
   "relation": "{{name2}} 此刻对 {{name1}} 的态度与关系，一句话 ≤40 字，写现状不写过程；本段没有变化则留空字符串",
   "people": [
-    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "status": "现状：在场/离开/死亡等", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
+    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
   "items": [
-    {"name": "物件名", "holder": "现在在谁手里", "status": "状态", "meaning": "对剧情或人物的意义", "floor": 楼层号}
+    {"name": "物件名", "tier": "关键 | 次要 | 摆设", "state": "待用 | 在用 | 已使用 | 已转手 | 遗失 | 损毁 | 封存", "holder": "现在在谁手里", "note": "现状一句", "meaning": "对剧情或人物的意义", "floor": 楼层号}
   ]
 }
 
@@ -481,6 +500,9 @@
 - people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键。没变化的人不必出现在 people 里，但必须出现在 cast 里。
 - 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
 - views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
+- people 的 state 是生命周期：在场=还在故事里活动；离场=剧情明确离开（出国、断交、调走、被赶走）；死亡；下落不明=失联、不知去向。没变化不写这个键。
+- items 只记对剧情或人物有意义的物件。tier 按作用判：关键=推动剧情或承载关系、没了故事会变（证据、信物、解药、钥匙）；次要=有意义但可替代；摆设=只是道具，可以不写。
+- items 的 state：待用=登场了还没派上用场；在用=正被使用或持有；已使用=一次性物件完成使命（药喝了、信读了、钱付了、票用了）；已转手=送出/交出/被夺，换了主人；遗失；损毁；封存=主动收起、不再出现但仍存在。物件状态或持有者变了，就要在 items 里更新。
 
 等级标准（按语义重要度，不按篇幅）：
 S = 不可逆事实：死亡/告白成立/关系定名/身份揭露/立誓承诺/任何『第一次』。永不遗忘。
@@ -501,7 +523,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function rosterText(data) {
         const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${x.tier ? `[${x.tier}]` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
-        const i = data.items.map(x => x.name);
+        const i = data.items.map(x => `${x.name}${x.tier ? `[${x.tier}]` : ''}${x.state ? `(${x.state})` : ''}`);
         return [p.length ? `人物：${p.join('、')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
     }
 
@@ -595,7 +617,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 if (ent) { addAliases(ent, [ent.name]); ent.name = name; }   // 新名字带着旧档案的名字/别称来 → 改名
             }
             if (!ent) {
-                ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', seen: 0, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                 data.people.push(ent);
             }
             if (!ent.views || typeof ent.views !== 'object') ent.views = {};
@@ -615,7 +637,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (!ent) continue;
             if (seen.length) { const first = Math.min(...seen); if (first < ent.first_idx) { ent.first_idx = first; ent.first_date = dateOf(first); } }
             const tier = String(c.tier || '').trim();
-            if (TIERS.includes(tier)) ent.tier = tier;
+            raiseTier(ent, tier);
             if (!fv(ent, 'role')) setF(ent, 'role', c.role, idx);
             seenThisWin.add(ent.id);
         }
@@ -632,6 +654,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const ent = upsertPerson(name, asArr(p.aliases), idx);
             if (!ent) continue;
             for (const k of PERSON_FIELDS) setF(ent, k, p[k], idx);
+            setState(ent, p.state, PERSON_STATES);
             for (const v of (Array.isArray(p.views) ? p.views : [])) {
                 const to = String(v?.to || '').trim(), text = String(v?.v || '').trim();
                 if (!to || !text || norm(to) === norm(ent.name)) continue;
@@ -646,21 +669,47 @@ C = 日常、闲聊、氛围、无后果的互动。
             const idx = floorOf(it.floor);
             let ent = findItem(data, name);
             if (!ent) {
-                ent = { id: uid('i'), name, f: {}, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                ent = { id: uid('i'), name, f: {}, tier: '', state: '', first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                 data.items.push(ent);
             }
             for (const k of ITEM_FIELDS) setF(ent, k, it[k], idx);
+            if (it.status && !it.note) setF(ent, 'note', it.status, idx);   // 旧模板/自定义模板仍按老键名回
+            raiseTier(ent, String(it.tier || '').trim(), ITEM_TIER_RANK);
+            setState(ent, it.state, ITEM_STATES);
             ent.last_idx = Math.max(ent.last_idx || 0, idx); ent.updated_at = Date.now();
         }
-        // 事件里点到的人，点名表漏了也建档（只有名字和楼层）
+        // 事件里点到的人，点名表漏了也建档（只有名字和楼层）；进过 S/A 事件的龙套/未定升配
         for (const e of made) {
             const idx = e.src?.idx ?? lastIdx;
             for (const name of (e.characters || [])) {
                 const ent = upsertPerson(name, [], idx);
-                if (ent) seenThisWin.add(ent.id);
+                if (!ent) continue;
+                seenThisWin.add(ent.id);
+                if (e.grade === 'S' || e.grade === 'A') promote(ent, '配');
             }
         }
-        for (const id of seenThisWin) { const ent = data.people.find(p => p.id === id); if (ent) ent.seen = (ent.seen || 0) + 1; }
+        for (const id of seenThisWin) {
+            const ent = data.people.find(p => p.id === id); if (!ent) continue;
+            ent.seen = (ent.seen || 0) + 1;
+            if (ent.seen >= PROMOTE_SEEN) promote(ent, '配');
+        }
+    }
+
+    // 档位只升不降；面板手改过（tierLock）的不动
+    function raiseTier(ent, tier, rank = TIER_RANK) {
+        if (!tier || !(tier in rank) || ent.tierLock) return;
+        if ((rank[tier] || 0) > (rank[ent.tier] || 0)) ent.tier = tier;
+    }
+    // 龙套 / 未定 → 配（不碰主，不碰手改）
+    function promote(ent, to) {
+        if (ent.tierLock || (TIER_RANK[ent.tier] || 0) >= TIER_RANK[to]) return;
+        ent.tier = to;
+    }
+    // 状态：最新一窗为准；面板手改过（stateLock）的不动
+    function setState(ent, val, allowed) {
+        const s = String(val || '').trim();
+        if (!s || !allowed.includes(s) || ent.stateLock) return;
+        ent.state = s;
     }
 
     // 零网络补档：把已有事件条目里点到的非主角名字全部建档（老聊天不重跑也能先把名单补齐）
@@ -678,7 +727,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 if (!n || n === me || n === them) continue;
                 let ent = findPerson(data, name);
                 if (!ent) {
-                    ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
+                    ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                     data.people.push(ent);
                 }
                 ent.seen = (ent.seen || 0) + 1;
@@ -1095,16 +1144,21 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function fmtPerson(p, full) {
         const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
-        if (!full) return `${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}`;
-        const parts = PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`);
+        if (!full) return `${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
+        const parts = [];
+        if (p.state && p.state !== '在场') parts.push(`状态：${p.state}`);   // 在场是默认，不占字
+        parts.push(...PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
         const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
         if (views.length) parts.push(`看法：${views.join('；')}`);
         return `- ${head}${parts.length ? '｜' + parts.join('｜') : ''}`;
     }
-    const fmtItem = it => `- ${it.name}${ITEM_FIELDS.filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`;
+    const fmtItem = it => `- ${it.name}${it.state ? `｜状态：${it.state}` : ''}${ITEM_FIELDS.filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`;
     const isExtra = p => p.tier === '龙套';
+    const isProp = it => it.tier === '摆设';
+    const isSettled = it => ITEM_SETTLED.includes(it.state);
 
     // 关系现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；龙套不进注入块
+    // 物件：摆设不进；已使用/遗失/损毁/封存的降成一行「已了结」（信烧了是要记住的事实，但不值一张卡）
     // 总字数受 entityChars 约束，放不下的完整卡按最久未露面降为一行
     function entityLines(data, chat) {
         const ctx = getCtx();
@@ -1126,14 +1180,17 @@ C = 日常、闲聊、氛围、无后果的互动。
             lines.push('', '## 人物志', ...full);
             if (brief.length) lines.push(`- 其他已登场：${brief.map(p => fmtPerson(p, false)).join('、')}`);
         }
-        if (data.items.length) {
-            const full = [], rest = [];
-            for (const it of data.items.slice().sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0))) {
+        const items = data.items.filter(it => !isProp(it));
+        if (items.length) {
+            const full = [], rest = [], settled = [];
+            for (const it of items.slice().sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0))) {
+                if (isSettled(it)) { settled.push(`${it.name}（${it.state}${fv(it, 'holder') ? `·${fv(it, 'holder')}` : ''}）`); continue; }
                 const s = fmtItem(it);
                 if (used + s.length <= budget) { full.push(s); used += s.length; } else rest.push(it.name);
             }
             lines.push('', '## 物件', ...full);
             if (rest.length) lines.push(`- 其他：${rest.join('、')}`);
+            if (settled.length) lines.push(`- 已了结：${settled.join('、')}`);
         }
         return lines;
     }
@@ -1591,7 +1648,9 @@ C = 日常、闲聊、氛围、无后果的互动。
     let addingManual = false;
     const expanded = new Set();
     const filter = { grade: '', type: '', status: '', q: '' };
-    const sections = { entities: true, timeline: true, preview: false, raw: false };
+    // 人物志 / 物件各自的筛选：档位 / 状态 / 活跃度（人）或持有者（物）/ 搜索 / 排序
+    const entFilter = { p: { tier: '', state: '', heat: '', q: '', sort: 'recent' }, i: { tier: '', state: '', holder: '', q: '', sort: 'recent' } };
+    const sections = { people: true, items: true, timeline: true, preview: false, raw: false };
 
     function addPanel() {
         const html = `
@@ -1633,9 +1692,32 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <div id="em_progress" class="em-progress" style="display:none"><div class="em-bar"></div><div class="em-prog-txt"></div></div>
                 <div id="em_alert" class="em-alert" style="display:none"></div>
 
-                <div class="em-section" data-sec="entities">
-                    <div class="em-sec-head"><span>人物与物件</span><span class="em-sec-arrow"></span></div>
-                    <div class="em-sec-body"><div id="em_ents" class="em-ents"></div></div>
+                <div class="em-section" data-sec="people">
+                    <div class="em-sec-head"><span>人物志 <span class="em-sec-n" id="em_n_people"></span></span><span class="em-sec-arrow"></span></div>
+                    <div class="em-sec-body">
+                        <div id="em_rel_box"></div>
+                        <div class="em-filters em-ef-bar">
+                            <select class="em-ef" data-kind="p" data-key="tier"><option value="">全部档位</option>${TIERS.map(t => `<option value="${t}">${t}</option>`).join('')}<option value="none">未定</option></select>
+                            <select class="em-ef" data-kind="p" data-key="state"><option value="">全部状态</option>${PERSON_STATES.map(s => `<option value="${s}">${s}</option>`).join('')}<option value="none">未定</option></select>
+                            <select class="em-ef" data-kind="p" data-key="heat"><option value="">全部活跃度</option><option value="recent">近期（本轮出完整卡）</option><option value="listed">在册</option><option value="dormant">沉寂（${DORMANT_FLOORS} 楼未露面）</option></select>
+                            <select class="em-ef" data-kind="p" data-key="sort"><option value="recent">最近露面</option><option value="first">首见先后</option><option value="name">名字</option><option value="seen">露面段数</option></select>
+                            <input class="text_pole em-ef-q" data-kind="p" placeholder="搜索名字 / 别称 / 身份">
+                        </div>
+                        <div id="em_people" class="em-ents"></div>
+                    </div>
+                </div>
+                <div class="em-section" data-sec="items">
+                    <div class="em-sec-head"><span>物件 <span class="em-sec-n" id="em_n_items"></span></span><span class="em-sec-arrow"></span></div>
+                    <div class="em-sec-body">
+                        <div class="em-filters em-ef-bar">
+                            <select class="em-ef" data-kind="i" data-key="tier"><option value="">全部关键性</option>${ITEM_TIERS.map(t => `<option value="${t}">${t}</option>`).join('')}<option value="none">未定</option></select>
+                            <select class="em-ef" data-kind="i" data-key="state"><option value="">全部状态</option>${ITEM_STATES.map(s => `<option value="${s}">${s}</option>`).join('')}<option value="settled">已了结（合并）</option><option value="none">未定</option></select>
+                            <select class="em-ef" data-kind="i" data-key="holder" id="em_fi_holder"><option value="">全部持有者</option></select>
+                            <select class="em-ef" data-kind="i" data-key="sort"><option value="recent">最近更新</option><option value="first">首见先后</option><option value="name">名字</option></select>
+                            <input class="text_pole em-ef-q" data-kind="i" placeholder="搜索名字 / 持有者 / 备注 / 意义">
+                        </div>
+                        <div id="em_items" class="em-ents"></div>
+                    </div>
                 </div>
                 <div class="em-section" data-sec="timeline">
                     <div class="em-sec-head"><span>时间线</span><span class="em-sec-arrow"></span></div>
@@ -1701,17 +1783,21 @@ C = 日常、闲聊、氛围、无后果的互动。
             filter[this.id.replace('em_f_', '')] = this.value; renderPanel();
         });
         $('#em_f_q').on('input', debounce(function () { filter.q = this.value.trim(); renderPanel(); }, 200));
+        $('#em_panel').on('change', '.em-ef', function () {
+            entFilter[$(this).data('kind')][$(this).data('key')] = this.value; renderPanel();
+        });
+        $('#em_panel').on('input', '.em-ef-q', debounce(function () { entFilter[$(this).data('kind')].q = this.value.trim(); renderPanel(); }, 200));
 
         $('#em_manual_form').on('click', '[data-mact]', function () { manualFormAction($(this).data('mact')); });
 
-        const ents = $('#em_ents');
+        const ents = $('#em_people, #em_items');
         ents.on('click', '.em-ent-head', function () {
             const id = $(this).closest('.em-ent').data('id');
             expanded.has(id) ? expanded.delete(id) : expanded.add(id);
             renderPanel();
         });
         ents.on('click', '[data-xact]', function (ev) { ev.stopPropagation(); entityAction($(this).data('xact'), $(this).closest('.em-ent').data('id')); });
-        ents.on('change', '#em_rel', function () {
+        $('#em_rel_box').on('change', '#em_rel', function () {
             const data = getData(); if (!data) return;
             data.relation.v = this.value.trim(); data.relation.manual = true;
             saveData(); applyInjection(); toast('success', '关系现状已保存');
@@ -1883,10 +1969,16 @@ C = 日常、闲聊、氛围、无后果的互动。
         </div>`;
     }
 
-    function entHtml(kind, x) {
+    // 面板活跃度：近期 = 最近 npcScanDepth 楼提到（与注入完整卡同一判断）；沉寂 = 超过 DORMANT_FLOORS 楼没露面；其余在册
+    const heatOf = (p, text, len) => mentioned(p, text) ? 'recent' : (len - 1 - (p.last_idx || 0) > DORMANT_FLOORS ? 'dormant' : 'listed');
+    const HEAT_LABEL = { recent: '近期', listed: '', dormant: '沉寂' };
+
+    function entHtml(kind, x, heat) {
         const open = expanded.has(x.id);
         const fields = kind === 'p' ? PERSON_FIELDS : ITEM_FIELDS;
         const label = k => kind === 'p' ? personLabel(k) : ITEM_LABEL[k];
+        const tiers = kind === 'p' ? TIERS : ITEM_TIERS;
+        const states = kind === 'p' ? PERSON_STATES : ITEM_STATES;
         const rows = fields.map(k => {
             const f = x.f?.[k];
             if (open) return `<label>${esc(label(k))}<input class="text_pole em-x-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
@@ -1896,14 +1988,23 @@ C = 日常、闲聊、氛围、无后果的互动。
         const views = kind === 'p' ? Object.entries(x.views || {}).filter(([, v]) => v?.v) : [];
         const viewRows = open ? '' : views.map(([to, v]) => `<div class="em-ent-row"><span class="em-ent-k">对${esc(to)}</span><span class="em-ent-v">${v.trend ? `[${esc(v.trend)}] ` : ''}${esc(v.v)}</span><span class="em-floor em-jump" data-idx="${v.idx}" title="点击跳到该楼">#${v.idx}</span></div>`).join('');
         const alias = kind === 'p' && x.aliases?.length ? `<span class="em-ent-alias">（${esc(x.aliases.join('/'))}）</span>` : '';
-        const tier = kind === 'p' && x.tier ? `<span class="em-tier em-tier-${x.tier === '龙套' ? 'x' : x.tier === '主' ? 'a' : 'b'}">${esc(x.tier)}</span>` : '';
+        const tierCls = kind === 'p' ? (x.tier === '龙套' ? 'x' : x.tier === '主' ? 'a' : 'b') : (x.tier === '摆设' ? 'x' : x.tier === '关键' ? 'a' : 'b');
+        const badges = [];
+        if (x.tier) badges.push(`<span class="em-tier em-tier-${tierCls}" title="${x.tierLock ? '手改已锁定' : ''}">${esc(x.tier)}${x.tierLock ? '🔒' : ''}</span>`);
+        if (x.state && x.state !== '在场') badges.push(`<span class="em-tier em-state${kind === 'i' && isSettled(x) ? ' em-state-done' : ''}" title="${x.stateLock ? '手改已锁定' : ''}">${esc(x.state)}${x.stateLock ? '🔒' : ''}</span>`);
+        if (kind === 'p' && HEAT_LABEL[heat]) badges.push(`<span class="em-tier em-heat-${heat}">${HEAT_LABEL[heat]}</span>`);
+        const dim = kind === 'p' ? x.tier === '龙套' : (isProp(x) || isSettled(x));
+        const sel = (cls, list, cur, none, extra) => `<select class="${cls}"><option value="">${none}</option>${list.map(t => `<option value="${t}" ${cur === t ? 'selected' : ''}>${t}${extra?.(t) || ''}</option>`).join('')}</select>`;
         return `
-        <div class="em-ent${kind === 'p' && x.tier === '龙套' ? ' em-ent-extra' : ''}" data-id="${x.id}">
-            <div class="em-ent-head"><span class="em-ent-name">${kind === 'p' ? '👤' : '📦'} ${esc(x.name)}${alias}${tier}</span><span class="em-floor">首见 #${x.first_idx ?? '?'}${x.seen ? ` · ${x.seen} 段` : ''}</span></div>
+        <div class="em-ent${dim ? ' em-ent-extra' : ''}" data-id="${x.id}">
+            <div class="em-ent-head"><span class="em-ent-name">${kind === 'p' ? '👤' : '📦'} ${esc(x.name)}${alias}${badges.join('')}</span><span class="em-floor">首见 #${x.first_idx ?? '?'}${x.seen ? ` · ${x.seen} 段` : ''}</span></div>
             ${open ? `<div class="em-ent-body">
                 <label>名字<input class="text_pole em-x-name" value="${esc(x.name)}"></label>
-                ${kind === 'p' ? `<label>别称（顿号分隔）<input class="text_pole em-x-alias" value="${esc((x.aliases || []).join('、'))}"></label>
-                <label>档位<select class="em-x-tier"><option value="">（未定）</option>${TIERS.map(t => `<option value="${t}" ${x.tier === t ? 'selected' : ''}>${t}${t === '龙套' ? '（不注入）' : ''}</option>`).join('')}</select></label>` : ''}
+                ${kind === 'p' ? `<label>别称（顿号分隔）<input class="text_pole em-x-alias" value="${esc((x.aliases || []).join('、'))}"></label>` : ''}
+                <div class="em-ent-2col">
+                    <label>${kind === 'p' ? '档位' : '关键性'}${x.tierLock ? '（已锁，选「未定」解锁）' : '（手改后锁定，副 AI 不再改）'}${sel('em-x-tier', tiers, x.tier, '（未定）', t => (t === '龙套' || t === '摆设') ? '（不注入）' : '')}</label>
+                    <label>状态${x.stateLock ? '（已锁，选「未定」解锁）' : ''}${sel('em-x-state', states, x.state, '（未定）')}</label>
+                </div>
                 ${rows}
                 ${kind === 'p' ? `<label>对他人的看法（每行：对象｜趋势｜一句话；趋势可空）<textarea class="text_pole em-x-views" rows="3">${esc(views.map(([to, v]) => `${to}｜${v.trend || ''}｜${v.v}`).join('\n'))}</textarea></label>` : ''}
                 <div class="em-actions"><div class="menu_button" data-xact="save">保存</div><div class="menu_button em-danger" data-xact="del">删除</div></div>
@@ -1911,17 +2012,49 @@ C = 日常、闲聊、氛围、无后果的互动。
         </div>`;
     }
 
+    function matchEnt(kind, x, heat) {
+        const f = entFilter[kind];
+        if (f.tier === 'none' ? x.tier : (f.tier && x.tier !== f.tier)) return false;
+        if (f.state === 'none' ? x.state : f.state === 'settled' ? !isSettled(x) : (f.state && x.state !== f.state)) return false;
+        if (kind === 'p' && f.heat && heat !== f.heat) return false;
+        if (kind === 'i' && f.holder && fv(x, 'holder') !== f.holder) return false;
+        if (f.q) {
+            const hay = (kind === 'p'
+                ? [x.name, ...(x.aliases || []), fv(x, 'role')]
+                : [x.name, fv(x, 'holder'), fv(x, 'note'), fv(x, 'meaning')]).join(' ').toLowerCase();
+            if (!hay.includes(f.q.toLowerCase())) return false;
+        }
+        return true;
+    }
+    const entSorter = sort => sort === 'first' ? (a, b) => (a.first_idx || 0) - (b.first_idx || 0)
+        : sort === 'name' ? (a, b) => String(a.name).localeCompare(String(b.name), 'zh')
+            : sort === 'seen' ? (a, b) => (b.seen || 0) - (a.seen || 0)
+                : (a, b) => (b.last_idx || 0) - (a.last_idx || 0);
+
     function renderEntities(data) {
         const ctx = getCtx();
+        const chat = ctx.chat || [];
         const rel = data.relation || {};
-        const parts = [`
+        $('#em_rel_box').html(`
         <div class="em-rel"><label>${esc(ctx.name2 || '{{char}}')} 对 ${esc(ctx.name1 || '{{user}}')} 的关系现状${rel.idx != null ? ` <span class="em-floor em-jump" data-idx="${rel.idx}">#${rel.idx}</span>` : ''}
-            <input id="em_rel" class="text_pole" value="${esc(rel.v || '')}" placeholder="（尚无记录，总结后由副 AI 填写，也可手改）"></label></div>`];
-        const byRecent = (a, b) => (b.last_idx || 0) - (a.last_idx || 0);
-        parts.push(...data.people.slice().sort(byRecent).map(p => entHtml('p', p)));
-        parts.push(...data.items.slice().sort(byRecent).map(i => entHtml('i', i)));
-        if (!data.people.length && !data.items.length) parts.push('<div class="em-empty">还没有人物志或物件，总结后由副 AI 自动建档（不含主角）</div>');
-        $('#em_ents').html(parts.join(''));
+            <input id="em_rel" class="text_pole" value="${esc(rel.v || '')}" placeholder="（尚无记录，总结后由副 AI 填写，也可手改）"></label></div>`);
+
+        const text = recentText(chat, Math.max(1, Number(settings.npcScanDepth) || 6));
+        const heats = new Map(data.people.map(p => [p.id, heatOf(p, text, chat.length)]));
+        const people = data.people.filter(p => matchEnt('p', p, heats.get(p.id))).sort(entSorter(entFilter.p.sort));
+        $('#em_n_people').text(data.people.length ? `${people.length}/${data.people.length}` : '');
+        $('#em_people').html(people.length ? people.map(p => entHtml('p', p, heats.get(p.id))).join('')
+            : `<div class="em-empty">${data.people.length ? '没有符合筛选的人物' : '还没有人物志，总结后由副 AI 自动建档（不含主角）；老聊天可「更多 → 从事件补人物」'}</div>`);
+
+        // 持有者下拉的选项随现有档案变，保住当前选择
+        const holders = [...new Set(data.items.map(it => fv(it, 'holder')).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'zh'));
+        const hsel = $('#em_fi_holder');
+        hsel.html(`<option value="">全部持有者</option>${holders.map(h => `<option value="${esc(h)}" ${entFilter.i.holder === h ? 'selected' : ''}>${esc(h)}</option>`).join('')}`);
+        if (entFilter.i.holder && !holders.includes(entFilter.i.holder)) entFilter.i.holder = '';
+        const items = data.items.filter(it => matchEnt('i', it)).sort(entSorter(entFilter.i.sort));
+        $('#em_n_items').text(data.items.length ? `${items.length}/${data.items.length}` : '');
+        $('#em_items').html(items.length ? items.map(it => entHtml('i', it)).join('')
+            : `<div class="em-empty">${data.items.length ? '没有符合筛选的物件' : '还没有物件，总结后由副 AI 自动建档'}</div>`);
     }
 
     function jumpTo(idx) {
@@ -1984,7 +2117,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const data = getData();
         const list = $('#em_list');
         const form = $('#em_manual_form');
-        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_ents').html(''); $('#em_preview').text(''); $('#em_raw').text(''); return; }
+        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_rel_box, #em_people, #em_items').html(''); $('#em_n_people, #em_n_items').text(''); $('#em_preview').text(''); $('#em_raw').text(''); return; }
         const chat = getCtx().chat || [];
         const depths = visibleDepths(chat);
         renderEntities(data);
@@ -2108,13 +2241,19 @@ C = 日常、闲聊、氛围、无后果的互动。
         const kind = data.people.some(x => x.id === id) ? 'p' : 'i';
         const list = kind === 'p' ? data.people : data.items;
         const x = list.find(v => v.id === id); if (!x) return;
-        const el = $(`#em_ents .em-ent[data-id="${id}"]`);
+        const el = $(`#em_panel .em-ent[data-id="${id}"]`);
         if (act === 'save') {
             x.name = el.find('.em-x-name').val().trim() || x.name;
+            // 档位 / 状态：改了就锁（副 AI 不再覆盖），选回「未定」= 清空并解锁
+            const tiers = kind === 'p' ? TIERS : ITEM_TIERS, states = kind === 'p' ? PERSON_STATES : ITEM_STATES;
+            const tier = String(el.find('.em-x-tier').val() || '');
+            if (!tier) { x.tier = ''; x.tierLock = false; }
+            else if (tiers.includes(tier) && tier !== x.tier) { x.tier = tier; x.tierLock = true; }
+            const state = String(el.find('.em-x-state').val() || '');
+            if (!state) { x.state = ''; x.stateLock = false; }
+            else if (states.includes(state) && state !== x.state) { x.state = state; x.stateLock = true; }
             if (kind === 'p') {
                 x.aliases = el.find('.em-x-alias').val().split(/[、,，/]/).map(s => s.trim()).filter(Boolean);
-                const tier = String(el.find('.em-x-tier').val() || '');
-                x.tier = TIERS.includes(tier) ? tier : '';
                 const views = {};
                 for (const line of String(el.find('.em-x-views').val() || '').split('\n')) {
                     const [to, trend, ...rest] = line.split(/[｜|]/).map(s => s.trim());
@@ -2273,6 +2412,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, mergeEntities, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
+        raiseTier, promote, setState, heatOf, matchEnt, entFilter,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
     };
 

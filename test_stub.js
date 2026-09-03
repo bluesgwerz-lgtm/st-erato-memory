@@ -1,4 +1,4 @@
-// Erato Memory v0.3.3 桩环境冒烟测试：不依赖酒馆，只验证纯逻辑（楼数口径 / 窗口切分 / 拆半重试 / 点名表与档案合并 / 事件密度 / 截断重试 / 清空世代 / 残影清理 / 对账 / 隐藏 / 注入 / 迁移）
+// Erato Memory v0.3.4 桩环境冒烟测试：不依赖酒馆，只验证纯逻辑（楼数口径 / 窗口切分 / 拆半重试 / 点名表与档案合并 / 档位只升不降与手改锁 / 物件关键性与状态 / 事件密度 / 截断重试 / 清空世代 / 残影清理 / 对账 / 隐藏 / 注入 / 迁移）
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -51,9 +51,10 @@ global.fetch = async (url, opt) => {
     else if (mode.finishLength > 0) { mode.finishLength--; finish = 'length'; content = '{"cast": [{"name": "陆衍"'; }
     else content = JSON.stringify({
         cast: [
-            { name: '陆衍', aliases: ['小衍'], tier: '配', role: '邻居', seen: floors },
+            // 后面的窗口故意把陆衍报成龙套：档位只升不降，应仍是配
+            { name: '陆衍', aliases: ['小衍'], tier: floors[0] >= 15 ? '龙套' : '配', role: '邻居', seen: floors },
             { name: '周远', tier: '配', role: '医生', seen: [floors[0]] },
-            { name: '司机老王', tier: '龙套', role: '司机', seen: [floors[0]] },
+            ...(floors[0] <= 2 ? [{ name: '司机老王', tier: '龙套', role: '司机', seen: [floors[0]] }] : []),   // 只露一段，不该自动升配
             { name: 'Char', tier: '主' }, { name: '用户', tier: '主' },
             floors[0] <= 5 ? { name: '陆母', aliases: ['母亲'], tier: '配', role: '用户的母亲', seen: [floors[0]] }
                 : { name: '王秀英', aliases: ['陆母'], tier: '配', seen: [floors[0]] },
@@ -61,12 +62,15 @@ global.fetch = async (url, opt) => {
         events: (mode.fewEvents ? [floors[0]] : floors).map(ev),
         relation: `对用户从戒备转为依赖（#${floors[floors.length - 1]}）`,
         people: [
-            { name: '陆衍', aliases: ['小衍'], role: '邻居', rel_user: '暧昧', status: '在场', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
-            { name: '周远', role: '医生', floor: floors[0] },
+            { name: '陆衍', aliases: ['小衍'], role: '邻居', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
+            { name: '周远', role: '医生', state: floors[0] >= 15 ? '离场' : '', floor: floors[0] },
             { name: 'Char', rel_user: '不该建档' },
             { name: '用户', role: '不该建档' },
         ],
-        items: [{ name: '牛皮笔袋', holder: '陆衍', status: '完好', floor: floors[0] }],
+        items: [
+            { name: '牛皮笔袋', tier: '关键', state: '在用', holder: '陆衍', note: '完好', floor: floors[0] },
+            { name: '咖啡杯', tier: '摆设', state: '在用', holder: '周远', floor: floors[0] },
+        ],
     });
     return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content }, finish_reason: finish }] }) };
 };
@@ -181,15 +185,17 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(data.entries.every(e => e.status === 'ok' && e.win && e.src.floors.length === 1));
         assert.strictEqual(data.entries.find(e => e.src.idx === 2).grade, 'S');
     });
-    t('档案合并：主角不建档，点名表建档带档位，事件里点到的人也建档，别称升级真名，views/arc 落地', () => {
+    t('档案合并：主角不建档，点名表建档带档位，事件里点到的人也建档，别称升级真名，views/arc/state 落地，档位只升不降，S 事件升配', () => {
         const names = data.people.map(p => p.name);
         assert.deepStrictEqual(names.sort(), ['司机老王', '周远', '小刘', '王秀英', '陆衍'].sort(), '人物：' + names.join(','));
         const lu = data.people.find(p => p.name === '陆衍');
         assert.deepStrictEqual(lu.aliases, ['小衍']);
-        assert.strictEqual(lu.tier, '配');
+        assert.strictEqual(lu.tier, '配', '后面窗口报龙套不能把配降下去');
+        assert.strictEqual(lu.state, '在场');
         assert.strictEqual(lu.f.role.v, '邻居');
         assert.strictEqual(lu.f.role.idx, 19, '最后一窗覆盖后来源楼应为 19');
         assert.strictEqual(lu.f.arc.v, '试探期');
+        assert.strictEqual(lu.f.status.v, '在厨房忙', '自由文本现状照旧');
         assert.strictEqual(lu.views['用户'].trend, '亲密'); assert.strictEqual(lu.views['周远'].v, '提防');
         assert.ok(!lu.views['陆衍'], '对自己的看法不记');
         assert.strictEqual(lu.first_idx, 0);
@@ -200,10 +206,17 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(mom.f.role.v, '用户的母亲', '点名表只在 role 为空时补');
         assert.strictEqual(mom.first_idx, 0);
         const liu = data.people.find(p => p.name === '小刘');
-        assert.ok(liu && liu.first_idx === 2 && !liu.tier, '事件 characters 反哺建档，只有名字与楼层');
-        assert.strictEqual(data.people.find(p => p.name === '司机老王').tier, '龙套');
-        assert.strictEqual(data.items.length, 1);
-        assert.strictEqual(data.items[0].f.holder.v, '陆衍');
+        assert.ok(liu && liu.first_idx === 2 && !liu.f.role, '事件 characters 反哺建档，只有名字与楼层');
+        assert.strictEqual(liu.tier, '配', '进过 S 事件的未定人物自动升配');
+        const zhou = data.people.find(p => p.name === '周远');
+        assert.strictEqual(zhou.state, '离场', '状态以最新一窗为准');
+        const wang = data.people.find(p => p.name === '司机老王');
+        assert.strictEqual(wang.tier, '龙套'); assert.strictEqual(wang.seen, 1, '只露一段不升配');
+        assert.strictEqual(data.items.length, 2);
+        const bag = data.items.find(i => i.name === '牛皮笔袋');
+        assert.strictEqual(bag.f.holder.v, '陆衍'); assert.strictEqual(bag.f.note.v, '完好');
+        assert.strictEqual(bag.tier, '关键'); assert.strictEqual(bag.state, '在用');
+        assert.strictEqual(data.items.find(i => i.name === '咖啡杯').tier, '摆设');
         assert.ok(data.relation.v.includes('#19'), '关系现状来自最后一窗');
         assert.strictEqual(data.relation.idx, 19);
         assert.ok(data.rawLog.length === 3 && data.rawLog[0].finish === 'stop', '原始回复留档 3 条');
@@ -287,9 +300,10 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(/- 陆衍（小衍）｜身份：邻居/.test(b.text), '陆衍在最近楼层出现，出完整卡');
         assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
         const brief = /其他已登场：([^\n]*)/.exec(b.text)?.[1] || '';
-        assert.ok(brief.includes('周远·医生') && brief.includes('王秀英（母亲/陆母）·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带别称）：' + brief);
+        assert.ok(brief.includes('周远·医生·离场') && brief.includes('王秀英（母亲/陆母）·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带别称与非在场状态）：' + brief);
         assert.ok(!b.text.includes('司机老王'), '龙套不进注入块');
-        assert.ok(b.text.includes('牛皮笔袋｜持有者：陆衍'));
+        assert.ok(b.text.includes('牛皮笔袋｜状态：在用｜持有者：陆衍｜备注：完好'), '物件卡带状态：' + b.text);
+        assert.ok(!b.text.includes('咖啡杯'), '摆设不进注入块');
         assert.ok(!b.text.includes('题22'), '#22 在正文窗口内不注入');
     });
     t('取消隐藏只恢复自己藏的', () => {
@@ -367,6 +381,87 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const liu = data.people.find(p => p.name === '小刘');
         assert.ok(liu && liu.first_idx === 2 && liu.seen === 1);
         assert.strictEqual(D.backfillPeople(), 0, '幂等');
+    });
+
+    console.log('== 档位 / 状态：只升不降、手改锁、自动升配、终态物件、活跃度、筛选 ==');
+    const merge = obj => D.mergeEntities(data, obj, { floors: [2] }, new Map([[2, chat[2]]]), []);
+    t('档位只升不降；手改锁住后副 AI 报更高档也不动；选回未定即解锁', () => {
+        const lu = data.people.find(p => p.name === '陆衍');
+        merge({ cast: [{ name: '陆衍', tier: '龙套', seen: [2] }] });
+        assert.strictEqual(lu.tier, '配');
+        merge({ cast: [{ name: '陆衍', tier: '主', seen: [2] }] });
+        assert.strictEqual(lu.tier, '主', '升档放行');
+        lu.tier = '龙套'; lu.tierLock = true;
+        merge({ cast: [{ name: '陆衍', tier: '主', seen: [2] }] });
+        assert.strictEqual(lu.tier, '龙套', '手改锁住不动');
+        lu.tier = '配'; lu.tierLock = false;
+    });
+    t('状态最新为准、手改锁；物件关键性只升不降', () => {
+        const lu = data.people.find(p => p.name === '陆衍');
+        merge({ people: [{ name: '陆衍', state: '离场', floor: 2 }] });
+        assert.strictEqual(lu.state, '离场');
+        merge({ people: [{ name: '陆衍', state: '乱写', floor: 2 }] });
+        assert.strictEqual(lu.state, '离场', '不在枚举里的忽略');
+        lu.stateLock = true;
+        merge({ people: [{ name: '陆衍', state: '死亡', floor: 2 }] });
+        assert.strictEqual(lu.state, '离场', '手改锁住不动');
+        lu.state = '在场'; lu.stateLock = false;
+        const bag = data.items.find(i => i.name === '牛皮笔袋');
+        merge({ items: [{ name: '牛皮笔袋', tier: '摆设', floor: 2 }] });
+        assert.strictEqual(bag.tier, '关键', '物件关键性只升不降');
+        merge({ items: [{ name: '咖啡杯', tier: '次要', floor: 2 }] });
+        assert.strictEqual(data.items.find(i => i.name === '咖啡杯').tier, '次要');
+        merge({ items: [{ name: '咖啡杯', tier: '摆设', status: '缺口', floor: 2 }] });
+        const cup = data.items.find(i => i.name === '咖啡杯');
+        assert.strictEqual(cup.tier, '次要'); assert.strictEqual(cup.f.note.v, '缺口', '旧键名 status 仍落到 note');
+        cup.tier = '摆设';
+    });
+    t('终态物件：注入降成一行「已了结」，不再出完整卡', () => {
+        const bag = data.items.find(i => i.name === '牛皮笔袋');
+        merge({ items: [{ name: '牛皮笔袋', state: '已使用', floor: 2 }] });
+        assert.strictEqual(bag.state, '已使用');
+        const text = D.buildBlock().text;
+        assert.ok(text.includes('已了结：牛皮笔袋（已使用·陆衍）'), text);
+        assert.ok(!text.includes('牛皮笔袋｜'), '终态不出完整卡');
+        bag.state = '在用';
+    });
+    t('龙套累计露面 ≥3 段自动升配；A 事件里点到的也升', () => {
+        merge({ cast: [{ name: '门房', tier: '龙套', seen: [2] }] });
+        merge({ cast: [{ name: '门房', tier: '龙套', seen: [2] }] });
+        const gk = data.people.find(p => p.name === '门房');
+        assert.strictEqual(gk.tier, '龙套'); assert.strictEqual(gk.seen, 2);
+        merge({ cast: [{ name: '门房', tier: '龙套', seen: [2] }] });
+        assert.strictEqual(gk.tier, '配', '第 3 段升配');
+        D.mergeEntities(data, { cast: [{ name: '保安', tier: '龙套', seen: [2] }] }, { floors: [2] }, new Map([[2, chat[2]]]), [{ src: { idx: 2 }, characters: ['保安'], grade: 'A' }]);
+        assert.strictEqual(data.people.find(p => p.name === '保安').tier, '配');
+        D.mergeEntities(data, { cast: [{ name: '收银员', tier: '龙套', seen: [2] }] }, { floors: [2] }, new Map([[2, chat[2]]]), [{ src: { idx: 2 }, characters: ['收银员'], grade: 'B' }]);
+        assert.strictEqual(data.people.find(p => p.name === '收银员').tier, '龙套', 'B 事件不升');
+        data.people = data.people.filter(p => !['门房', '保安', '收银员'].includes(p.name));
+    });
+    t('活跃度与筛选：近期 = 最近几楼提到；沉寂 = 100 楼未露面；档位/状态/持有者/搜索各自可筛', () => {
+        const lu = data.people.find(p => p.name === '陆衍');
+        const wang = data.people.find(p => p.name === '司机老王');
+        const recent = '陆衍在厨房'.toLowerCase();
+        assert.strictEqual(D.heatOf(lu, recent, chat.length), 'recent');
+        assert.strictEqual(D.heatOf(wang, recent, chat.length), 'listed');
+        assert.strictEqual(D.heatOf(wang, recent, wang.last_idx + 102), 'dormant');
+        const F = D.entFilter;
+        F.p.tier = '龙套'; assert.ok(D.matchEnt('p', wang, 'listed') && !D.matchEnt('p', lu, 'recent'));
+        F.p.tier = 'none'; assert.ok(!D.matchEnt('p', wang, 'listed'));
+        F.p.tier = ''; F.p.heat = 'recent'; assert.ok(D.matchEnt('p', lu, 'recent') && !D.matchEnt('p', wang, 'listed'));
+        F.p.heat = ''; F.p.q = '小衍'; assert.ok(D.matchEnt('p', lu, 'recent') && !D.matchEnt('p', wang, 'listed'), '别称可搜');
+        F.p.q = '';
+        const bag = data.items.find(i => i.name === '牛皮笔袋'), cup = data.items.find(i => i.name === '咖啡杯');
+        F.i.holder = '陆衍'; assert.ok(D.matchEnt('i', bag) && !D.matchEnt('i', cup));
+        F.i.holder = ''; F.i.state = 'settled'; bag.state = '遗失'; assert.ok(D.matchEnt('i', bag) && !D.matchEnt('i', cup)); bag.state = '在用';
+        F.i.state = ''; F.i.q = '完好'; assert.ok(D.matchEnt('i', bag), '备注可搜'); F.i.q = '';
+    });
+    t('旧数据：物件的自由文本 status 读取时改名 note，档位/状态键补空', () => {
+        data.items.push({ id: 'i_old', name: '旧伞', f: { status: { v: '破了', idx: 2 } }, first_idx: 2, last_idx: 2 });
+        const d = D.getData();
+        const old = d.items.find(i => i.id === 'i_old');
+        assert.strictEqual(old.f.note.v, '破了'); assert.ok(!old.f.status); assert.strictEqual(old.tier, ''); assert.strictEqual(old.state, '');
+        d.items = d.items.filter(i => i.id !== 'i_old');
     });
 
     console.log('== 迁移 v1 → v2 ==');
