@@ -51,12 +51,11 @@
     const END_MARK = '<END_OF_MEMORY/>';
     const RECAP_CHARS = 400;    // 逐楼 recap 底层每楼存多少字
     const CANON_RESEAL = 5;     // S 集合相对上次压缩变化这么多条就重压
-    // 向量源：请求体字段与酒馆 /api/vector/* 的 getSourceSettings 一致；密钥走酒馆同名槽位
-    const VEC_SOURCES = {
-        siliconflow: { label: '硅基流动（SiliconFlow）', secret: 'api_key_siliconflow', model: 'Qwen/Qwen3-Embedding-0.6B' },
-        vllm: { label: '通用 OpenAI 兼容 embeddings（vllm 源）', secret: 'api_key_vllm', model: '' },
-        openai: { label: 'OpenAI 官方', secret: 'api_key_openai', model: 'text-embedding-3-small' },
-    };
+    // 向量走酒馆 /api/vector/* 的通用 embeddings 路线（source=vllm：任何 OpenAI 兼容 embeddings 地址 + 模型）；密钥自动写进酒馆的 vllm 槽位
+    const VEC_SECRET = 'api_key_vllm';
+    const VEC_DEFAULT_URL = 'https://api.siliconflow.cn/v1';
+    const VEC_DEFAULT_MODEL = 'Qwen/Qwen3-Embedding-0.6B';
+    const LEGACY_VEC_URL = { siliconflow: VEC_DEFAULT_URL, openai: 'https://api.openai.com/v1' };
     const RAW_CHUNK_CHARS = 600;   // 原文细节：已总结楼层的 <content> 按这么多字切块、带重叠入向量库
     const RAW_CHUNK_OVERLAP = 80;
 
@@ -79,8 +78,8 @@
         canonChars: 800,      // 正典段字数上限
         outlineChars: 2000,   // 远景层（被裁条目折成的按日骨架）注入预算，超过就把最老的日行再折成时期行
         foldMin: 6,           // 被预算裁掉且未折叠的条目攒够这么多才跑一次折叠
-        // 召回：关键词通道零网络默认开；向量走酒馆自带 /api/vector/*，默认关
-        recall: { keyword: true, vector: false, source: 'siliconflow', apiUrl: '', model: '', cn: true, raw: true, topK: 8, threshold: 0.4, recallChars: 2000, rawChars: 1200, queryChars: 600, timeoutSec: 4 },
+        // 召回：关键词通道零网络默认开；向量走酒馆自带 /api/vector/*（通用 embeddings 路线：地址 + 密钥 + 模型，和副 API 一样填），默认关
+        recall: { keyword: true, vector: false, source: 'vllm', apiUrl: '', key: '', keyWritten: '', model: '', models: [], raw: true, topK: 8, threshold: 0.4, recallChars: 2000, rawChars: 1200, queryChars: 600, timeoutSec: 4 },
         autoFold: 'batch',    // 治理（远景折叠/正典压缩）何时自动跑：always=每次生成后攒够就跑 / batch=只在总结批次结束后 / manual=只点「现在折叠」
         headerText: '',       // 注入块块首说明，留空用默认
         hideSummarized: true,
@@ -120,6 +119,13 @@
         if (hadWin) settings.windowFloors = Math.max(1, Number(settings.windowFloors) || 20) * 2;
         settings.floorUnit = 'chat';
     }
+    // v0.4.0 首版的「向量源」下拉已并入通用路线：旧的 siliconflow/openai 源换成对应地址
+    if (settings.recall.source !== 'vllm') {
+        if (!settings.recall.apiUrl && LEGACY_VEC_URL[settings.recall.source]) settings.recall.apiUrl = LEGACY_VEC_URL[settings.recall.source];
+        settings.recall.source = 'vllm';
+        delete settings.recall.cn;
+    }
+    if (!Array.isArray(settings.recall.models)) settings.recall.models = [];
     const saveSettings = () => getCtx().saveSettingsDebounced();
 
     /* ================= 工具 ================= */
@@ -379,14 +385,14 @@
 
     // 拉模型列表：与主 API「连接」按钮同一条路，后端拿 reverse_proxy + proxy_password 去请求 {base}/models
     // 上游出错时酒馆后端回 200 + {error:true}，不带原因，只能提示去看后台日志
-    async function fetchModels() {
+    async function fetchModelList(base, key) {
         const ctx = getCtx();
         let res, text;
         try {
             res = await fetch('/api/backends/chat-completions/status', {
                 method: 'POST',
                 headers: ctx.getRequestHeaders(),
-                body: JSON.stringify({ chat_completion_source: 'openai', reverse_proxy: apiBase(), proxy_password: settings.api.key.trim() }),
+                body: JSON.stringify({ chat_completion_source: 'openai', reverse_proxy: base, proxy_password: key }),
             });
             text = await res.text();
         } catch (err) {
@@ -399,7 +405,20 @@
         const raw = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : Array.isArray(json) ? json : [];
         const ids = [...new Set(raw.map(m => typeof m === 'string' ? m : (m?.id || m?.name)).filter(Boolean).map(String))].sort();
         if (!ids.length) throw new Error('接口返回了空的模型列表');
+        return ids;
+    }
+    async function fetchModels() {
+        const ids = await fetchModelList(apiBase(), settings.api.key.trim());
         settings.api.models = ids;
+        saveSettings();
+        return ids;
+    }
+    // 向量模型列表：同一条路打 embeddings 接口的 /models；像 embedding 的排前面（硅基流动之类的列表里聊天模型和向量模型混在一起）
+    const looksEmbedding = id => /embed|bge|e5|gte|minilm|jina|nomic/i.test(String(id));
+    async function fetchVecModels() {
+        const ids = await fetchModelList(vecBase(), String(settings.recall.key || '').trim());
+        ids.sort((a, b) => (looksEmbedding(b) ? 1 : 0) - (looksEmbedding(a) ? 1 : 0) || a.localeCompare(b));
+        settings.recall.models = ids;
         saveSettings();
         return ids;
     }
@@ -1854,7 +1873,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     const rc = { key: '', promise: null, result: null, at: 0, error: '' };
     const recallEnabled = () => !!(settings.enabled && (settings.recall.keyword || settings.recall.vector));
-    const recallSig = () => `${settings.recall.keyword ? 'k' : ''}${settings.recall.vector ? `v:${settings.recall.source}:${settings.recall.model}:${settings.recall.raw ? 'r' : ''}` : ''}`;
+    const recallSig = () => `${settings.recall.keyword ? 'k' : ''}${settings.recall.vector ? `v:${settings.recall.apiUrl}:${settings.recall.model}:${settings.recall.raw ? 'r' : ''}` : ''}`;
 
     // 预取：用户消息一落地就开始算（向量要走网络），生成前只等剩下的时间
     function prepareRecall(chat = getCtx().chat || []) {
@@ -1949,16 +1968,26 @@ C = 日常、闲聊、氛围、无后果的互动。
     const vecOn = () => !!settings.recall.vector;
     const numHash = s => parseInt(hash(String(s)), 16);
     const vecCollection = kind => `erato-${kind}-${hash(String(getCtx().chatId || ''))}`;
+    // 地址：去尾斜杠与末尾 /v1（酒馆后端自己拼 /v1/embeddings；拉模型那条路则需要带 /v1）
+    const vecBase = () => String(settings.recall.apiUrl || '').trim().replace(/\/+$/, '').replace(/\/embeddings$/i, '').replace(/\/+$/, '');
     function vecBody() {
-        const s = settings.recall;
-        const src = VEC_SOURCES[s.source] ? s.source : 'siliconflow';
-        const b = { source: src };
-        if (src === 'siliconflow') { b.model = s.model?.trim() || VEC_SOURCES.siliconflow.model; b.siliconflow_endpoint = s.cn === false ? 'global' : 'cn'; }
-        else if (src === 'vllm') { b.apiUrl = String(s.apiUrl || '').trim().replace(/\/+$/, '').replace(/\/v1$/i, ''); b.model = s.model?.trim() || ''; }
-        else b.model = s.model?.trim() || VEC_SOURCES.openai.model;
-        return b;
+        return { source: 'vllm', apiUrl: vecBase().replace(/\/v1$/i, ''), model: String(settings.recall.model || '').trim() || VEC_DEFAULT_MODEL };
+    }
+    const vecConfigured = () => !!(vecBase() && String(settings.recall.key || '').trim());
+    // 密钥写进酒馆的 vllm 槽位（服务端只认槽位）；同一把密钥只写一次
+    async function ensureVecSecret() {
+        const key = String(settings.recall.key || '').trim();
+        if (!key) return false;
+        const sig = hash(key);
+        if (settings.recall.keyWritten === sig) return false;
+        await writeVecSecret(key);
+        settings.recall.keyWritten = sig;
+        saveSettings();
+        return true;
     }
     async function vecCall(route, body, timeoutMs = 60000) {
+        if (!vecBase()) throw new Error('未填 embeddings 地址');
+        await ensureVecSecret();
         const ctx = getCtx();
         const c = new AbortController();
         const t = setTimeout(() => c.abort(), timeoutMs);
@@ -2117,12 +2146,11 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!Array.isArray(res?.metadata)) throw new Error('查询没有返回结果');
         return res.metadata.length;
     }
-    // 把密钥写进酒馆对应源的槽位（会覆盖同名槽位）
+    // 把密钥写进酒馆 vllm 槽位（会覆盖同名槽位）
     async function writeVecSecret(value) {
-        const src = VEC_SOURCES[settings.recall.source] ? settings.recall.source : 'siliconflow';
-        const res = await fetch('/api/secrets/write', { method: 'POST', headers: getCtx().getRequestHeaders(), body: JSON.stringify({ key: VEC_SOURCES[src].secret, value: String(value || ''), label: 'Erato Memory' }) });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return VEC_SOURCES[src].secret;
+        const res = await fetch('/api/secrets/write', { method: 'POST', headers: getCtx().getRequestHeaders(), body: JSON.stringify({ key: VEC_SECRET, value: String(value || ''), label: 'Erato Memory' }) });
+        if (!res.ok) throw new Error(`写入密钥失败：HTTP ${res.status}`);
+        return VEC_SECRET;
     }
 
     /* ================= 状态 ================= */
@@ -2343,39 +2371,6 @@ C = 日常、闲聊、氛围、无后果的互动。
                 </select>
             </label>
             <hr>
-            <div class="em-sec">召回（把被裁掉/已折叠的条目按当下话题捞回来）</div>
-            <label class="checkbox_label"><input type="checkbox" id="em_rc_kw"><span>关键词召回（零网络：用户最新输入 + 最近一楼 recap 与条目做 n-gram 匹配）</span></label>
-            <label class="checkbox_label"><input type="checkbox" id="em_rc_vec"><span>向量召回（走酒馆自带向量接口，服务端存储；需要下面的源与密钥）</span></label>
-            <div class="em-row">
-                <label>向量源
-                    <select id="em_rc_src">${Object.entries(VEC_SOURCES).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join('')}</select>
-                </label>
-                <label class="em-grow">embeddings 地址（仅 vllm 源）<input id="em_rc_url" class="text_pole" placeholder="https://api.example.com（后端自动加 /v1/embeddings）"></label>
-            </div>
-            <div class="em-row">
-                <label class="em-grow">模型（留空用源默认）<input id="em_rc_model" class="text_pole" placeholder="Qwen/Qwen3-Embedding-0.6B"></label>
-                <label class="checkbox_label"><input type="checkbox" id="em_rc_cn"><span>硅基流动国内站</span></label>
-                <label class="checkbox_label"><input type="checkbox" id="em_rc_raw"><span>原文细节（已总结楼层的正文切块入库，捞摘要没写进的小细节）</span></label>
-            </div>
-            <div class="em-row">
-                <label class="em-grow">密钥（写入酒馆对应源的槽位，会覆盖同名槽位）<input id="em_rc_key" class="text_pole" type="password" autocomplete="off" placeholder="sk-…"></label>
-                <div class="menu_button" id="em_rc_write_key">写入密钥</div>
-            </div>
-            <div class="em-row">
-                <label>topK <input id="em_rc_topk" class="text_pole em-short" type="number" min="1" max="30"></label>
-                <label>阈值 <input id="em_rc_thr" class="text_pole em-short" type="number" min="0" max="1" step="0.05" title="余弦相似度阈值，Qwen3-Embedding 建议 0.4 起调"></label>
-                <label>召回预算(字) <input id="em_rc_chars" class="text_pole em-short" type="number" min="200" step="100"></label>
-                <label>原文预算(字) <input id="em_rc_raw_chars" class="text_pole em-short" type="number" min="200" step="100"></label>
-                <label>查询串上限(字) <input id="em_rc_query" class="text_pole em-short" type="number" min="100" step="100"></label>
-                <label>生成前最多等(秒) <input id="em_rc_timeout" class="text_pole em-short" type="number" min="1" max="30" title="用户消息一发出就开始查；生成前最多再等这么久，超时就不带召回，绝不阻断生成"></label>
-            </div>
-            <div class="em-row">
-                <div class="menu_button" id="em_rc_test">测试向量连接</div>
-                <div class="menu_button" id="em_rc_fill">补向量（只补缺的）</div>
-                <div class="menu_button" id="em_rc_rebuild">重建向量（清空重灌）</div>
-            </div>
-            <div class="em-hint" id="em_rc_hint"></div>
-            <hr>
             <div class="em-sec">副 API（OpenAI 兼容）</div>
             <label>地址<input id="em_api_url" class="text_pole" placeholder="https://api.example.com/v1"></label>
             <label>密钥<input id="em_api_key" class="text_pole" type="password" placeholder="sk-…" autocomplete="off"></label>
@@ -2393,6 +2388,36 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <label>超时(秒) <input id="em_api_timeout" class="text_pole" type="number" min="5"></label>
             </div>
             <div class="menu_button" id="em_test">测试连接</div>
+            <hr>
+            <div class="em-sec">向量召回（高楼层可选）</div>
+            <div class="em-hint">两三百楼以内不需要开。开了以后，被注入上限裁掉、或已折进远景的旧记忆会按你当下聊的话题被捞回来。填法和副 API 一样：地址 + 密钥 + 拉取模型选一个；任何 OpenAI 兼容的 embeddings 接口都行（硅基流动填 https://api.siliconflow.cn/v1，模型选 Qwen/Qwen3-Embedding-0.6B 或 BAAI/bge-m3）。向量存在酒馆服务端，不进聊天文件。</div>
+            <label class="checkbox_label"><input type="checkbox" id="em_rc_vec"><span>启用向量召回</span></label>
+            <label>地址<input id="em_rc_url" class="text_pole" placeholder="${VEC_DEFAULT_URL}"></label>
+            <label>密钥<input id="em_rc_key" class="text_pole" type="password" placeholder="sk-…" autocomplete="off"></label>
+            <div class="em-row em-model-row">
+                <label class="em-grow">向量模型（先拉取再选，或直接手填）
+                    <select id="em_rc_model_sel"></select>
+                </label>
+                <div class="menu_button" id="em_rc_models">拉取向量模型</div>
+            </div>
+            <label>模型名（手填 / 当前生效值）<input id="em_rc_model" class="text_pole" placeholder="${VEC_DEFAULT_MODEL}"></label>
+            <div class="em-hint"><span id="em_rc_model_count"></span></div>
+            <div class="em-row">
+                <div class="menu_button" id="em_rc_test">测试向量连接</div>
+                <div class="menu_button" id="em_rc_fill">补向量（只补缺的）</div>
+                <div class="menu_button" id="em_rc_rebuild">重建向量（清空重灌）</div>
+            </div>
+            <label class="checkbox_label"><input type="checkbox" id="em_rc_raw"><span>原文细节（已总结楼层的正文切块入库，捞摘要没写进的小细节；正文会发给向量服务）</span></label>
+            <label class="checkbox_label"><input type="checkbox" id="em_rc_kw"><span>关键词召回（零网络、不需要配置，默认开）</span></label>
+            <div class="em-row">
+                <label>topK <input id="em_rc_topk" class="text_pole em-short" type="number" min="1" max="30"></label>
+                <label>阈值 <input id="em_rc_thr" class="text_pole em-short" type="number" min="0" max="1" step="0.05" title="余弦相似度阈值，Qwen3-Embedding 建议 0.4 起调"></label>
+                <label>召回预算(字) <input id="em_rc_chars" class="text_pole em-short" type="number" min="200" step="100"></label>
+                <label>原文预算(字) <input id="em_rc_raw_chars" class="text_pole em-short" type="number" min="200" step="100"></label>
+                <label>查询串上限(字) <input id="em_rc_query" class="text_pole em-short" type="number" min="100" step="100"></label>
+                <label>生成前最多等(秒) <input id="em_rc_timeout" class="text_pole em-short" type="number" min="1" max="30" title="用户消息一发出就开始查；生成前最多再等这么久，超时就不带召回，绝不阻断生成"></label>
+            </div>
+            <div class="em-hint" id="em_rc_hint"></div>
             <hr>
             <div class="em-sec">悬浮球</div>
             <label class="checkbox_label"><input type="checkbox" id="em_ball_on"><span>显示悬浮球（单击开面板，可拖动，松手吸边）</span></label>
@@ -2497,27 +2522,44 @@ C = 日常、闲聊、氛围、无后果的互动。
         bindNum('#em_recap_win', 'recapWindow', applyInjection);
         bindNum('#em_keep', 'keepVisible', () => { $('#em_keep_q').val(settings.keepVisible); if (settings.hideSummarized) { hideSummarized(); applyInjection(); refreshStatus(); } });
 
-        // 召回 / 向量
+        // 向量召回：地址 / 密钥 / 拉模型选择，与副 API 同一套交互
         const rcHint = () => {
             const s = settings.recall;
-            const src = VEC_SOURCES[s.source] ? s.source : 'siliconflow';
             const data = getData();
             const n = data ? Object.keys(data.vec.entries).length : 0, r = data ? Object.keys(data.vec.raw).length : 0;
-            $('#em_rc_hint').text(`${s.vector ? `向量：${VEC_SOURCES[src].label} · 模型 ${vecBody().model || '（源默认）'} · 密钥槽 ${VEC_SOURCES[src].secret} · 本聊天已入库 ${n} 条记忆 / ${r} 楼原文${data?.vec?.error ? ` · 上次错误：${data.vec.error}` : ''}` : '向量召回未开启；关键词召回不需要任何配置。'}`);
-            $('#em_rc_url').closest('label').toggle(src === 'vllm');
-            $('#em_rc_cn').closest('label').toggle(src === 'siliconflow');
+            $('#em_rc_hint').text(s.vector
+                ? `向量：${vecBase() || '（未填地址）'} · 模型 ${vecBody().model} · 密钥${String(s.key || '').trim() ? '已填（自动写入酒馆 vllm 槽位）' : '未填'} · 本聊天已入库 ${n} 条记忆 / ${r} 楼原文${data?.vec?.error ? ` · 上次错误：${data.vec.error}` : ''}`
+                : '向量召回未开启；关键词召回不需要任何配置。');
+        };
+        const renderVecModelSelect = () => {
+            const sel = $('#em_rc_model_sel');
+            const cur = String(settings.recall.model || '').trim();
+            const list = Array.isArray(settings.recall.models) ? settings.recall.models : [];
+            sel.html(['<option value="">（未选择 / 手填）</option>'].concat(list.map(m => `<option value="${esc(m)}">${esc(m)}</option>`)).join(''));
+            sel.val(list.includes(cur) ? cur : '');
+            $('#em_rc_model_count').text(list.length ? `已拉取 ${list.length} 个模型（像 embedding 的排在前面）` : '尚未拉取模型列表');
         };
         const bindRc = (id, key, kind) => $(id).each(function () {
             if (kind === 'bool') $(this).prop('checked', !!settings.recall[key]); else $(this).val(settings.recall[key] ?? '');
         }).on('change', function () {
             settings.recall[key] = kind === 'bool' ? this.checked : kind === 'num' ? Number(this.value) : this.value.trim();
+            if (key === 'key') settings.recall.keyWritten = '';   // 换了密钥，下次调用重新写槽位
             saveSettings(); rc.key = ''; rc.result = null; rcHint(); applyInjection();
-            if (key === 'vector' && this.checked && getData()?.entries.length) toast('info', '已有记忆尚未入向量库，点「补向量」灌一次');
+            if (key === 'model') renderVecModelSelect();
+            if (key === 'vector' && this.checked) {
+                if (!vecConfigured()) toast('warning', '先填 embeddings 地址和密钥，再拉取并选择向量模型');
+                else if (getData()?.entries.length) toast('info', '已有记忆尚未入向量库，点「补向量」灌一次');
+            }
         });
-        bindRc('#em_rc_kw', 'keyword', 'bool'); bindRc('#em_rc_vec', 'vector', 'bool'); bindRc('#em_rc_src', 'source'); bindRc('#em_rc_url', 'apiUrl'); bindRc('#em_rc_model', 'model');
-        bindRc('#em_rc_cn', 'cn', 'bool'); bindRc('#em_rc_raw', 'raw', 'bool'); bindRc('#em_rc_topk', 'topK', 'num'); bindRc('#em_rc_thr', 'threshold', 'num');
+        bindRc('#em_rc_kw', 'keyword', 'bool'); bindRc('#em_rc_vec', 'vector', 'bool'); bindRc('#em_rc_url', 'apiUrl'); bindRc('#em_rc_key', 'key'); bindRc('#em_rc_model', 'model');
+        bindRc('#em_rc_raw', 'raw', 'bool'); bindRc('#em_rc_topk', 'topK', 'num'); bindRc('#em_rc_thr', 'threshold', 'num');
         bindRc('#em_rc_chars', 'recallChars', 'num'); bindRc('#em_rc_raw_chars', 'rawChars', 'num'); bindRc('#em_rc_query', 'queryChars', 'num'); bindRc('#em_rc_timeout', 'timeoutSec', 'num');
-        $('#em_rc_src').on('change', () => $('#em_rc_model').attr('placeholder', VEC_SOURCES[settings.recall.source]?.model || '模型名'));
+        $('#em_rc_model_sel').on('change', function () {
+            if (!this.value) return;
+            settings.recall.model = this.value; saveSettings();
+            $('#em_rc_model').val(this.value); rc.key = ''; rc.result = null; rcHint();
+        });
+        renderVecModelSelect();
         rcHint();
         const busyBtn = async (btn, text, fn) => {
             const el = $(btn); const old = el.text();
@@ -2525,25 +2567,28 @@ C = 日常、闲聊、氛围、无后果的互动。
             try { await fn(); } catch (err) { toast('error', `${old}失败：${err.message}`); const d = getData(); if (d) d.vec.error = err.message; }
             finally { el.removeClass('disabled').text(old); rcHint(); }
         };
-        $('#em_rc_write_key').on('click', () => busyBtn('#em_rc_write_key', '写入中…', async () => {
-            const v = String($('#em_rc_key').val() || '').trim();
-            if (!v) throw new Error('密钥为空');
-            const slot = await writeVecSecret(v);
-            $('#em_rc_key').val('');
-            toast('success', `密钥已写入酒馆槽位 ${slot}`);
+        $('#em_rc_models').on('click', () => busyBtn('#em_rc_models', '拉取中…', async () => {
+            if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
+            const ids = await fetchVecModels();
+            renderVecModelSelect();
+            toast('success', `拉到 ${ids.length} 个模型，请在下拉框里选一个向量模型`);
         }));
         $('#em_rc_test').on('click', () => busyBtn('#em_rc_test', '测试中…', async () => {
+            if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
+            if (!String(settings.recall.model || '').trim()) toast('warning', `未选模型，将用默认 ${VEC_DEFAULT_MODEL}`);
             const n = await vecTest();
             toast('success', `向量接口可用（探针查询命中 ${n} 条）`);
         }));
         $('#em_rc_fill').on('click', () => busyBtn('#em_rc_fill', '补充中…', async () => {
-            if (!settings.recall.vector) throw new Error('请先勾选向量召回');
+            if (!settings.recall.vector) throw new Error('请先勾选「启用向量召回」');
+            if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
             const data = getData(); if (!data) throw new Error('没有打开聊天');
             const r = await vecSync(data, (done, total) => $('#em_rc_fill').text(`补充中 ${done}/${total}`));
             toast('success', `已补 ${r.entries} 条记忆、${r.raw} 段原文`);
         }));
         $('#em_rc_rebuild').on('click', () => busyBtn('#em_rc_rebuild', '重建中…', async () => {
-            if (!settings.recall.vector) throw new Error('请先勾选向量召回');
+            if (!settings.recall.vector) throw new Error('请先勾选「启用向量召回」');
+            if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
             if (!await confirmBox('清空本聊天的向量并全部重灌？条目多时要跑一会儿')) return;
             const r = await vecRebuild((done, total) => $('#em_rc_rebuild').text(`重建中 ${done}/${total}`));
             toast('success', `已重建：${r.entries} 条记忆、${r.raw} 段原文`);
@@ -3579,7 +3624,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
-        vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecCollection, writeVecSecret,
+        vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
     };
 

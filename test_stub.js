@@ -49,6 +49,7 @@ const foldLog = [];
 const vecStore = {};   // collectionId → Map(hash → { text, index })
 const vecLog = [];
 const secrets = [];
+const modelCalls = [];
 const mode = { fewEvents: false, finishLength: 0, clearDuring: false, noSentinel: 0, allowBig: false, skipFloors: 0, declare: false, slow: false };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 global.fetch = async (url, opt) => {
@@ -70,6 +71,10 @@ global.fetch = async (url, opt) => {
         return { ok: true, status: 200, text: async () => out };
     }
     if (url === '/api/secrets/write') { secrets.push(body); return { ok: true, status: 200, text: async () => '{"id":"x"}' }; }
+    if (url === '/api/backends/chat-completions/status') {
+        modelCalls.push({ base: body.reverse_proxy, key: body.proxy_password });
+        return { ok: true, status: 200, text: async () => JSON.stringify({ data: [{ id: 'deepseek-chat' }, { id: 'BAAI/bge-m3' }, { id: 'Qwen/Qwen3-Embedding-0.6B' }, { id: 'gpt-4o' }] }) };
+    }
     if (mode.slow) {
         await new Promise((res, rej) => { const t = setTimeout(res, 300); opt.signal?.addEventListener('abort', () => { clearTimeout(t); rej(Object.assign(new Error('aborted'), { name: 'AbortError' })); }); });
     }
@@ -659,15 +664,25 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(D.rc.key, key, '同一查询串不重算');
         D.settings.maxInjectChars = 9000;
     });
-    await ta('向量：窗口入库后同步条目与原文 chunk；对账补缺；查询命中；重建 purge 后重灌；密钥写入槽位', async () => {
-        D.settings.recall.vector = true; D.settings.recall.source = 'siliconflow'; D.settings.recall.model = '';
+    await ta('向量：地址+密钥+拉模型选择（与副 API 同法）；密钥自动写进酒馆 vllm 槽位且只写一次；窗口入库后同步条目与原文 chunk；对账补缺；查询命中；重建 purge 后重灌', async () => {
+        D.settings.recall.vector = true; D.settings.recall.apiUrl = 'https://api.siliconflow.cn/v1/'; D.settings.recall.key = 'sk-vec'; D.settings.recall.model = '';
+        assert.ok(D.vecConfigured());
+        const ids = await D.fetchVecModels();
+        assert.deepStrictEqual(ids.slice(0, 2), ['BAAI/bge-m3', 'Qwen/Qwen3-Embedding-0.6B'], '像 embedding 的排前面：' + ids.join(','));
+        assert.deepStrictEqual(D.settings.recall.models, ids);
+        assert.strictEqual(modelCalls[modelCalls.length - 1].base, 'https://api.siliconflow.cn/v1', '拉模型带 /v1');
+        D.settings.recall.model = 'Qwen/Qwen3-Embedding-0.6B';
+        assert.deepStrictEqual(D.vecBody(), { source: 'vllm', apiUrl: 'https://api.siliconflow.cn', model: 'Qwen/Qwen3-Embedding-0.6B' }, '向量调用去掉 /v1，后端自己拼');
+        const s0 = secrets.length;
         const r = await D.vecSync(data);
         assert.ok(r.entries >= 10 && r.raw >= 10, '首次补向量：' + JSON.stringify(r));
-        assert.ok(vecLog.some(l => l.route === 'insert' && l.collection.startsWith('erato-mem-') && l.source === 'siliconflow' && l.endpoint === 'cn' && l.model === 'Qwen/Qwen3-Embedding-0.6B'));
+        assert.strictEqual(secrets.length, s0 + 1, '密钥只写一次'); assert.strictEqual(secrets[s0].key, 'api_key_vllm'); assert.strictEqual(secrets[s0].value, 'sk-vec');
+        assert.ok(vecLog.some(l => l.route === 'insert' && l.collection.startsWith('erato-mem-') && l.source === 'vllm' && l.model === 'Qwen/Qwen3-Embedding-0.6B'));
         assert.ok(vecLog.some(l => l.route === 'insert' && l.collection.startsWith('erato-raw-')));
         assert.strictEqual(Object.keys(data.vec.entries).length, data.entries.filter(e => e.status === 'ok').length);
         const r2 = await D.vecSync(data);
         assert.strictEqual(r2.entries, 0, '第二次对账无需补');
+        assert.strictEqual(secrets.length, s0 + 1, '同一把密钥不重复写');
         const q = await D.vecQuery(data, '7号钥匙', 8);
         assert.ok(q.ids.length >= 1 && q.raw.length >= 1, '向量查询：' + JSON.stringify(q));
         assert.ok(q.raw.some(x => x.index === 7 && x.text.includes('7号钥匙藏进了抽屉')), '原文 chunk 命中 7 楼');
@@ -688,12 +703,14 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(vecLog.slice(n0).some(l => l.route === 'insert'), '入库后应同步向量');
         const rr = await D.vecRebuild();
         assert.ok(vecLog.some(l => l.route === 'purge') && rr.entries >= 10);
-        const secretsBefore = secrets.length;
-        assert.strictEqual(await D.writeVecSecret('sk-test'), 'api_key_siliconflow');
-        assert.strictEqual(secrets[secretsBefore].key, 'api_key_siliconflow');
-        D.settings.recall.source = 'vllm'; D.settings.recall.apiUrl = 'https://emb.example.com/v1/'; D.settings.recall.model = 'bge-m3';
+        // 换密钥 → 下次调用重新写槽位
+        D.settings.recall.key = 'sk-new'; D.settings.recall.keyWritten = '';
+        await D.vecCall?.('list', { collectionId: D.vecCollection('mem') }).catch(() => {});
+        await D.vecSync(data);
+        assert.strictEqual(secrets[secrets.length - 1].value, 'sk-new');
+        D.settings.recall.apiUrl = 'https://emb.example.com/v1/'; D.settings.recall.model = 'bge-m3';
         assert.deepStrictEqual(D.vecBody(), { source: 'vllm', apiUrl: 'https://emb.example.com', model: 'bge-m3' });
-        D.settings.recall.source = 'siliconflow'; D.settings.recall.vector = false; D.settings.maxInjectChars = 9000;
+        D.settings.recall.vector = false; D.settings.maxInjectChars = 9000;
         D.rc.key = ''; D.rc.result = null;
     });
     t('原文切块：长文按句末切、带重叠', () => {
@@ -900,8 +917,11 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const load = saved => { ctx.extensionSettings = saved ? { 'erato-memory': saved } : {}; new Function(src)(); return ctx.extensionSettings['erato-memory']; };
         let s = load({ autoInterval: 10, windowFloors: 20, enabled: true });
         assert.strictEqual(s.autoInterval, 20); assert.strictEqual(s.windowFloors, 40); assert.strictEqual(s.floorUnit, 'chat');
-        assert.strictEqual(s.recall.keyword, true); assert.strictEqual(s.recall.vector, false); assert.strictEqual(s.recall.source, 'siliconflow'); assert.strictEqual(s.canonMax, 25); assert.strictEqual(s.recapWindow, 20);
+        assert.strictEqual(s.recall.keyword, true); assert.strictEqual(s.recall.vector, false); assert.strictEqual(s.recall.source, 'vllm'); assert.strictEqual(s.canonMax, 25); assert.strictEqual(s.recapWindow, 20);
         assert.strictEqual(s.autoFold, 'batch'); assert.strictEqual(s.headerText, '');
+        // v0.4.0 首版的「向量源」下拉：旧设置换成对应地址
+        s = load({ recall: { source: 'siliconflow', cn: true, vector: true, model: 'BAAI/bge-m3' } });
+        assert.strictEqual(s.recall.source, 'vllm'); assert.strictEqual(s.recall.apiUrl, 'https://api.siliconflow.cn/v1'); assert.strictEqual(s.recall.cn, undefined); assert.strictEqual(s.recall.model, 'BAAI/bge-m3'); assert.deepStrictEqual(s.recall.models, []);
         s = load({ autoInterval: 0, windowFloors: 50, enabled: true });
         assert.strictEqual(s.autoInterval, 0, '手动模式保持 0'); assert.strictEqual(s.windowFloors, 100);
         s = load(null);
