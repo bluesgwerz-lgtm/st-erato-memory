@@ -109,18 +109,19 @@ global.fetch = async (url, opt) => {
         content = JSON.stringify({
             cast: [
                 // 后面的窗口故意把陆衍报成龙套：档位只升不降，应仍是配
-                { name: '陆衍', aliases: ['小衍'], tier: floors[0] >= 15 ? '龙套' : '配', role: '邻居', seen: floors },
-                { name: '周远', tier: '配', role: '医生', seen: [floors[0]] },
+                { name: '陆衍', aliases: ['小衍'], tier: floors[0] >= 15 ? '龙套' : '配', role: '邻居', sex: '男', seen: floors },
+                { name: '周远', tier: '配', role: '医生', sex: '不详', seen: [floors[0]] },   // 枚举外的性别忽略
                 ...(floors[0] <= 2 ? [{ name: '司机老王', tier: '龙套', role: '司机', seen: [floors[0]] }] : []),   // 只露一段，不该自动升配
                 { name: 'Char', tier: '主' }, { name: '用户', tier: '主' },
-                floors[0] <= 5 ? { name: '陆母', aliases: ['母亲'], tier: '配', role: '用户的母亲', seen: [floors[0]] }
-                    : { name: '王秀英', aliases: ['陆母'], tier: '配', seen: [floors[0]] },
+                floors[0] <= 5 ? { name: '陆母', aliases: ['母亲'], tier: '配', role: '用户的母亲', sex: '女', seen: [floors[0]] }
+                    : { name: '王秀英', aliases: ['陆母'], tier: '配', sex: floors[0] === 19 ? '男' : '女性', seen: [floors[0]] },   // 最后一窗性别报反 → 冲突不合并
             ],
             events: evFloors.map(ev),
             relation: `对用户从戒备转为依赖（#${floors[floors.length - 1]}）`,
             people: [
-                { name: '陆衍', aliases: ['小衍'], role: '邻居', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
+                { name: '陆衍', aliases: ['小衍'], role: '邻居', addr: floors[0] <= 5 ? '您' : '昭昭', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
                 { name: '周远', role: '医生', state: floors[0] >= 15 ? '离场' : '', floor: floors[0] },
+                ...(floors[0] === 19 ? [{ name: '王秀英', status: '同名另一人的现状，不该并进来', floor: 19 }] : []),
                 { name: 'Char', rel_user: '不该建档' },
                 { name: '用户', role: '不该建档' },
             ],
@@ -228,6 +229,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const msgs = D.buildMessages({ floors, recent: [], locked: [], data });
         assert.ok(!/\{\{(name1|name2|roster|relation|context|recent|locked|floor_range|floor_count|material|min_events|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
         assert.ok(msgs[1].content.includes('"cast"') && msgs[1].content.includes('亲属') && msgs[1].content.includes('"uncovered"') && msgs[1].content.includes(END), '模板应含点名表、亲属明文、覆盖申报与哨兵');
+        assert.ok(msgs[1].content.includes('"sex"') && msgs[1].content.includes('"addr"') && msgs[1].content.includes('不从外貌推'), '模板应含性别、称呼与年龄填写规则');
         assert.ok(msgs[1].content.includes('【#2】') && msgs[1].content.includes('【#5】') && msgs[1].content.includes('#2–#5') && msgs[1].content.includes('用户角色：用户'));
     });
     t('自定义模板缺 {{material}} 时退回默认', () => {
@@ -277,6 +279,12 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(mom.aliases.includes('陆母') && mom.aliases.includes('母亲'), '旧写法与称呼都进别称：' + mom.aliases.join(','));
         assert.strictEqual(mom.f.role.v, '用户的母亲', '点名表只在 role 为空时补');
         assert.strictEqual(mom.first_idx, 0);
+        assert.strictEqual(mom.f.sex.v, '女', '性别只写一次，「女性」归一为「女」，最后一窗报男不覆盖');
+        assert.deepStrictEqual({ v: mom.sexClash?.v, idx: mom.sexClash?.idx }, { v: '男', idx: 19 }, '性别相反 → 记冲突');
+        assert.ok(!mom.f.status, '冲突那一窗对此人的 people 更新不并进来');
+        assert.strictEqual(lu.f.sex.v, '男'); assert.ok(!lu.sexClash, '性别一致不冲突');
+        assert.strictEqual(lu.f.addr.v, '您', '称呼只写一次：后面窗口的「昭昭」不覆盖');
+        assert.ok(!data.people.find(p => p.name === '周远').f.sex, '枚举外的性别值忽略');
         const liu = data.people.find(p => p.name === '小刘');
         assert.ok(liu && liu.first_idx === 2 && !liu.f.role, '事件 characters 反哺建档，只有名字与楼层');
         assert.strictEqual(liu.tier, '配', '进过 S 事件的未定人物自动升配');
@@ -503,10 +511,10 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(b.text.includes('## 正典') && b.text.includes('## 关系现状') && b.text.includes('## 人物志') && b.text.includes('## 物件'));
         assert.ok(b.text.indexOf('## 人物志') < b.text.indexOf('## 正典'));
         assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙') && b.text.includes('远景 ='), '块首五行');
-        assert.ok(/- 陆衍（小衍）｜身份：邻居/.test(b.text), '陆衍在最近楼层出现，出完整卡');
+        assert.ok(/- 陆衍（小衍）｜身份：邻居｜性别：男｜称呼用户：您/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后');
         assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
         const brief = /其他已登场：([^\n]*)/.exec(b.text)?.[1] || '';
-        assert.ok(brief.includes('周远·医生·离场') && brief.includes('王秀英（母亲/陆母）·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带别称与非在场状态）：' + brief);
+        assert.ok(brief.includes('周远·医生·离场') && brief.includes('王秀英（母亲/陆母）·女·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带性别、别称与非在场状态）：' + brief);
         assert.ok(!b.text.includes('司机老王'), '龙套不进注入块');
         assert.ok(b.text.includes('牛皮笔袋｜状态：在用｜持有者：陆衍｜备注：完好'), '物件卡带状态：' + b.text);
         assert.ok(!b.text.includes('咖啡杯'), '摆设不进注入块');

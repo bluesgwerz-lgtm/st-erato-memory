@@ -230,5 +230,6 @@
 .em-oline-text { font-size: .82em; line-height: 1.5; margin-top: 3px; opacity: .9; }
 .em-oline .em-ent-body { margin-top: 4px; }
 .em-lost { background: rgba(224,82,82,.35); }
+.em-clash { background: rgba(240,160,40,.4); }
 .em-canon-view { cursor: pointer; }
 .em-canon textarea { width: 100%; box-sizing: border-box; margin-top: 4px; }

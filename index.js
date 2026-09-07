@@ -27,8 +27,12 @@
 
     // 人物志 / 物件档案的字段（值带来源楼层号）；主角只记一行「关系现状」，不建档
     // arc = 此人此刻处在什么阶段（一句）；views = 对任意他人的看法（另存 p.views，不在此表）
-    const PERSON_FIELDS = ['role', 'age', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows', 'arc'];
-    const PERSON_LABEL = { role: '身份', age: '年龄', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情', arc: '阶段' };
+    // sex 来自点名表（身份表，龙套也有），addr = 此人怎么称呼 {{user}}；这两项只写一次不覆盖（性别不随剧情变，称呼升级是关系事件走 views/arc），面板可改
+    const PERSON_FIELDS = ['role', 'sex', 'age', 'addr', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows', 'arc'];
+    const PERSON_LABEL = { role: '身份', sex: '性别', age: '年龄', addr: '称呼{{user}}', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情', arc: '阶段' };
+    const PERSON_ONCE = ['sex', 'addr'];
+    const SEXES = ['男', '女'];
+    const normSex = v => { const s = String(v || '').trim().charAt(0); return SEXES.includes(s) ? s : ''; };
     const ITEM_FIELDS = ['holder', 'note', 'meaning'];   // v0.3.4：原自由文本 status 改名 note（备注），status 让给枚举状态
     const ITEM_LABEL = { holder: '持有者', note: '备注', meaning: '意义' };
     // 点名表档位：按对剧情的影响判，不按是否在场；龙套只留在面板里，不进注入块
@@ -547,7 +551,7 @@
 先点名，再写事件，最后更新档案。输出一个 JSON 对象，键的顺序必须是 cast、events、relation、people、items、uncovered：
 {
   "cast": [
-    {"name": "本段出现过的每一个人，包括只被提到的、包括主角、包括主角的亲属；有正式名用正式名，没有就写『谁的什么人』如 {{name1}}的母亲；宁多勿漏", "aliases": ["原文里对此人的称呼/昵称/别称，如 母亲、老陆、张姐"], "tier": "主 | 配 | 龙套", "role": "一句身份", "seen": [出现或被提到的楼层号]}
+    {"name": "本段出现过的每一个人，包括只被提到的、包括主角、包括主角的亲属；有正式名用正式名，没有就写『谁的什么人』如 {{name1}}的母亲；宁多勿漏", "aliases": ["原文里对此人的称呼/昵称/别称，如 母亲、老陆、张姐"], "tier": "主 | 配 | 龙套", "role": "一句身份", "sex": "男 | 女，原文有依据（他/她、称谓、自述）才写，没有就不写这个键", "seen": [出现或被提到的楼层号]}
   ],
   "events": [
     {
@@ -568,7 +572,7 @@
   ],
   "relation": "{{name2}} 此刻对 {{name1}} 的态度与关系，一句话 ≤40 字，写现状不写过程；本段没有变化则留空字符串",
   "people": [
-    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
+    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人怎么称呼{{name1}}（王哥/您/直呼其名），原文有才写", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
   "items": [
     {"name": "物件名", "tier": "关键 | 次要 | 摆设", "state": "待用 | 在用 | 已使用 | 已转手 | 遗失 | 损毁 | 封存", "holder": "现在在谁手里", "note": "现状一句", "meaning": "对剧情或人物的意义", "floor": 楼层号}
@@ -588,6 +592,7 @@ JSON 结束后另起一行输出 ${END_MARK} 作为结束标记。
 - tier 按对剧情的影响判，不按是否在场：不在场但影响了事件走向的人（打电话提醒、发消息、被反复提起的亲属）算主或配；在场但只提供服务、没有自己意图的人（店员、司机、随从）算龙套。
 - people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键。没变化的人不必出现在 people 里，但必须出现在 cast 里。
 - 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
+- 档案里已标了性别的人以档案为准；若本段原文明确相反，照原文写 sex，可能是同名的另一个人。
 - views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
 - people 的 state 是生命周期：在场=还在故事里活动；离场=剧情明确离开（出国、断交、调走、被赶走）；死亡；下落不明=失联、不知去向。没变化不写这个键。
 - items 只记对剧情或人物有意义的物件。tier 按作用判：关键=推动剧情或承载关系、没了故事会变（证据、信物、解药、钥匙）；次要=有意义但可替代；摆设=只是道具，可以不写。
@@ -620,7 +625,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     const personLabel = k => PERSON_LABEL[k].replace('{{user}}', getCtx().name1 || '{{user}}').replace('{{char}}', getCtx().name2 || '{{char}}');
 
     function rosterText(data) {
-        const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${x.tier ? `[${x.tier}]` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
+        const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${x.tier ? `[${x.tier}]` : ''}${fv(x, 'sex') ? `·${fv(x, 'sex')}` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
         const i = data.items.map(x => `${x.name}${x.tier ? `[${x.tier}]` : ''}${x.state ? `(${x.state})` : ''}`);
         return [p.length ? `人物：${p.join('、')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
     }
@@ -715,14 +720,25 @@ C = 日常、闲聊、氛围、无后果的互动。
         const floorOf = v => { const n = Number(v); return byIdx.has(n) ? n : lastIdx; };
         const dateOf = i => byIdx.get(i)?.send_date || '';
         const HIST_MAX = 3;
-        // 覆盖前把旧值压进 hist（最近 3 版），来源楼被删时能退回上一版；手改过的字段（manual）副模型不覆盖
+        // 覆盖前把旧值压进 hist（最近 3 版），来源楼被删时能退回上一版；手改过的字段（manual）副模型不覆盖；只写一次的字段（PERSON_ONCE）有值后不换
         const setF = (ent, key, val, idx) => {
             const v = String(val || '').trim();
             if (!v || ent.f[key]?.manual) return;
             const old = ent.f[key];
             if (old?.v === v) { old.idx = idx; old.date = dateOf(idx); return; }
+            if (old?.v && PERSON_ONCE.includes(key)) return;
             const hist = old?.v ? [{ v: old.v, idx: old.idx, date: old.date }, ...(old.hist || [])].slice(0, HIST_MAX) : (old?.hist || []);
             ent.f[key] = { v, idx, date: dateOf(idx), hist };
+        };
+        // 性别当身份护栏：档案里已有性别、本窗报的相反 → 不合并，记冲突（面板标 ⚠），本窗对此人的 people 更新跳过；报的与档案相同则清冲突
+        const clashed = new Set();
+        const setSex = (ent, val, idx) => {
+            const s = normSex(val);
+            if (!s) return;
+            const cur = fv(ent, 'sex');
+            if (cur && cur !== s) { ent.sexClash = { v: s, idx, date: dateOf(idx) }; clashed.add(ent.id); return; }
+            if (cur === s) delete ent.sexClash;
+            setF(ent, 'sex', s, idx);
         };
         const me = norm(ctx.name1), them = norm(ctx.name2);
         const isLead = n => n === me || n === them;
@@ -768,6 +784,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const tier = String(c.tier || '').trim();
             raiseTier(ent, tier);
             if (!fv(ent, 'role')) setF(ent, 'role', c.role, idx);
+            setSex(ent, c.sex, idx);
             seenThisWin.add(ent.id);
         }
         for (const p of (Array.isArray(obj.people) ? obj.people : [])) {
@@ -782,7 +799,9 @@ C = 日常、闲聊、氛围、无后果的互动。
             const idx = floorOf(p.floor);
             const ent = upsertPerson(name, asArr(p.aliases), idx);
             if (!ent) continue;
-            for (const k of PERSON_FIELDS) setF(ent, k, p[k], idx);
+            if (clashed.has(ent.id)) continue;   // 本窗性别对不上：可能是同名另一人，字段与看法不并进来
+            for (const k of PERSON_FIELDS) if (k !== 'sex') setF(ent, k, p[k], idx);
+            if (p.sex) setSex(ent, p.sex, idx);   // 自定义模板把性别放在 people 里也认
             setState(ent, p.state, PERSON_STATES, idx, dateOf(idx));
             for (const v of (Array.isArray(p.views) ? p.views : [])) {
                 const to = String(v?.to || '').trim(), text = String(v?.v || '').trim();
@@ -864,6 +883,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         for (const list of [data.people, data.items]) for (const x of list) {
             for (const k of Object.keys(x.f || {})) revert(x.f, k);
             for (const k of Object.keys(x.views || {})) revert(x.views, k);
+            if (x.sexClash?.date && isDead(x.sexClash.date)) delete x.sexClash;   // 报冲突的那楼没了，冲突也作废
             if (x.state && !x.stateLock && x.stateDate && isDead(x.stateDate)) {
                 const hist = (x.stateHist || []).filter(h => !(h.date && isDead(h.date)));
                 if (hist.length) { const h = hist.shift(); x.state = h.s; x.stateIdx = h.idx; x.stateDate = h.date; x.stateHist = hist; }
@@ -1457,7 +1477,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function fmtPerson(p, full) {
         const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
-        if (!full) return `${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
+        if (!full) return `${head}${fv(p, 'sex') ? `·${fv(p, 'sex')}` : ''}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
         const parts = [];
         if (p.state && p.state !== '在场') parts.push(`状态：${p.state}`);   // 在场是默认，不占字
         parts.push(...PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
@@ -3066,6 +3086,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const mark = v => `${v?.manual ? ' <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span>' : ''}${v?.stale ? ' <span class="em-stale" title="来源楼层已不存在，待核">?</span>' : ''}`;
         const rows = fields.map(k => {
             const f = x.f?.[k];
+            if (open && k === 'sex') return `<label>${esc(label(k))}${f?.manual ? ' 🔒' : ''}<select class="em-x-f" data-k="sex"><option value="">（未定）</option>${SEXES.map(s => `<option value="${s}" ${f?.v === s ? 'selected' : ''}>${s}</option>`).join('')}</select></label>`;
             if (open) return `<label>${esc(label(k))}${f?.manual ? ' 🔒' : ''}<input class="text_pole em-x-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
             if (!f?.v) return '';
             return `<div class="em-ent-row"><span class="em-ent-k">${esc(label(k))}</span><span class="em-ent-v">${esc(f.v)}${mark(f)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
@@ -3080,6 +3101,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (x.state && x.state !== '在场') badges.push(`<span class="em-tier em-state${kind === 'i' && isSettled(x) ? ' em-state-done' : ''}" title="${x.stateLock ? '手改已锁定' : ''}">${esc(x.state)}${x.stateLock ? '🔒' : ''}</span>`);
         if (kind === 'p' && HEAT_LABEL[heat]) badges.push(`<span class="em-tier em-heat-${heat}">${HEAT_LABEL[heat]}</span>`);
         if (x.lost) badges.push('<span class="em-tier em-lost" title="首见楼与所有来源楼都已被删：不注入；再次被提到或手动保存即恢复">来源全失</span>');
+        if (kind === 'p' && x.sexClash?.v) badges.push(`<span class="em-tier em-clash" title="副 AI 在 #${x.sexClash.idx} 报此人为「${esc(x.sexClash.v)}」，档案是「${esc(fv(x, 'sex'))}」：可能是同名的另一个人，那一段的更新没有并进来。保存本卡即清除；若真是两个人，改名字或别称区分">⚠性别冲突</span>`);
         const dim = kind === 'p' ? x.tier === '龙套' || x.lost : (isProp(x) || isSettled(x) || x.lost);
         const sel = (cls, list, cur, none, extra) => `<select class="${cls}"><option value="">${none}</option>${list.map(t => `<option value="${t}" ${cur === t ? 'selected' : ''}>${t}${extra?.(t) || ''}</option>`).join('')}</select>`;
         return `
@@ -3434,6 +3456,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             });
             x.updated_at = Date.now();
             delete x.lost;
+            delete x.sexClash;
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
             toast('success', '已保存（改过的字段已锁定，副 AI 不再覆盖）');
         } else if (act === 'unlockf') {
