@@ -88,6 +88,8 @@
         directive: '',
         systemPrompt: '',
         promptTemplate: '',
+        contentRegex: '',     // 非 Erato 预设用：正文提取正则（捕获组 1 为正文），留空 = <content>…</content>
+        stripRegex: '',       // 非 Erato 预设用：额外剥除正则，一行一条，取正文前先从整楼剥掉（自家思考块 / 状态栏）
         debug: false,
     };
 
@@ -267,11 +269,27 @@
 
     const stripCommon = t => t.replace(RX.prop, '').replace(RX.toy, '').replace(RX.newspaper, '');
 
-    // 优先取 <content> 块；缺标签时按已知块逐个剥除，剩下的当正文并标记 fallback
+    // 非 Erato 预设：设置里可换正文提取正则与额外剥除正则；无效的正则忽略并在控制台提示一次，留空 = 上面的 Erato 默认
+    const rxCache = new Map();
+    function compileRx(src, flags) {
+        const key = flags + '/' + src;
+        if (!rxCache.has(key)) {
+            let rx = null;
+            try { rx = new RegExp(src, flags); } catch (e) { console.warn(`[${EXT}] 正则无效，已忽略：${src} — ${e.message}`); }
+            rxCache.set(key, rx);
+        }
+        return rxCache.get(key);
+    }
+    const customContentRx = () => { const s = String(settings.contentRegex || '').trim(); return s ? compileRx(s, 'i') : null; };
+    const customStripRxs = () => String(settings.stripRegex || '').split('\n').map(s => s.trim()).filter(Boolean).map(s => compileRx(s, 'gi')).filter(Boolean);
+    const badRxLines = (text, flags) => String(text || '').split('\n').map(s => s.trim()).filter(Boolean).filter(s => { try { new RegExp(s, flags); return false; } catch { return true; } });
+
+    // 优先取 <content> 块（或设置里的自定义正则，捕获组 1 为正文、无捕获组取整段）；缺标签时按已知块逐个剥除，剩下的当正文并标记 fallback
     function extractContent(mes) {
-        const text = String(mes || '');
-        const m = RX.content.exec(text);
-        if (m) return { text: stripCommon(m[1]).trim(), fallback: false };
+        let text = String(mes || '');
+        for (const r of customStripRxs()) text = text.replace(r, '');
+        const m = (customContentRx() || RX.content).exec(text);
+        if (m) return { text: stripCommon(m[1] ?? m[0]).trim(), fallback: false };
         let t = text;
         for (const r of RX.thinkBlocks) t = t.replace(r, '');
         const open = t.search(/<content>/i);
@@ -2439,6 +2457,11 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <div class="menu_button" id="em_tpl_reset">恢复默认</div>
             </div>
             <hr>
+            <div class="em-sec">正文提取（用 Erato 预设不用填）</div>
+            <label>正文提取正则（留空 = 取 &lt;content&gt;…&lt;/content&gt;；捕获组 1 当正文，没有捕获组就取整段匹配）<input id="em_x_content" class="text_pole" placeholder="<content>([\\s\\S]*?)</content>" autocomplete="off" spellcheck="false"></label>
+            <label>额外剥除正则（一行一条，取正文前先从整楼剥掉；填自家预设的思考块、状态栏标签）<textarea id="em_x_strip" class="text_pole" rows="3" placeholder="<thought>[\\s\\S]*?</thought>\n<status>[\\s\\S]*?</status>" spellcheck="false"></textarea></label>
+            <div class="em-hint">别家预设没有正文标签时提取正则留空即可：插件会把整楼减去 think / thinking / think_format / COT_Director、&lt;details&gt;、&lt;recap&gt;、&lt;plot_directions&gt; 后当正文。自家的思考块和状态栏标签不在这张清单里的，写进「额外剥除」，否则思考里的备选走向、状态栏里的数值快照会被当成事件记下来。正则无效会被忽略（控制台有提示）。改动后已总结的段落会被判为「过期」并在下次总结时重跑。</div>
+            <hr>
             <div class="em-sec">调试</div>
             <label class="checkbox_label"><input type="checkbox" id="em_debug"><span>控制台调试日志</span></label>
             <div class="em-hint">斜杠命令：/em-panel 开面板 · /em-summarize 总结到当前 · /em-pin 楼层号 钉/取消钉 · /em-note 文字 手动记一条</div>
@@ -2611,6 +2634,15 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_tpl_reset').on('click', () => { $('#em_tpl, #em_sys_prompt, #em_header').val(''); settings.promptTemplate = ''; settings.systemPrompt = ''; settings.headerText = ''; saveSettings(); applyInjection(); toast('info', '已恢复默认提示词'); });
         $('#em_header').val(settings.headerText).attr('placeholder', DEFAULT_HEADER.join('\n')).on('change', function () { settings.headerText = this.value; saveSettings(); applyInjection(); });
         $('#em_auto_fold').val(['always', 'batch', 'manual'].includes(settings.autoFold) ? settings.autoFold : 'batch').on('change', function () { settings.autoFold = this.value; saveSettings(); });
+        const rxChanged = (key, value, flags) => {
+            const had = getData().windows.length > 0;
+            settings[key] = value; saveSettings();
+            const bad = badRxLines(value, flags);
+            if (bad.length) toast('warning', `正则无效，已忽略：${bad[0].slice(0, 60)}`);
+            else if (had) toast('info', '正文提取规则已改：已总结的段落会被判为过期，下次总结时重跑');
+        };
+        $('#em_x_content').val(settings.contentRegex).on('change', function () { rxChanged('contentRegex', this.value.trim(), 'i'); });
+        $('#em_x_strip').val(settings.stripRegex).on('change', function () { rxChanged('stripRegex', this.value, 'gi'); });
         $('#em_debug').prop('checked', settings.debug).on('change', function () { settings.debug = this.checked; saveSettings(); });
         $('#em_test').on('click', async function () {
             if (!apiConfigured()) return toast('warning', '请先填写副 API 地址与密钥');

@@ -910,6 +910,28 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     console.log('== 抠取 / JSON ==');
     t('说戏 COT 不进正文', () => { const c = D.extractContent(chat[2].mes); assert.ok(!c.text.includes('备选走向') && c.text.includes('正文第2楼') && !c.fallback); });
     t('缺 </content> 走兜底', () => { const c = D.extractContent('<think>x</think><content>正文<details>d</details>'); assert.ok(c.fallback && c.text === '正文'); });
+    t('非 Erato 预设：无正文标签整楼当正文；自定义提取正则（捕获组 / 无捕获组）与额外剥除正则；无效正则忽略；留空回默认', () => {
+        let c = D.extractContent('<thought>备选走向A</thought>正文一段<status>HP 80</status>');
+        assert.ok(c.fallback && c.text.includes('<thought>备选走向A</thought>') && c.text.includes('<status>HP 80</status>'), '默认清单不认别家标签，连标签带内容整楼当正文：' + c.text);
+        D.settings.stripRegex = '<thought>[\\s\\S]*?</thought>\n<status>[\\s\\S]*?</status>\n';
+        c = D.extractContent('<thought>备选走向A</thought>正文一段<status>HP 80</status>');
+        assert.ok(c.fallback && c.text === '正文一段', '额外剥除后只剩正文：' + c.text);
+        D.settings.contentRegex = '<body>([\\s\\S]*?)</body>';
+        c = D.extractContent('<thought>x</thought>前言<body>正文二段</body>后记');
+        assert.ok(!c.fallback && c.text === '正文二段', '捕获组 1 当正文：' + c.text);
+        D.settings.contentRegex = '正文[^<]*';
+        c = D.extractContent('<body>正文三段</body>');
+        assert.ok(!c.fallback && c.text === '正文三段', '无捕获组取整段：' + c.text);
+        D.settings.contentRegex = '<body>([\\s\\S]*?</body>';
+        c = D.extractContent('<body>正文四段</body>');
+        assert.ok(c.fallback && c.text === '<body>正文四段</body>', '无效正则忽略、回默认 <content> 找不到走兜底：' + c.text);
+        D.settings.stripRegex = '<status>[\\s\\S]*?</status>\n[未闭合';
+        c = D.extractContent('正文五段<status>HP</status>');
+        assert.ok(c.text === '正文五段', '剥除清单里坏的一行忽略、好的照用：' + c.text);
+        D.settings.contentRegex = ''; D.settings.stripRegex = '';
+        c = D.extractContent(chat[2].mes);
+        assert.ok(!c.fallback && c.text.includes('正文第2楼') && !c.text.includes('备选走向'), '留空回 Erato 默认');
+    });
     t('JSON 修复链', () => { assert.strictEqual(D.parseJson('```json\n{"summary": "a\nb", "grade": "S",}\n```').summary, 'a\nb'); assert.strictEqual(D.parseJson('{"summary": "截断').summary, '截断'); });
 
     console.log('== 设置迁移：楼数单位 ==');
