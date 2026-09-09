@@ -24,8 +24,12 @@ global.jQuery = $; global.$ = $;
 const fakeEl = () => ({
     style: { setProperty() {}, removeProperty() {} }, classList: { add() {}, remove() {}, toggle() {} },
     addEventListener() {}, setAttribute() {}, getBoundingClientRect: () => ({ left: 0, top: 0, width: 40, height: 40 }),
-    appendChild() {}, innerHTML: '', id: '', className: '',
+    appendChild() {}, innerHTML: '', id: '', className: '', click() { downloads.push({ name: this.download, href: this.href }); },
 });
+const downloads = [];   // 假下载：a.click() 记文件名，Blob 记内容
+let lastBlob = null;
+global.Blob = class { constructor(parts, opts) { this.text = parts.join(''); this.type = opts?.type || ''; lastBlob = this; } };
+global.URL = { createObjectURL: () => 'blob:fake', revokeObjectURL() {} };
 const domAttrs = {};
 global.document = {
     getElementById: () => null,
@@ -43,14 +47,14 @@ const END = '<END_OF_MEMORY/>';
 // mode.fewEvents：只回 1 条事件（测密度下限）；mode.finishLength：前 N 次回 finish_reason=length（测截断重试）；
 // mode.clearDuring：调用期间把库换掉（测清空世代）；mode.noSentinel：前 N 次不带结束哨兵；
 // mode.allowBig：不拒答大窗口；mode.skipFloors：漏掉前 N 楼的事件（测覆盖核验）；mode.declare：漏掉的楼在 uncovered 里申报；
-// mode.slow：调用挂 300ms 且尊重 abort（测停止）
+// mode.slow：调用挂 300ms 且尊重 abort（测停止）；mode.fenced：整个回复包进 ```json 围栏、哨兵在围栏内（测围栏内哨兵不被当截断）
 const apiLog = [];
 const foldLog = [];
 const vecStore = {};   // collectionId → Map(hash → { text, index })
 const vecLog = [];
 const secrets = [];
 const modelCalls = [];
-const mode = { fewEvents: false, finishLength: 0, clearDuring: false, noSentinel: 0, allowBig: false, skipFloors: 0, declare: false, slow: false };
+const mode = { fewEvents: false, finishLength: 0, clearDuring: false, noSentinel: 0, allowBig: false, skipFloors: 0, declare: false, slow: false, fenced: false };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 global.fetch = async (url, opt) => {
     const body = JSON.parse(opt.body);
@@ -133,6 +137,7 @@ global.fetch = async (url, opt) => {
         });
     }
     if (mode.noSentinel > 0) mode.noSentinel--; else if (finish !== 'length') content += '\n' + END;
+    if (mode.fenced && finish !== 'length') content = '```json\n' + content + '\n```';
     return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content }, finish_reason: finish }] }) };
 };
 
@@ -238,10 +243,17 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(msgs[1].content.includes('XYZ') && msgs[1].content.includes('等级标准'));
         D.settings.promptTemplate = '';
     });
-    t('哨兵判定：有哨兵即完整，缺哨兵即截断；剥离后再解析', () => {
+    t('哨兵判定：有哨兵即完整，缺哨兵即截断；剥离后再解析；哨兵写在 ``` 围栏内（Gemini 习惯）同样算完整', () => {
         assert.ok(D.hasEndMark('{"a":1}\n' + END) && D.hasEndMark('{"a":1}' + END + '  '));
         assert.ok(!D.hasEndMark('{"a":1}') && !D.hasEndMark('{"a":1}' + END + ' 还有话'));
         assert.strictEqual(D.stripEndMark('{"a":1}\n' + END + '\n'), '{"a":1}');
+        assert.ok(D.hasEndMark('```json\n{"a":1}\n' + END + '\n```'), '围栏内哨兵');
+        assert.ok(D.hasEndMark('```json\n{"a":1}\n' + END + '\n```\n\n'), '围栏后带空行');
+        assert.ok(D.hasEndMark('```json\n{"a":1}\n' + END), '只开不闭的围栏');
+        assert.ok(!D.hasEndMark('```json\n{"a":1}\n```'), '围栏里没哨兵仍是截断');
+        assert.strictEqual(D.stripEndMark('```json\n{"a":1}\n' + END + '\n```'), '{"a":1}', '剥离连围栏一起去掉');
+        assert.strictEqual(D.parseJson(D.stripEndMark('```json\n{"a":1}\n' + END + '\n```')).a, 1);
+        assert.strictEqual(D.stripEndMark('```\n- 正典一条\n' + END + '\n```'), '- 正典一条', '纯文本折叠输出同样剥围栏');
     });
 
     console.log('== 入库（假副 API：>2 楼拒答 → 拆半） ==');
@@ -299,7 +311,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(data.items.find(i => i.name === '咖啡杯').tier, '摆设');
         assert.ok(data.relation.v.includes('#19'), '关系现状来自最后一窗');
         assert.strictEqual(data.relation.idx, 19);
-        assert.ok(data.rawLog.length === 3 && data.rawLog[0].finish === 'stop', '原始回复留档 3 条');
+        assert.ok(data.rawLog.length === D.RAW_LOG_MAX && data.rawLog[0].finish === 'stop', `原始回复留档 ${D.RAW_LOG_MAX} 条`);
     });
     t('计数：已总结 18 楼（10 个 AI 楼）/ 10 条，待总结 0', () => {
         const c = D.counts();
@@ -941,6 +953,37 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(!c.fallback && c.text.includes('正文第2楼') && !c.text.includes('备选走向'), '留空回 Erato 默认');
     });
     t('JSON 修复链', () => { assert.strictEqual(D.parseJson('```json\n{"summary": "a\nb", "grade": "S",}\n```').summary, 'a\nb'); assert.strictEqual(D.parseJson('{"summary": "截断').summary, '截断'); });
+
+    console.log('== 围栏内哨兵 / 原始回复导出 ==');
+    D.settings.autoInterval = 20; D.settings.windowFloors = 8; D.settings.minEventsPer = 4; mode.allowBig = true; mode.fewEvents = false; mode.skipFloors = 0;
+    await ta('哨兵在 ``` 围栏内（Gemini 习惯）→ 不算截断，一次调用入库，不重发', async () => {
+        const b = chat.length; chat.push(mkMsg(b, true), mkMsg(b + 1, false), mkMsg(b + 2, true), mkMsg(b + 3, false));   // 新增两 AI 楼 b+1, b+3
+        mode.fenced = true;
+        const n0 = apiLog.length;
+        await D.ingest('manual');
+        mode.fenced = false;
+        const calls = apiLog.slice(n0);
+        assert.ok(calls.length >= 1 && calls.every(c => !c.retry && !c.correction), '围栏内哨兵不该触发任何重试：' + JSON.stringify(calls.map(c => c.correction)));
+        assert.ok(data.windows.filter(w => w.floors.includes(b + 1) || w.floors.includes(b + 3)).every(w => w.status === 'ok'));
+        assert.ok(data.rawLog.slice(0, calls.length).every(r => !r.note), '新增留档（最新在前）都不带重试标注');
+        assert.ok(data.entries.some(e => e.src.idx === b + 3), '围栏里的 JSON 解析入库');
+    });
+    t('原始回复：面板文本与 .txt 导出同一份，最新在前带 finish/note；清空后为空', () => {
+        const text = D.rawLogText(data);
+        assert.ok(text.startsWith('[') && text.includes('finish=stop') && text.includes('========'), text.slice(0, 120));
+        downloads.length = 0;
+        D.rawAction('export');
+        assert.strictEqual(downloads.length, 1); assert.ok(/^erato-raw-chat1\.txt$/.test(downloads[0].name), downloads[0].name);
+        assert.ok(lastBlob.text.includes('副 API 原始回复') && lastBlob.text.includes(text), '导出内容 = 头行 + 面板文本');
+        assert.ok(lastBlob.type.startsWith('text/plain'));
+        const n = data.rawLog.length;
+        assert.ok(n > 0 && n <= D.RAW_LOG_MAX);
+        D.rawAction('clear');
+        assert.strictEqual(data.rawLog.length, 0); assert.strictEqual(D.rawLogText(data), '（还没有调用记录）');
+        downloads.length = 0;
+        D.rawAction('export');
+        assert.strictEqual(downloads.length, 0, '空记录不导出');
+    });
 
     console.log('== 设置迁移：楼数单位 ==');
     t('v0.3.1 旧设置（AI 楼计）加载时翻倍；新装用新默认；已迁移的不重复翻倍；v0.2 直升不把默认值翻倍；v0.3 设置补齐 recall 组', () => {

@@ -49,8 +49,8 @@
     const ITEM_SETTLED = ['已使用', '遗失', '损毁', '封存'];   // 终态：仍是要记住的事实，但注入降成一行
     const DORMANT_FLOORS = 100;   // 面板活跃度：超过这么多楼没露面算「沉寂」；「近期」= 最近 npcScanDepth 楼提到（与注入完整卡同一判断）
     const TRENDS = ['破裂', '厌恶', '反感', '陌生', '投缘', '亲密', '交融'];
-    const RAW_LOG_MAX = 3;      // 保留最近几次副 API 原始回复供诊断
-    const RAW_LOG_CHARS = 6000;
+    const RAW_LOG_MAX = 8;      // 保留最近几次副 API 原始回复供诊断（一次总结三四个窗口各带一次重试也能放下）
+    const RAW_LOG_CHARS = 12000;    // 每条截多少字：40 楼窗口的完整 JSON 也要存得下，否则「查截断」的记录自己先被截断
     // 结束哨兵：副模型在 JSON/正文之后另起一行输出它。缺哨兵 = 截断，不管 finish_reason 报什么（供应商会错报）
     const END_MARK = '<END_OF_MEMORY/>';
     const RECAP_CHARS = 400;    // 逐楼 recap 底层每楼存多少字
@@ -402,8 +402,11 @@
 
     // 哨兵：模板/提示词里要求了哨兵才核验；有哨兵即完整（供应商错报 length 也收），缺哨兵即截断（错报 stop 也不收）
     const wantsEndMark = text => String(text || '').includes(END_MARK);
-    const hasEndMark = raw => new RegExp(END_MARK.replace(/[/<>]/g, '\\$&') + '\\s*$').test(String(raw || '').trim());
-    const stripEndMark = raw => String(raw || '').replace(new RegExp('\\s*' + END_MARK.replace(/[/<>]/g, '\\$&') + '\\s*$'), '').trim();
+    // 模型常把整个回复包进 ``` 围栏、哨兵写在围栏内（Gemini 尤甚）：判定与剥离前先去掉围栏，否则完整输出被当截断白白重发一次
+    const END_RX = END_MARK.replace(/[/<>]/g, '\\$&');
+    const unfence = raw => String(raw || '').trim().replace(/^```[\w-]*\s*/, '').replace(/\s*```\s*$/, '').trim();
+    const hasEndMark = raw => new RegExp(END_RX + '\\s*$').test(unfence(raw));
+    const stripEndMark = raw => unfence(raw).replace(new RegExp('\\s*' + END_RX + '\\s*$'), '').trim();
 
     // 拉模型列表：与主 API「连接」按钮同一条路，后端拿 reverse_proxy + proxy_password 去请求 {base}/models
     // 上游出错时酒馆后端回 200 + {error:true}，不带原因，只能提示去看后台日志
@@ -2833,8 +2836,14 @@ C = 日常、闲聊、氛围、无后果的互动。
                     <div class="em-sec-body"><div class="em-inject-line" id="em_preview_line"></div><pre id="em_preview" class="em-preview"></pre></div>
                 </div>
                 <div class="em-section" data-sec="raw">
-                    <div class="em-sec-head"><span>副 API 最近的原始回复（诊断用）</span><span class="em-sec-arrow"></span></div>
-                    <div class="em-sec-body"><pre id="em_raw" class="em-preview"></pre></div>
+                    <div class="em-sec-head"><span>副 API 最近的原始回复（诊断用）<span class="em-sec-n" id="em_n_raw"></span></span><span class="em-sec-arrow"></span></div>
+                    <div class="em-sec-body">
+                        <div class="em-actions em-oact">
+                            <div class="menu_button" data-ract="export">导出原始回复 (.txt)</div>
+                            <div class="menu_button" data-ract="clear">清空记录</div>
+                        </div>
+                        <pre id="em_raw" class="em-preview"></pre>
+                    </div>
                 </div>
             </div>
             <div id="em_view_cfg" class="em-view em-cfg" style="display:none">
@@ -2904,6 +2913,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             renderPanel();
         });
         $('#em_panel').on('click', '[data-oact]', function (ev) { ev.stopPropagation(); outlineAction($(this).data('oact'), $(this).closest('.em-oline').data('id')); });
+        $('#em_panel').on('click', '[data-ract]', function (ev) { ev.stopPropagation(); rawAction($(this).data('ract')); });
 
         const list = $('#em_list');
         list.on('click', '.em-card-head', function () {
@@ -3258,7 +3268,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const data = getData();
         const list = $('#em_list');
         const form = $('#em_manual_form');
-        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_rel_box, #em_people, #em_items, #em_tombs, #em_tombs_i, #em_canon, #em_outline').html(''); $('#em_n_people, #em_n_items, #em_n_outline, #em_outline_line').text(''); $('#em_preview').text(''); $('#em_raw').text(''); return; }
+        if (!data) { list.html('<div class="em-empty">当前没有打开聊天</div>'); form.hide(); $('#em_rel_box, #em_people, #em_items, #em_tombs, #em_tombs_i, #em_canon, #em_outline').html(''); $('#em_n_people, #em_n_items, #em_n_outline, #em_n_raw, #em_outline_line').text(''); $('#em_preview').text(''); $('#em_raw').text(''); return; }
         const chat = getCtx().chat || [];
         const depths = visibleDepths(chat);
         renderEntities(data);
@@ -3280,9 +3290,8 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_preview').text(lastInject.text || '（本轮没有可注入的内容）');
         const sz = lastInject.sizes || {};
         $('#em_preview_line').text(lastInject.text ? `共 ${lastInject.chars} 字：档案 ${sz.ent || 0} · 远景 ${sz.outline || 0} · 正典 ${sz.canon || 0} · 往事 ${sz.past || 0} · 保底 ${sz.fallback || 0} · 召回 ${sz.recall || 0} · 原文 ${sz.raw || 0}${lastInject.dropped ? ` · 预算裁掉 ${lastInject.dropped} 条` : ''}` : '');
-        $('#em_raw').text((data.rawLog || []).length
-            ? data.rawLog.map(r => `[${new Date(r.at).toLocaleString()}] ${r.win} · ${r.model || ''}${r.finish ? ` · finish=${r.finish}` : ''}${r.note ? ` · ${r.note}` : ''}\n${r.text}`).join('\n\n========\n\n')
-            : '（还没有调用记录）');
+        $('#em_raw').text(rawLogText(data));
+        $('#em_n_raw').text((data.rawLog || []).length ? `${data.rawLog.length}/${RAW_LOG_MAX}` : '');
 
         const c = counts();
         const alert = $('#em_alert');
@@ -3527,6 +3536,34 @@ C = 日常、闲聊、氛围、无后果的互动。
         }
     }
 
+    // 原始回复区：面板显示与 .txt 导出共用同一份文本；导出走「导出 JSON」同一条下载路
+    const rawLogText = data => (data?.rawLog || []).length
+        ? data.rawLog.map(r => `[${new Date(r.at).toLocaleString()}] ${r.win} · ${r.model || ''}${r.finish ? ` · finish=${r.finish}` : ''}${r.note ? ` · ${r.note}` : ''}\n${r.text}`).join('\n\n========\n\n')
+        : '（还没有调用记录）';
+    function downloadText(name, text, type) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([text], { type }));
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    }
+    async function rawAction(act) {
+        const data = getData();
+        if (!data) return toast('warning', '当前没有打开聊天');
+        const n = (data.rawLog || []).length;
+        if (act === 'export') {
+            if (!n) return toast('info', '还没有调用记录');
+            const ctx = getCtx();
+            const head = `Erato Memory 副 API 原始回复 · 聊天 ${ctx.chatId || ''} · 导出 ${new Date().toLocaleString()} · 共 ${n} 条（最新在前，每条最多 ${RAW_LOG_CHARS} 字）`;
+            downloadText(`erato-raw-${String(ctx.chatId || 'chat').replace(/[^\w.-]+/g, '_')}.txt`, head + '\n\n' + rawLogText(data) + '\n', 'text/plain;charset=utf-8');
+        } else if (act === 'clear') {
+            if (!n) return toast('info', '还没有调用记录');
+            data.rawLog = [];
+            saveData(); renderPanel();
+            toast('info', `已清空 ${n} 条调用记录`);
+        }
+    }
+
     async function panelAction(act) {
         const data = getData();
         if (act === 'cfg') return showTab('cfg');
@@ -3551,12 +3588,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             toast('info', n ? `已恢复 ${n} 条消息；「隐藏已总结」仍勾着的话，下次总结后会再次隐藏` : '没有本插件隐藏的楼层');
         } else if (act === 'export') {
             const ctx = getCtx();
-            const blob = new Blob([JSON.stringify({ chatId: ctx.chatId, exportedAt: new Date().toISOString(), data }, null, 2)], { type: 'application/json' });
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = `erato-memory-${String(ctx.chatId || 'chat').replace(/[^\w.-]+/g, '_')}.json`;
-            a.click();
-            setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+            downloadText(`erato-memory-${String(ctx.chatId || 'chat').replace(/[^\w.-]+/g, '_')}.json`, JSON.stringify({ chatId: ctx.chatId, exportedAt: new Date().toISOString(), data }, null, 2), 'application/json');
         } else if (act === 'import') {
             $('#em_import_file').val('').trigger('click');
         } else if (act === 'clear') {
@@ -3677,6 +3709,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
         raiseTier, promote, setState, heatOf, matchEnt, entFilter,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
+        rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
