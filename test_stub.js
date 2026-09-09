@@ -47,14 +47,15 @@ const END = '<END_OF_MEMORY/>';
 // mode.fewEvents：只回 1 条事件（测密度下限）；mode.finishLength：前 N 次回 finish_reason=length（测截断重试）；
 // mode.clearDuring：调用期间把库换掉（测清空世代）；mode.noSentinel：前 N 次不带结束哨兵；
 // mode.allowBig：不拒答大窗口；mode.skipFloors：漏掉前 N 楼的事件（测覆盖核验）；mode.declare：漏掉的楼在 uncovered 里申报；
-// mode.slow：调用挂 300ms 且尊重 abort（测停止）；mode.fenced：整个回复包进 ```json 围栏、哨兵在围栏内（测围栏内哨兵不被当截断）
+// mode.slow：调用挂 300ms 且尊重 abort（测停止）；mode.fenced：整个回复包进 ```json 围栏、哨兵在围栏内（测围栏内哨兵不被当截断）；
+// mode.failQueue：按队列依次回 HTTP 错误 [{status,msg}]（测 429/5xx 退避重试与 401 直接失败），队列空了才正常回
 const apiLog = [];
 const foldLog = [];
 const vecStore = {};   // collectionId → Map(hash → { text, index })
 const vecLog = [];
 const secrets = [];
 const modelCalls = [];
-const mode = { fewEvents: false, finishLength: 0, clearDuring: false, noSentinel: 0, allowBig: false, skipFloors: 0, declare: false, slow: false, fenced: false };
+const mode = { fewEvents: false, finishLength: 0, clearDuring: false, noSentinel: 0, allowBig: false, skipFloors: 0, declare: false, slow: false, fenced: false, failQueue: [] };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 global.fetch = async (url, opt) => {
     const body = JSON.parse(opt.body);
@@ -97,6 +98,7 @@ global.fetch = async (url, opt) => {
     const floors = [...user.matchAll(/【#(\d+)】/g)].map(m => Number(m[1]));
     const correction = body.messages.length > 2 ? (/截断/.test(last) ? 'length' : /认领/.test(last) ? 'coverage' : /太少|事件/.test(last) ? 'density' : 'json') : '';
     apiLog.push({ floors, msgs: body.messages.length, retry: correction === 'length', correction, hasLocked: /已锁定的记忆[\s\S]*?\n(?!（无）)/.test(user) && !/已锁定的记忆（[^\n]*\n（无）/.test(user), user });
+    if (mode.failQueue.length) { const f = mode.failQueue.shift(); return { ok: false, status: f.status, text: async () => JSON.stringify({ error: { message: f.msg } }) }; }
     if (mode.clearDuring) { mode.clearDuring = false; ctx.chatMetadata.eratoMemory = { version: 2 }; }
     let content, finish = 'stop';
     const ev = i => ({ floors: [i], story_time: `3月${i}日 · 午后 · 厨房`, type: 'plot', title: `题${i}`, summary: `第${i}楼发生的事情，陆衍在厨房里做了决定，提到了${i}号钥匙。`, characters: ['陆衍', i === 2 ? '小刘' : '用户'], grade: i === 2 ? 'S' : 'B', tags: ['厨房'] });
@@ -124,7 +126,7 @@ global.fetch = async (url, opt) => {
             relation: `对用户从戒备转为依赖（#${floors[floors.length - 1]}）`,
             people: [
                 { name: '陆衍', aliases: ['小衍'], role: '邻居', addr: floors[0] <= 5 ? '您' : '昭昭', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
-                { name: '周远', role: '医生', state: floors[0] >= 15 ? '离场' : '', floor: floors[0] },
+                { name: '周远', role: '医生', look: '（未知）', stance: '不详', state: floors[0] >= 15 ? '离场' : '', floor: floors[0] },   // 占位词不该入档
                 ...(floors[0] === 19 ? [{ name: '王秀英', status: '同名另一人的现状，不该并进来', floor: 19 }] : []),
                 { name: 'Char', rel_user: '不该建档' },
                 { name: '用户', role: '不该建档' },
@@ -302,6 +304,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(liu.tier, '配', '进过 S 事件的未定人物自动升配');
         const zhou = data.people.find(p => p.name === '周远');
         assert.strictEqual(zhou.state, '离场', '状态以最新一窗为准');
+        assert.ok(zhou.f.role?.v === '医生' && !zhou.f.look && !zhou.f.stance, '「（未知）」「不详」占位词不入档：' + JSON.stringify(zhou.f));
         const wang = data.people.find(p => p.name === '司机老王');
         assert.strictEqual(wang.tier, '龙套'); assert.strictEqual(wang.seen, 1, '只露一段不升配');
         assert.strictEqual(data.items.length, 2);
@@ -983,6 +986,57 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         downloads.length = 0;
         D.rawAction('export');
         assert.strictEqual(downloads.length, 0, '空记录不导出');
+    });
+
+    console.log('== 暂时性失败退避重试 / 鉴权错直接失败 / 占位词 ==');
+    t('失败分类：429/5xx/限流文字/网络错可重试；401/403/400/密钥/模型名错不重试', () => {
+        assert.ok(D.isTransient(429, '') && D.isTransient(503, '') && D.isTransient(500, 'Internal'));
+        assert.ok(!D.isTransient(401, '') && !D.isTransient(403, 'Forbidden') && !D.isTransient(400, 'bad request') && !D.isTransient(404, ''));
+        assert.ok(D.isTransient(200, 'Too Many Requests') && D.isTransient(200, 'rate limit exceeded') && D.isTransient(200, 'RESOURCE_EXHAUSTED') && D.isTransient(200, '网络错误：ECONNRESET'), '酒馆后端 200+error 只能按文字判');
+        assert.ok(!D.isTransient(200, 'Invalid API key') && !D.isTransient(200, 'model gpt-x not found') && !D.isTransient(200, '疑似拒答'));
+    });
+    t('占位词判定', () => {
+        for (const s of ['未知', '（未知）', '(不详)', '未提及', '暂无', 'N/A', 'unknown', '【待定】']) assert.ok(D.PLACEHOLDER_RX.test(s), s);
+        for (const s of ['未知的来客', '不详细说', '无业', '医生', '（未知，但裴凛熟悉其口气）']) assert.ok(!D.PLACEHOLDER_RX.test(s), s);
+    });
+    D.RETRY_DELAYS.splice(0, D.RETRY_DELAYS.length, 10, 10);   // 桩环境把 3s/8s 缩成 10ms
+    await ta('429 → 批次内退避重试后成功入库；失败那次留一行错误记录', async () => {
+        const b = chat.length; chat.push(mkMsg(b, true), mkMsg(b + 1, false));
+        mode.failQueue = [{ status: 429, msg: 'Too Many Requests' }];
+        const n0 = apiLog.length;
+        await D.ingest('manual');
+        const calls = apiLog.slice(n0);
+        assert.strictEqual(calls.length, 2, '一次 429 + 一次成功：' + calls.length);
+        const w = data.windows.find(x => x.floors.includes(b + 1));
+        assert.ok(w && w.status === 'ok' && w.attempts === 0, JSON.stringify({ s: w?.status, e: w?.last_error }));
+        const errLine = data.rawLog.find(r => r.error);
+        assert.ok(errLine && /429|Too Many/.test(errLine.note) && /1\/2/.test(errLine.note) && errLine.text === '', JSON.stringify(errLine));
+        assert.ok(D.rawLogText(data).includes('Too Many Requests'), '错误行进导出文本');
+    });
+    await ta('连续三次 429（超过两次退避）→ 窗口 failed 待手动重试；再点重试成功', async () => {
+        const b = chat.length; chat.push(mkMsg(b, true), mkMsg(b + 1, false));
+        mode.failQueue = [{ status: 429, msg: 'Too Many Requests' }, { status: 503, msg: 'Service Unavailable' }, { status: 429, msg: 'Too Many Requests' }];
+        const n0 = apiLog.length;
+        await D.ingest('manual');
+        assert.strictEqual(apiLog.length - n0, 3, '首发 + 两次退避 = 3 次');
+        const w = data.windows.find(x => x.floors.includes(b + 1));
+        assert.ok(w && w.status === 'failed' && w.attempts === 1 && /Too Many/.test(w.last_error), JSON.stringify({ s: w?.status, a: w?.attempts, e: w?.last_error }));
+        assert.ok(/失败（第 1 次）/.test(data.rawLog[0].note), data.rawLog[0].note);
+        mode.failQueue = [];
+        await D.ingest('retry');
+        assert.strictEqual(w.status, 'ok');
+    });
+    await ta('401 → 不重试，一次即失败', async () => {
+        const b = chat.length; chat.push(mkMsg(b, true), mkMsg(b + 1, false));
+        mode.failQueue = [{ status: 401, msg: 'Unauthorized' }];
+        const n0 = apiLog.length;
+        await D.ingest('manual');
+        assert.strictEqual(apiLog.length - n0, 1, '鉴权错不该重发');
+        const w = data.windows.find(x => x.floors.includes(b + 1));
+        assert.ok(w && w.status === 'failed' && /Unauthorized/.test(w.last_error), JSON.stringify({ s: w?.status, e: w?.last_error }));
+        mode.failQueue = [];
+        await D.ingest('retry');
+        assert.strictEqual(w.status, 'ok');
     });
 
     console.log('== 设置迁移：楼数单位 ==');

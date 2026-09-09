@@ -49,6 +49,8 @@
     const ITEM_SETTLED = ['已使用', '遗失', '损毁', '封存'];   // 终态：仍是要记住的事实，但注入降成一行
     const DORMANT_FLOORS = 100;   // 面板活跃度：超过这么多楼没露面算「沉寂」；「近期」= 最近 npcScanDepth 楼提到（与注入完整卡同一判断）
     const TRENDS = ['破裂', '厌恶', '反感', '陌生', '投缘', '亲密', '交融'];
+    // 副模型不知道时爱填的占位词：整段只有这个的字段视为没写（模板也要求不写这个键，这里是兜底）
+    const PLACEHOLDER_RX = /^[（(【\[]?\s*(未知|不详|未提及|未明确|未描写|未说明|不明|待定|无|暂无|N\/A|none|null|unknown)\s*[）)】\]]?$/i;
     const RAW_LOG_MAX = 8;      // 保留最近几次副 API 原始回复供诊断（一次总结三四个窗口各带一次重试也能放下）
     const RAW_LOG_CHARS = 12000;    // 每条截多少字：40 楼窗口的完整 JSON 也要存得下，否则「查截断」的记录自己先被截断
     // 结束哨兵：副模型在 JSON/正文之后另起一行输出它。缺哨兵 = 截断，不管 finish_reason 报什么（供应商会错报）
@@ -141,6 +143,8 @@
     const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     const uid = p => `${p}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const sleep = ms => new Promise(r => setTimeout(r, ms));
+    // 可被「停止」打断的等待（退避重试期间点停止不用等满）
+    const sleepAbortable = (ms, signal) => new Promise(r => { if (signal?.aborted) return r(); const t = setTimeout(done, ms); function done() { clearTimeout(t); signal?.removeEventListener?.('abort', done); r(); } signal?.addEventListener?.('abort', done, { once: true }); });
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
     // FNV-1a 32 位，只对抠出的正文做，改状态栏/道具不算改
@@ -379,7 +383,8 @@
             text = await res.text();
         } catch (err) {
             if (signal?.aborted) throw Object.assign(new Error('已停止'), { stopped: true });
-            throw new Error(controller.signal.aborted ? `超时（${settings.api.timeoutSec}s）` : `网络错误：${err.message}`);
+            // 超时与网络错都是暂时性的：标 retryable 交给批次内退避
+            throw Object.assign(new Error(controller.signal.aborted ? `超时（${settings.api.timeoutSec}s）` : `网络错误：${err.message}`), { retryable: true });
         } finally {
             clearTimeout(timer);
             signal?.removeEventListener?.('abort', onOuter);
@@ -387,17 +392,39 @@
         let json;
         try { json = JSON.parse(text); } catch { throw new Error(`后端返回非 JSON：${text.slice(0, 120)}`); }
         if (!res.ok || json.error) {
-            const msg = json.error?.message || json.error || json.message || `HTTP ${res.status}`;
-            throw new Error(String(msg).slice(0, 200));
+            const msg = String(json.error?.message || json.error || json.message || `HTTP ${res.status}`).slice(0, 200);
+            throw Object.assign(new Error(msg), { retryable: isTransient(res.status, msg) });
         }
         const choice = json.choices?.[0];
         const content = choice?.message?.content;
         const finish = String(choice?.finish_reason || '');
         // 上游安全策略拦截：内容常为空或半截，按拒答处理（会走拆半），不当网络错误
         if (finish === 'content_filter') throw Object.assign(new Error('上游内容过滤（content_filter）'), { refused: true, split: true });
-        if (!content || !String(content).trim()) throw new Error('空回复');
+        if (!content || !String(content).trim()) throw Object.assign(new Error('空回复'), { retryable: true });
         const out = String(content).replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
         return { text: out, finish };
+    }
+
+    // 失败分类：限流 / 上游 5xx / 网络 / 超时 / 空回复是暂时性的，同一批次内退避重来（3s → 8s），扛过去就不用等下次手动重试；
+    // 鉴权、参数、模型名这类 4xx 再发也一样，直接失败；酒馆后端把上游错误包成 200+{error} 时只能按文字判
+    const RETRY_DELAYS = [3000, 8000];
+    const isTransient = (status, msg) => {
+        if (status === 429 || (status >= 500 && status < 600)) return true;
+        if (status >= 400 && status < 500) return false;
+        if (/\b(400|401|403|404)\b|unauthorized|forbidden|invalid.{0,20}key|api key|model.{0,20}not (found|exist)/i.test(msg)) return false;
+        return /\b(429|50[0-9]|502|503|504)\b|too many|rate.?limit|overloaded|resource.?exhausted|quota|timeout|timed out|unavailable|bad gateway|ECONN|ETIMEDOUT|socket|fetch failed/i.test(msg);
+    };
+    async function callApiRetry(messages, maxTokens, signal, onFail) {
+        for (let i = 0; ; i++) {
+            try { return await callApi(messages, maxTokens, signal); }
+            catch (err) {
+                if (err.stopped || !err.retryable || i >= RETRY_DELAYS.length || signal?.aborted) throw err;
+                onFail?.(err, i + 1);
+                log('副 API 暂时性失败，退避后重试', `${i + 1}/${RETRY_DELAYS.length}`, err.message);
+                await sleepAbortable(RETRY_DELAYS[i], signal);
+                if (signal?.aborted) throw Object.assign(new Error('已停止'), { stopped: true });
+            }
+        }
     }
 
     // 哨兵：模板/提示词里要求了哨兵才核验；有哨兵即完整（供应商错报 length 也收），缺哨兵即截断（错报 stop 也不收）
@@ -559,7 +586,7 @@
   "events": [
     {
       "floors": [本事件来自哪几楼，只填楼层号数字；本段每一楼都必须被至少一个事件认领，或在 uncovered 里申报],
-      "story_time": "沿用该楼作者摘要的『日期 · 时段 · 场景』原文；没有则从正文推断；推断不出写（未知），禁止编造",
+      "story_time": "沿用该楼作者摘要的『日期 · 时段 · 场景』原文；没有则从正文推断；推断不出就不写这个键，禁止编造",
       "type": "plot | emotion | intimacy | relationship | setting 之一。setting=新角色登场/世界观揭示/规则确立",
       "title": "≤8字，意象或事件名，不用『之后』『开始』这类空词",
       "summary": "80–200字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。必须保留正式人名、原文称呼、地点、关键物件和具体动作；禁止『两人发生冲突』『关系升温』这类不带主语宾语的空话；未来只凭一句口语提法也要能认出这条。可保留1句决定走向的原台词。去掉感官修辞。",
@@ -593,7 +620,7 @@ JSON 结束后另起一行输出 ${END_MARK} 作为结束标记。
 档案规则：
 - cast 是点名表：本段每一个有名字或固定称呼的人都要在，包括只被提到、没到场的。漏一个人比多写十个龙套更糟。
 - tier 按对剧情的影响判，不按是否在场：不在场但影响了事件走向的人（打电话提醒、发消息、被反复提起的亲属）算主或配；在场但只提供服务、没有自己意图的人（店员、司机、随从）算龙套。
-- people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键。没变化的人不必出现在 people 里，但必须出现在 cast 里。
+- people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键；不知道的不写『未知』『不详』这类占位词，档案里只放原文有依据的话。没变化的人不必出现在 people 里，但必须出现在 cast 里。
 - 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
 - 档案里已标了性别的人以档案为准；若本段原文明确相反，照原文写 sex，可能是同名的另一个人。
 - views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
@@ -723,10 +750,11 @@ C = 日常、闲聊、氛围、无后果的互动。
         const floorOf = v => { const n = Number(v); return byIdx.has(n) ? n : lastIdx; };
         const dateOf = i => byIdx.get(i)?.send_date || '';
         const HIST_MAX = 3;
-        // 覆盖前把旧值压进 hist（最近 3 版），来源楼被删时能退回上一版；手改过的字段（manual）副模型不覆盖；只写一次的字段（PERSON_ONCE）有值后不换
+        // 覆盖前把旧值压进 hist（最近 3 版），来源楼被删时能退回上一版；手改过的字段（manual）副模型不覆盖；只写一次的字段（PERSON_ONCE）有值后不换；
+        // 「（未知）」「不详」这类占位词按空处理：不入档、不注入、不占只写一次的名额
         const setF = (ent, key, val, idx) => {
             const v = String(val || '').trim();
-            if (!v || ent.f[key]?.manual) return;
+            if (!v || PLACEHOLDER_RX.test(v) || ent.f[key]?.manual) return;
             const old = ent.f[key];
             if (old?.v === v) { old.idx = idx; old.date = dateOf(idx); return; }
             if (old?.v && PERSON_ONCE.includes(key)) return;
@@ -768,7 +796,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         };
         const rel = String(obj.relation || '').trim();
         const setRelation = (v, idx) => {
-            if (!v || data.relation?.manual) return;
+            if (!v || PLACEHOLDER_RX.test(v) || data.relation?.manual) return;
             const old = data.relation || {};
             if (old.v === v) { old.idx = idx; old.date = dateOf(idx); return; }
             const hist = old.v ? [{ v: old.v, idx: old.idx, date: old.date }, ...(old.hist || [])].slice(0, HIST_MAX) : (old.hist || []);
@@ -1097,12 +1125,13 @@ C = 日常、闲聊、氛围、无后果的互动。
         for (const f of inputs) storeRecap(data, f);
         const recent = data.entries.filter(x => x.status === 'ok' && !x.manual && x.src.idx < w.floors[0]).slice(-3);
         const locked = data.entries.filter(x => x.win === w.id && (x.pinned || x.locked));
-        // 最近几次原始回复留档，诊断「模型到底返回了什么」
+        // 最近几次原始回复留档，诊断「模型到底返回了什么」；失败的调用也记一行（只有错误信息没有正文），导出时能还原一次总结的全部调用
         const keepRaw = (r, note) => {
             if (!Array.isArray(data.rawLog)) data.rawLog = [];
-            data.rawLog.unshift({ at: Date.now(), win: winLabel(w), model: settings.api.model, finish: r.finish || '', note: note || '', text: String(r.text || '').slice(0, RAW_LOG_CHARS) });
+            data.rawLog.unshift({ at: Date.now(), win: winLabel(w), model: settings.api.model, finish: r.finish || '', note: note || '', text: String(r.text || '').slice(0, RAW_LOG_CHARS), ...(r.error ? { error: true } : {}) });
             data.rawLog.length = Math.min(data.rawLog.length, RAW_LOG_MAX);
         };
+        const onFail = (err, n) => keepRaw({ error: true }, `失败，${RETRY_DELAYS[n - 1] / 1000}s 后重试（${n}/${RETRY_DELAYS.length}）：${err.message}`);
         const signal = run.ctrl?.signal;
         const gone = () => getData() !== data;   // 库在调用期间被清空/切换（清空按钮、切聊天）：结果作废，不写进新库
         const split = msg => Object.assign(new Error(msg), { split: true });
@@ -1110,17 +1139,17 @@ C = 日常、闲聊、氛围、无后果的互动。
             const messages = buildMessages({ floors: inputs, recent, locked, data });
             const sentinel = wantsEndMark(messages[1].content);
             const truncated = r => r.finish === 'length' || (sentinel && !hasEndMark(r.text));
-            let r = await callApi(messages, undefined, signal);
+            let r = await callApiRetry(messages, undefined, signal, onFail);
             if (gone()) { w.status = 'pending'; w.last_error = '库已重置，本次结果作废'; return; }
             keepRaw(r);
             if (truncated(r) && !parseJson(stripEndMark(r.text)) && isRefusal(r.text)) throw Object.assign(new Error('疑似拒答：' + r.text.slice(0, 80)), { refused: true, split: true });
             if (truncated(r)) {
                 // 输出撞上限（或缺结束哨兵）：先带长度约束重来一次，仍截断再交给拆半
                 log('输出被截断，压缩重试', winLabel(w));
-                r = await callApi(messages.concat([
+                r = await callApiRetry(messages.concat([
                     { role: 'assistant', content: r.text.slice(0, 2000) },
                     { role: 'user', content: `上面的输出被截断了。重新输出完整的 JSON：键的顺序与内容要求不变，每条 summary 压到 100 字以内，cast 一个都不能少；只输出 JSON，JSON 之后另起一行输出 ${END_MARK}。` },
-                ]), undefined, signal);
+                ]), undefined, signal, onFail);
                 if (gone()) { w.status = 'pending'; w.last_error = '库已重置，本次结果作废'; return; }
                 keepRaw(r, '压缩重试');
                 if (truncated(r)) throw split('输出两次被截断（max_tokens 太小或窗口太大）');
@@ -1133,10 +1162,10 @@ C = 日常、闲聊、氛围、无后果的互动。
                 if (corrected) return false;
                 corrected = true;
                 log('纠正重试', note, winLabel(w));
-                r = await callApi(messages.concat([
+                r = await callApiRetry(messages.concat([
                     { role: 'assistant', content: raw.slice(0, 3000) },
                     { role: 'user', content: `${fix}\n只输出 JSON，JSON 之后另起一行输出 ${END_MARK}。` },
-                ]), undefined, signal);
+                ]), undefined, signal, onFail);
                 if (gone()) return null;
                 keepRaw(r, '纠正重试：' + note);
                 raw = stripEndMark(r.text);
@@ -1169,6 +1198,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             w.status = err.refused ? 'refused' : 'failed';
             w.last_error = err.message;
             w.split = !!err.split;
+            if (!gone()) keepRaw({ error: true }, `失败（第 ${w.attempts} 次）：${err.message}`);
             data.stats.failStreak++;
             data.stats.lastError = err.message;
             warn('窗口', winLabel(w), '摘要失败：', err.message);
@@ -1689,20 +1719,21 @@ C = 日常、闲聊、氛围、无后果的互动。
         gov.timer = setTimeout(() => govern().catch(err => warn('治理失败：', err)), delay);
     }
 
-    // 折叠/压缩调用：纯文本或 JSON 输出，都要求结束哨兵；缺哨兵或撞上限重来一次
+    // 折叠/压缩调用：纯文本或 JSON 输出，都要求结束哨兵；缺哨兵或撞上限重来一次；暂时性失败同样退避重试
     async function callFold(user, maxTokens, note) {
         const data = getData();
         const messages = [{ role: 'system', content: FOLD_SYSTEM_PROMPT }, { role: 'user', content: user }];
         const keep = (r, n) => {
             if (!data) return;
             if (!Array.isArray(data.rawLog)) data.rawLog = [];
-            data.rawLog.unshift({ at: Date.now(), win: note || '治理', model: settings.api.model, finish: r.finish || '', note: n || '', text: String(r.text || '').slice(0, RAW_LOG_CHARS) });
+            data.rawLog.unshift({ at: Date.now(), win: note || '治理', model: settings.api.model, finish: r.finish || '', note: n || '', text: String(r.text || '').slice(0, RAW_LOG_CHARS), ...(r.error ? { error: true } : {}) });
             data.rawLog.length = Math.min(data.rawLog.length, RAW_LOG_MAX);
         };
-        let r = await callApi(messages, maxTokens);
+        const onFail = (err, n) => keep({ error: true }, `失败，${RETRY_DELAYS[n - 1] / 1000}s 后重试（${n}/${RETRY_DELAYS.length}）：${err.message}`);
+        let r = await callApiRetry(messages, maxTokens, undefined, onFail);
         keep(r);
         if (r.finish === 'length' || !hasEndMark(r.text)) {
-            r = await callApi(messages.concat([{ role: 'assistant', content: r.text.slice(0, 2000) }, { role: 'user', content: `上面的输出被截断了。重新输出，字数压到原要求的一半以内；结束后另起一行输出 ${END_MARK}。` }]), maxTokens);
+            r = await callApiRetry(messages.concat([{ role: 'assistant', content: r.text.slice(0, 2000) }, { role: 'user', content: `上面的输出被截断了。重新输出，字数压到原要求的一半以内；结束后另起一行输出 ${END_MARK}。` }]), maxTokens, undefined, onFail);
             keep(r, '压缩重试');
             if (r.finish === 'length' || !hasEndMark(r.text)) throw new Error('输出两次被截断');
         }
@@ -3538,7 +3569,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     // 原始回复区：面板显示与 .txt 导出共用同一份文本；导出走「导出 JSON」同一条下载路
     const rawLogText = data => (data?.rawLog || []).length
-        ? data.rawLog.map(r => `[${new Date(r.at).toLocaleString()}] ${r.win} · ${r.model || ''}${r.finish ? ` · finish=${r.finish}` : ''}${r.note ? ` · ${r.note}` : ''}\n${r.text}`).join('\n\n========\n\n')
+        ? data.rawLog.map(r => `[${new Date(r.at).toLocaleString()}] ${r.win} · ${r.model || ''}${r.finish ? ` · finish=${r.finish}` : ''}${r.note ? ` · ${r.note}` : ''}${r.error ? '' : `\n${r.text}`}`).join('\n\n========\n\n')
         : '（还没有调用记录）';
     function downloadText(name, text, type) {
         const a = document.createElement('a');
@@ -3709,7 +3740,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
         raiseTier, promote, setState, heatOf, matchEnt, entFilter,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
-        rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS,
+        rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
