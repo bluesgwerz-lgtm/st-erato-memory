@@ -25,12 +25,20 @@
     const GRADE_BASE = { S: Infinity, A: 1, B: 0.6, C: 0.3 };
     const GRADE_HALFLIFE = { S: Infinity, A: 200, B: 60, C: 20 };
 
-    // 人物志 / 物件档案的字段（值带来源楼层号）；主角只记一行「关系现状」，不建档
+    // 人物志 / 物件档案的字段（值带来源楼层号）；主角不进人物志，只记「主角现状」（见 PRINCIPAL_FIELDS）
     // arc = 此人此刻处在什么阶段（一句）；views = 对任意他人的看法（另存 p.views，不在此表）
     // sex 来自点名表（身份表，龙套也有），addr = 此人怎么称呼 {{user}}；这两项只写一次不覆盖（性别不随剧情变，称呼升级是关系事件走 views/arc），面板可改
     const PERSON_FIELDS = ['role', 'sex', 'age', 'addr', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows', 'arc'];
     const PERSON_LABEL = { role: '身份', sex: '性别', age: '年龄', addr: '称呼{{user}}', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情', arc: '阶段' };
     const PERSON_ONCE = ['sex', 'addr'];
+    // knows（知情范围）是单向累加的：知道了就不会变回不知道，新值按「；」拆开并进旧值，最多留这么多条（最老的先掉）
+    const KNOWS_MAX = 10;
+    // 主角现状：{{user}}/{{char}} 只记「之后所有场景都会沿用」的长期变化，与人物志同构（setF / hist / 回退 / 手改锁全复用），
+    // 但不进档位/状态/活跃度/墓碑/来源全失任何一条人物志流程；字段按身份白名单，多写的键丢弃：
+    //   user = 玩家在演的人，只记外部事实；char = 主模型要写的人，多一项 knows（已经知道了 user 的什么）；both = 两人关系的形态（双向事实，玩家明言的约定也放这里）
+    // {{char}} 对 {{user}} 的态度仍是 data.relation 一行（内心态，与形态是两条轴），注入时并成一行
+    const PRINCIPAL_FIELDS = { user: ['role', 'home', 'body', 'family'], char: ['role', 'home', 'body', 'family', 'knows'], both: ['bond'] };
+    const PRINCIPAL_LABEL = { role: '职业身份', home: '住处', body: '身体', family: '婚姻家庭', knows: '知情', bond: '两人关系' };
     const SEXES = ['男', '女'];
     const normSex = v => { const s = String(v || '').trim().charAt(0); return SEXES.includes(s) ? s : ''; };
     const ITEM_FIELDS = ['holder', 'note', 'meaning'];   // v0.3.4：原自由文本 status 改名 note（备注），status 让给枚举状态
@@ -175,7 +183,8 @@
             windows: [],      // 窗口 = 一次副 API 调用覆盖的楼层段，是入库/对账的单位
             people: [],       // 人物志（配角）
             items: [],        // 物件
-            relation: { v: '', idx: null, date: '' },   // {{char}} 对 {{user}} 的关系现状
+            relation: { v: '', idx: null, date: '' },   // {{char}} 对 {{user}} 的关系现状（态度）
+            principal: { user: { f: {} }, char: { f: {} }, both: { f: {} } },   // 主角现状：长期变化的现值，字段见 PRINCIPAL_FIELDS
             archives: [],
             canon: { text: '', builtFrom: [], builtAt: 0 },   // 正典压缩段：S 超过 canonMax 条时由副 API 压成一段，之后新增的 S 逐条附在段后
             outline: { lines: [], pending: [], at: 0 },      // 远景层：被预算裁掉的条目按故事日折成一行；level 2 = 若干日行再折成的时期行
@@ -198,6 +207,8 @@
         for (const k of Object.keys(def)) if (d[k] === undefined) d[k] = def[k];
         for (const k of ['entries', 'windows', 'people', 'items']) if (!Array.isArray(d[k])) d[k] = [];
         if (!d.relation || typeof d.relation !== 'object') d.relation = def.relation;
+        if (!d.principal || typeof d.principal !== 'object') d.principal = def.principal;
+        for (const k of Object.keys(PRINCIPAL_FIELDS)) if (!d.principal[k]?.f || typeof d.principal[k].f !== 'object') d.principal[k] = { f: {} };
         for (const k of ['canon', 'outline', 'tombstones', 'vec']) if (!d[k] || typeof d[k] !== 'object') d[k] = def[k];
         if (!Array.isArray(d.outline.lines)) d.outline.lines = [];
         if (!Array.isArray(d.outline.pending)) d.outline.pending = [];
@@ -562,7 +573,7 @@
 ## 已有档案（名字务必与此一致，不要给同一个人起第二个名字）
 {{roster}}
 
-## {{name2}} 对 {{name1}} 的关系现状（上次记录）
+## 主角现状（上次记录：{{name2}} 对 {{name1}} 的态度，以及两人的长期变化）
 {{relation}}
 
 ## 更早的剧情骨架（远景与已定案的正典，只供承接因果与去重，不要复述）
@@ -578,7 +589,7 @@
 {{material}}
 
 ## 输出要求
-先点名，再写事件，最后更新档案。输出一个 JSON 对象，键的顺序必须是 cast、events、relation、people、items、uncovered：
+先点名，再写事件，最后更新档案。输出一个 JSON 对象，键的顺序必须是 cast、events、relation、principal、people、items、uncovered：
 {
   "cast": [
     {"name": "本段出现过的每一个人，包括只被提到的、包括主角、包括主角的亲属；有正式名用正式名，没有就写『谁的什么人』如 {{name1}}的母亲；宁多勿漏", "aliases": ["原文里对此人的称呼/昵称/别称，如 母亲、老陆、张姐"], "tier": "主 | 配 | 龙套", "role": "一句身份", "sex": "男 | 女，原文有依据（他/她、称谓、自述）才写，没有就不写这个键", "seen": [出现或被提到的楼层号]}
@@ -601,6 +612,11 @@
     }
   ],
   "relation": "{{name2}} 此刻对 {{name1}} 的态度与关系，一句话 ≤40 字，写现状不写过程；本段没有变化则留空字符串",
+  "principal": {
+    "{{name1}}": {"role": "职业/身份", "home": "住处", "body": "长期身体变化", "family": "婚姻家庭状况", "floor": 楼层号},
+    "{{name2}}": {"role": "职业/身份", "home": "住处", "body": "长期身体变化", "family": "婚姻家庭状况", "knows": "已经知道了 {{name1}} 的哪些事/秘密，一条一句、『；』分隔", "floor": 楼层号},
+    "between": {"v": "两人关系的形态：陌生/同事/朋友/恋人/同居/订婚/已婚/分手…，以及 {{name1}} 明言的约定或界限（如『说好只做朋友』）", "floor": 楼层号}
+  },
   "people": [
     {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人怎么称呼{{name1}}（王哥/您/直呼其名），原文有才写", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
@@ -621,6 +637,7 @@ JSON 结束后另起一行输出 ${END_MARK} 作为结束标记。
 - cast 是点名表：本段每一个有名字或固定称呼的人都要在，包括只被提到、没到场的。漏一个人比多写十个龙套更糟。
 - tier 按对剧情的影响判，不按是否在场：不在场但影响了事件走向的人（打电话提醒、发消息、被反复提起的亲属）算主或配；在场但只提供服务、没有自己意图的人（店员、司机、随从）算龙套。
 - people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键；不知道的不写『未知』『不详』这类占位词，档案里只放原文有依据的话。没变化的人不必出现在 people 里，但必须出现在 cast 里。
+- principal 是主角现状表，只记『之后所有场景都会沿用』的改变：换了工作或身份、搬了家、身体留下长期变化（怀孕、伤疤、残疾、重病）、结婚离婚订婚分手、知道了某个秘密。当天在哪、穿什么、心情、临时受伤不算。写现值不写过程（『副总监』不是『升职了』）。本段没有这类改变就不写这个键；{{name2}} 不是一个具体人物就不写 {{name2}} 那一项。knows 只写本段新知道的，不用重复上次记录里已有的。
 - 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
 - 档案里已标了性别的人以档案为准；若本段原文明确相反，照原文写 sex，可能是同名的另一个人。
 - views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
@@ -653,6 +670,23 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     const fv = (ent, k) => ent?.f?.[k]?.v || '';
     const personLabel = k => PERSON_LABEL[k].replace('{{user}}', getCtx().name1 || '{{user}}').replace('{{char}}', getCtx().name2 || '{{char}}');
+    const principalName = key => { const ctx = getCtx(); return key === 'user' ? (ctx.name1 || '{{user}}') : (ctx.name2 || '{{char}}'); };
+
+    // 主角现状的行：两人关系（形态 + {{char}} 的态度）一行，user / char 各一行只列有值的键，每值带来源楼号；全空返回 []
+    // 喂回副模型（「上次记录」）与注入块共用，withFloor=false 时不带楼号
+    function principalLines(data, withFloor = true) {
+        const pr = data.principal || {};
+        const tag = v => withFloor && v?.idx != null ? `(#${v.idx})` : '';
+        const lines = [];
+        const bond = pr.both?.f?.bond, rel = data.relation;
+        const pair = [bond?.v ? `${bond.v}${tag(bond)}` : '', rel?.v ? `${principalName('char')} 对 ${principalName('user')}：${rel.v}${tag(rel)}` : ''].filter(Boolean);
+        if (pair.length) lines.push(`- 两人关系：${pair.join('｜')}`);
+        for (const key of ['user', 'char']) {
+            const parts = PRINCIPAL_FIELDS[key].filter(k => fv(pr[key], k)).map(k => `${PRINCIPAL_LABEL[k]} ${fv(pr[key], k)}${tag(pr[key].f[k])}`);
+            if (parts.length) lines.push(`- ${principalName(key)}：${parts.join('·')}`);
+        }
+        return lines;
+    }
 
     function rosterText(data) {
         const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${x.tier ? `[${x.tier}]` : ''}${fv(x, 'sex') ? `·${fv(x, 'sex')}` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
@@ -690,7 +724,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             name1: ctx.name1 || '{{user}}',
             name2: ctx.name2 || '{{char}}',
             roster: input.data ? rosterText(input.data) : '（无）',
-            relation: input.data?.relation?.v || '（尚无记录）',
+            relation: (input.data && principalLines(input.data).join('\n')) || '（尚无记录）',
             context: (input.data && contextText(input.data, floors[0]?.idx ?? Infinity)) || '（无）',
             recent: input.recent?.length ? input.recent.map(fmtRecent).join('\n') : '（无）',
             locked: input.locked?.length ? input.locked.map(fmtRecent).join('\n') : '（无）',
@@ -710,6 +744,8 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     const asArr = v => Array.isArray(v) ? v.map(x => String(x).trim()).filter(Boolean) : [];
     const norm = s => String(s || '').trim().toLowerCase();
+    // 知情范围累加：旧值与新值按「；」拆条去重合并（副模型重写全量也不会重复），超过 KNOWS_MAX 条丢最老的
+    const mergeKnows = (oldV, v) => { const parts = []; for (const s of `${oldV}；${v}`.split(/[；;\n]/)) { const t = s.trim(); if (t && !parts.some(p => norm(p) === norm(t))) parts.push(t); } return parts.slice(-KNOWS_MAX).join('；'); };
     // 事件密度下限：每 minEventsPer 个 AI 楼至少 1 条；0 = 不核验
     const minEventsFor = n => { const per = Number(settings.minEventsPer) || 0; return per > 0 ? Math.max(1, Math.ceil(n / per)) : 1; };
 
@@ -751,11 +787,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         const dateOf = i => byIdx.get(i)?.send_date || '';
         const HIST_MAX = 3;
         // 覆盖前把旧值压进 hist（最近 3 版），来源楼被删时能退回上一版；手改过的字段（manual）副模型不覆盖；只写一次的字段（PERSON_ONCE）有值后不换；
-        // 「（未知）」「不详」这类占位词按空处理：不入档、不注入、不占只写一次的名额
+        // 「（未知）」「不详」这类占位词按空处理：不入档、不注入、不占只写一次的名额；knows 累加不覆盖（见 mergeKnows）
         const setF = (ent, key, val, idx) => {
-            const v = String(val || '').trim();
+            let v = String(val || '').trim();
             if (!v || PLACEHOLDER_RX.test(v) || ent.f[key]?.manual) return;
             const old = ent.f[key];
+            if (key === 'knows' && old?.v) v = mergeKnows(old.v, v);
             if (old?.v === v) { old.idx = idx; old.date = dateOf(idx); return; }
             if (old?.v && PERSON_ONCE.includes(key)) return;
             const hist = old?.v ? [{ v: old.v, idx: old.idx, date: old.date }, ...(old.hist || [])].slice(0, HIST_MAX) : (old?.hist || []);
@@ -803,6 +840,16 @@ C = 日常、闲聊、氛围、无后果的互动。
             data.relation = { v, idx, date: dateOf(idx), hist };
         };
         if (rel) setRelation(rel, lastIdx);
+        // 主角现状：按身份白名单取键，多写的丢；对象键认 {{name1}}/{{name2}} 原名或 user/char；between 可以是字符串或 {v, floor}
+        const pr = obj.principal && typeof obj.principal === 'object' ? obj.principal : null;
+        if (pr) {
+            const pick = names => { for (const k of Object.keys(pr)) if (names.includes(norm(k))) return pr[k]; return null; };
+            const put = (holder, src, keys) => { if (!src || typeof src !== 'object') return; const idx = floorOf(src.floor); for (const k of keys) setF(holder, k, src[k], idx); };
+            put(data.principal.user, pick([me, 'user', 'name1', '{{user}}', '{{name1}}']), PRINCIPAL_FIELDS.user);
+            put(data.principal.char, pick([them, 'char', 'name2', '{{char}}', '{{name2}}']), PRINCIPAL_FIELDS.char);
+            const b = pr.between;
+            if (b) setF(data.principal.both, 'bond', typeof b === 'object' ? (b.v ?? b.text ?? b.state) : b, floorOf(typeof b === 'object' ? b.floor : undefined));
+        }
         const seenThisWin = new Set();
         for (const c of (Array.isArray(obj.cast) ? obj.cast : [])) {
             const name = String(c?.name || '').trim();
@@ -926,6 +973,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const firstDead = !!(x.first_date && isDead(x.first_date));
             if (firstDead && !alive && !x.lost) { x.lost = true; n++; }
         }
+        for (const key of Object.keys(PRINCIPAL_FIELDS)) for (const k of Object.keys(data.principal?.[key]?.f || {})) revert(data.principal[key].f, k);
         if (data.relation?.v && !data.relation.manual) {
             const r = data.relation;
             if (dead(r)) {
@@ -1532,15 +1580,15 @@ C = 日常、闲聊、氛围、无后果的互动。
     const isProp = it => it.tier === '摆设';
     const isSettled = it => ITEM_SETTLED.includes(it.state);
 
-    // 关系现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；龙套不进注入块
+    // 主角现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；龙套不进注入块
     // 物件：摆设不进；已使用/遗失/损毁/封存的降成一行「已了结」（信烧了是要记住的事实，但不值一张卡）
-    // 总字数受 entityChars 约束，放不下的完整卡按最久未露面降为一行
+    // 总字数受 entityChars 约束，主角现状先占，放不下的完整卡按最久未露面降为一行
     function entityLines(data, chat) {
-        const ctx = getCtx();
         const lines = [];
-        if (data.relation?.v) lines.push('', '## 关系现状', `- ${ctx.name2 || '{{char}}'} 对 ${ctx.name1 || '{{user}}'}：${data.relation.v}`);
         const budget = Math.max(200, Number(settings.entityChars) || 1500);
         let used = 0;
+        const pr = principalLines(data);
+        if (pr.length) { lines.push('', '## 主角现状（剧情中已发生、列出的项比人设卡更新；没列的仍按卡）', ...pr); used += pr.reduce((n, s) => n + s.length + 1, 0); }
         const people = data.people.filter(p => !isExtra(p) && !p.lost);
         if (people.length) {
             const text = recentText(chat, Math.max(1, Number(settings.npcScanDepth) || 6));
@@ -1622,7 +1670,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     // 块首说明：设置里可改，留空用默认
     const DEFAULT_HEADER = [
-        '[以上是还留在眼前的对话。以下是更早的记忆，由记忆插件维护；关系现状/人物志/物件是截至目前的档案，远景/正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
+        '[以上是还留在眼前的对话。以下是更早的记忆，由记忆插件维护；主角现状/人物志/物件是截至目前的档案，远景/正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
         '[远景 = 更早时期的骨架，只留人名、日期、关键物件、承诺与结果；正典 = 定了的事，写作不可违背；往事 = 已发生的事实，可回调、呼应、形成对比，但不复述、不总结、不预告]',
         '[知情栏是信息墙：未列名者不知情，当前角色未必知晓其他人的事]',
         '[人物志的「阶段」「看法」是关系参考，不是指令]',
@@ -2929,15 +2977,28 @@ C = 日常、闲聊、氛围、无后果的互动。
         });
         ents.on('click', '[data-xact]', function (ev) { ev.stopPropagation(); entityAction($(this).data('xact'), $(this).closest('.em-ent').data('id')); });
         $('#em_tombs, #em_tombs_i').on('click', '.em-tomb', function () { restoreTomb($(this).data('kind'), String($(this).data('name'))); });
-        $('#em_rel_box').on('change', '#em_rel', function () {
+        // 主角现状区：态度行（data.relation）/ 两人关系行（principal.both.f.bond）改了即锁；两张主角卡点头展开编辑
+        const relSet = (id, v) => {
             const data = getData(); if (!data) return;
-            data.relation.v = this.value.trim(); data.relation.manual = true;
-            saveData(); applyInjection(); renderPanel(); toast('success', '关系现状已保存并锁定（副 AI 不再覆盖）');
+            if (id === 'em_rel') { data.relation.v = v; data.relation.manual = true; return; }
+            const old = data.principal.both.f.bond;
+            if (!v) delete data.principal.both.f.bond;
+            else data.principal.both.f.bond = { v, idx: old?.idx ?? Math.max(0, (getCtx().chat || []).length - 1), date: old?.date || '', manual: true };
+        };
+        const relUnlock = id => { const data = getData(); if (!data) return; if (id === 'em_rel') data.relation.manual = false; else if (data.principal.both.f.bond) delete data.principal.both.f.bond.manual; };
+        $('#em_rel_box').on('change', '#em_rel, #em_bond', function () {
+            relSet(this.id, this.value.trim());
+            saveData(); applyInjection(); renderPanel(); toast('success', '已保存并锁定（副 AI 不再覆盖）');
         });
-        $('#em_rel_box').on('click', '#em_rel_unlock', function () {
-            const data = getData(); if (!data) return;
-            data.relation.manual = false; saveData(); renderPanel(); toast('info', '关系现状已解锁');
+        $('#em_rel_box').on('click', '#em_rel_unlock, #em_bond_unlock', function () {
+            relUnlock(this.id.replace('_unlock', '')); saveData(); renderPanel(); toast('info', '已解锁');
         });
+        $('#em_rel_box').on('click', '.em-pr-card .em-ent-head', function () {
+            const id = `pr_${$(this).closest('.em-pr-card').data('key')}`;
+            expanded.has(id) ? expanded.delete(id) : expanded.add(id);
+            renderPanel();
+        });
+        $('#em_rel_box').on('click', '[data-pact]', function (ev) { ev.stopPropagation(); principalAction($(this).data('pact'), $(this).closest('.em-pr-card').data('key')); });
         $('#em_outline').on('click', '.em-oline-head', function () {
             const id = $(this).closest('.em-oline').data('id');
             expanded.has(id) ? expanded.delete(id) : expanded.add(id);
@@ -3124,7 +3185,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const label = k => kind === 'p' ? personLabel(k) : ITEM_LABEL[k];
         const tiers = kind === 'p' ? TIERS : ITEM_TIERS;
         const states = kind === 'p' ? PERSON_STATES : ITEM_STATES;
-        const mark = v => `${v?.manual ? ' <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span>' : ''}${v?.stale ? ' <span class="em-stale" title="来源楼层已不存在，待核">?</span>' : ''}`;
+        const mark = valMark;
         const rows = fields.map(k => {
             const f = x.f?.[k];
             if (open && k === 'sex') return `<label>${esc(label(k))}${f?.manual ? ' 🔒' : ''}<select class="em-x-f" data-k="sex"><option value="">（未定）</option>${SEXES.map(s => `<option value="${s}" ${f?.v === s ? 'selected' : ''}>${s}</option>`).join('')}</select></label>`;
@@ -3181,13 +3242,66 @@ C = 日常、闲聊、氛围、无后果的互动。
             : sort === 'seen' ? (a, b) => (b.seen || 0) - (a.seen || 0)
                 : (a, b) => (b.last_idx || 0) - (a.last_idx || 0);
 
+    // 值旁边的锁 / 待核标记（人物志卡与主角卡共用）
+    const valMark = v => `${v?.manual ? ' <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span>' : ''}${v?.stale ? ' <span class="em-stale" title="来源楼层已不存在，待核">?</span>' : ''}`;
+
+    // 主角现状区：两人关系（形态 + 态度）两行输入，下面 user / char 两张钉住的卡（只有白名单字段，没有档位/状态/删除）
+    function principalHtml(data) {
+        const pr = data.principal, rel = data.relation || {}, bond = pr.both.f.bond || {};
+        const line = (id, label, v, ph) => `<label>${label}${v.idx != null ? ` <span class="em-floor em-jump" data-idx="${v.idx}">#${v.idx}</span>` : ''}${v.manual ? ` <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span> <span id="${id}_unlock" class="em-floor em-link">解锁</span>` : ''}
+            <input id="${id}" class="text_pole" value="${esc(v.v || '')}" placeholder="${ph}"></label>`;
+        const card = key => {
+            const x = pr[key], id = `pr_${key}`, open = expanded.has(id);
+            const keys = PRINCIPAL_FIELDS[key];
+            const rows = keys.map(k => {
+                const f = x.f[k];
+                if (open) return `<label>${PRINCIPAL_LABEL[k]}${f?.manual ? ' 🔒' : ''}<input class="text_pole em-pr-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
+                if (!f?.v) return '';
+                return `<div class="em-ent-row"><span class="em-ent-k">${PRINCIPAL_LABEL[k]}</span><span class="em-ent-v">${esc(f.v)}${valMark(f)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
+            }).join('');
+            const hasLock = keys.some(k => x.f[k]?.manual);
+            const last = Math.max(-1, ...keys.map(k => x.f[k]?.idx ?? -1));
+            return `
+        <div class="em-ent em-pr-card" data-key="${key}">
+            <div class="em-ent-head"><span class="em-ent-name">👤 ${esc(principalName(key))}<span class="em-tier em-tier-a">主角</span></span><span class="em-floor">${last >= 0 ? `最近变化 #${last}` : '无长期变化记录'}</span></div>
+            ${open ? `<div class="em-ent-body">${rows}<div class="em-actions"><div class="menu_button" data-pact="save">保存</div>${hasLock ? '<div class="menu_button" data-pact="unlockf">解除字段锁定</div>' : ''}<div class="menu_button" data-pact="cancel">取消</div></div></div>`
+                : (rows ? `<div class="em-ent-rows">${rows}</div>` : '')}
+        </div>`;
+        };
+        return `
+        <div class="em-rel">
+            ${line('em_bond', '两人关系（形态：同事 / 恋人 / 同居 / 已婚…，含明言的约定）', bond, '（尚无记录，总结后由副 AI 填写，也可手改）')}
+            ${line('em_rel', `${esc(principalName('char'))} 对 ${esc(principalName('user'))} 的态度`, rel, '（尚无记录，总结后由副 AI 填写，也可手改）')}
+        </div>
+        <div class="em-ents em-pr">${card('user')}${card('char')}</div>`;
+    }
+
+    function principalAction(act, key) {
+        const data = getData(); if (!data) return;
+        const x = data.principal[key]; if (!x) return;
+        const id = `pr_${key}`;
+        if (act === 'save') {
+            $(`#em_rel_box .em-pr-card[data-key="${key}"] .em-pr-f`).each(function () {
+                const k = $(this).data('k');
+                const v = this.value.trim();
+                if (!v) { delete x.f[k]; return; }
+                if (x.f[k]?.v !== v) x.f[k] = { v, idx: x.f[k]?.idx ?? Math.max(0, (getCtx().chat || []).length - 1), date: x.f[k]?.date || '', manual: true };
+            });
+            saveData(); applyInjection(); expanded.delete(id); renderPanel();
+            toast('success', '已保存（改过的字段已锁定，副 AI 不再覆盖）');
+        } else if (act === 'unlockf') {
+            for (const k of Object.keys(x.f)) delete x.f[k].manual;
+            saveData(); renderPanel();
+            toast('info', '已解除字段锁定');
+        } else if (act === 'cancel') {
+            expanded.delete(id); renderPanel();
+        }
+    }
+
     function renderEntities(data) {
         const ctx = getCtx();
         const chat = ctx.chat || [];
-        const rel = data.relation || {};
-        $('#em_rel_box').html(`
-        <div class="em-rel"><label>${esc(ctx.name2 || '{{char}}')} 对 ${esc(ctx.name1 || '{{user}}')} 的关系现状${rel.idx != null ? ` <span class="em-floor em-jump" data-idx="${rel.idx}">#${rel.idx}</span>` : ''}${rel.manual ? ' <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span> <span id="em_rel_unlock" class="em-floor em-jump">解锁</span>' : ''}
-            <input id="em_rel" class="text_pole" value="${esc(rel.v || '')}" placeholder="（尚无记录，总结后由副 AI 填写，也可手改）"></label></div>`);
+        $('#em_rel_box').html(principalHtml(data));
         const tombHtml = kind => {
             const names = [...new Set(Object.values(data.tombstones?.[kind] || {}).map(t => t.name))];
             return names.length ? `已删除（不再自动建档，点名字恢复）：${names.map(n => `<span class="em-tomb" data-kind="${kind}" data-name="${esc(n)}">${esc(n)} ×</span>`).join(' ')}` : '';
@@ -3650,7 +3764,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     ? (await confirmBox(`当前已有 ${data.entries.length} 条记忆、${data.people.length} 个人物。确定=替换，取消=合并（按 id / 名字去重）`) ? 'replace' : 'merge')
                     : 'replace';
                 if (mode === 'replace') {
-                    for (const k of ['entries', 'windows', 'people', 'items', 'relation', 'skip', 'archives', 'hidden', 'outline', 'canon', 'recaps', 'tombstones']) data[k] = src[k];
+                    for (const k of ['entries', 'windows', 'people', 'items', 'relation', 'principal', 'skip', 'archives', 'hidden', 'outline', 'canon', 'recaps', 'tombstones']) data[k] = src[k];
                     data.vec = { entries: {}, raw: {}, source: '', model: '', at: 0 };   // 向量库是本地索引，导入后按需「补向量」
                 } else {
                     const eIds = new Set(data.entries.map(e => e.id)), wIds = new Set(data.windows.map(w => w.id));
@@ -3659,6 +3773,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     for (const p of src.people) if (!findPerson(data, p.name)) data.people.push(p);
                     for (const it of src.items) if (!findItem(data, it.name)) data.items.push(it);
                     if (!data.relation?.v && src.relation?.v) data.relation = src.relation;
+                    for (const key of Object.keys(PRINCIPAL_FIELDS)) for (const k of PRINCIPAL_FIELDS[key]) if (!fv(data.principal[key], k) && src.principal?.[key]?.f?.[k]?.v) data.principal[key].f[k] = src.principal[key].f[k];
                     Object.assign(data.skip, src.skip || {});
                     const oIds = new Set(data.outline.lines.map(l => l.id));
                     for (const l of (src.outline?.lines || [])) if (!oIds.has(l.id)) data.outline.lines.push(l);
@@ -3738,7 +3853,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
-        raiseTier, promote, setState, heatOf, matchEnt, entFilter,
+        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,

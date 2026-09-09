@@ -124,6 +124,12 @@ global.fetch = async (url, opt) => {
             ],
             events: evFloors.map(ev),
             relation: `对用户从戒备转为依赖（#${floors[floors.length - 1]}）`,
+            // 主角现状：user 的 home 是占位词不入档、mood 不在白名单丢弃；Char 的 knows 分两次报应累加；between 后期变成同居
+            principal: {
+                '用户': { role: floors[0] <= 5 ? '实习生' : '副总监', home: '（未知）', mood: '开心', floor: floors[0] },
+                'Char': { family: '未婚', knows: floors[0] <= 5 ? '知道用户已婚' : '知道用户已婚；知道用户有个弟弟', floor: floors[0] },
+                between: { v: floors[0] >= 15 ? '同居' : '暧昧', floor: floors[floors.length - 1] },
+            },
             people: [
                 { name: '陆衍', aliases: ['小衍'], role: '邻居', addr: floors[0] <= 5 ? '您' : '昭昭', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
                 { name: '周远', role: '医生', look: '（未知）', stance: '不详', state: floors[0] >= 15 ? '离场' : '', floor: floors[0] },   // 占位词不该入档
@@ -237,6 +243,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(!/\{\{(name1|name2|roster|relation|context|recent|locked|floor_range|floor_count|material|min_events|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
         assert.ok(msgs[1].content.includes('"cast"') && msgs[1].content.includes('亲属') && msgs[1].content.includes('"uncovered"') && msgs[1].content.includes(END), '模板应含点名表、亲属明文、覆盖申报与哨兵');
         assert.ok(msgs[1].content.includes('"sex"') && msgs[1].content.includes('"addr"') && msgs[1].content.includes('不从外貌推'), '模板应含性别、称呼与年龄填写规则');
+        assert.ok(msgs[1].content.includes('"principal"') && msgs[1].content.includes('"between"') && msgs[1].content.includes('之后所有场景都会沿用'), '模板应含主角现状键与规则');
         assert.ok(msgs[1].content.includes('【#2】') && msgs[1].content.includes('【#5】') && msgs[1].content.includes('#2–#5') && msgs[1].content.includes('用户角色：用户'));
     });
     t('自定义模板缺 {{material}} 时退回默认', () => {
@@ -314,6 +321,12 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(data.items.find(i => i.name === '咖啡杯').tier, '摆设');
         assert.ok(data.relation.v.includes('#19'), '关系现状来自最后一窗');
         assert.strictEqual(data.relation.idx, 19);
+        const pr = data.principal;
+        assert.strictEqual(pr.user.f.role.v, '副总监', '主角现状：最新覆盖'); assert.strictEqual(pr.user.f.role.hist[0].v, '实习生', '旧值进 hist');
+        assert.ok(!pr.user.f.home && !pr.user.f.mood, '占位词不入档、白名单外的键丢弃：' + JSON.stringify(pr.user.f));
+        assert.strictEqual(pr.char.f.knows.v, '知道用户已婚；知道用户有个弟弟', 'knows 累加去重'); assert.strictEqual(pr.char.f.family.v, '未婚');
+        assert.strictEqual(pr.both.f.bond.v, '同居'); assert.strictEqual(pr.both.f.bond.idx, 19);
+        assert.ok(apiLog.some(c => c.user.includes('## 主角现状（上次记录') && c.user.includes('两人关系：暧昧(#') && c.user.includes('用户：职业身份 实习生(#')), '主角现状喂回副模型（上次记录）');
         assert.ok(data.rawLog.length === D.RAW_LOG_MAX && data.rawLog[0].finish === 'stop', `原始回复留档 ${D.RAW_LOG_MAX} 条`);
     });
     t('计数：已总结 18 楼（10 个 AI 楼）/ 10 条，待总结 0', () => {
@@ -425,12 +438,14 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     });
     t('删楼回滚：来源楼没了的值退回上一版，退无可退清掉；手改的保留标待核；关系现状与状态同样回退；首见楼与全部值都没了标来源全失，再被提到即恢复', () => {
         const lu = data.people.find(p => p.name === '陆衍');
-        const savedRel = { ...data.relation };
+        const savedRel = { ...data.relation }, savedBond = { ...data.principal.both.f.bond };
         lu.f.age = { v: '31', idx: 99, date: 'gone', hist: [{ v: '30', idx: 2, date: 'd2' }] };
         lu.f.look = { v: '高', idx: 99, date: 'gone', manual: true };
         lu.f.knows = { v: '秘密', idx: 99, date: 'gone' };
         lu.views['小刘'] = { v: '讨厌', idx: 99, date: 'gone', hist: [{ v: '一般', trend: '陌生', idx: 2, date: 'd2' }] };
         data.relation = { v: '新关系', idx: 99, date: 'gone', hist: [{ v: '旧关系', idx: 2, date: 'd2' }] };
+        data.principal.user.f.home = { v: '新家', idx: 99, date: 'gone', hist: [{ v: '旧家', idx: 2, date: 'd2' }] };
+        data.principal.both.f.bond = { v: '已婚', idx: 99, date: 'gone', hist: [] };
         lu.state = '离场'; lu.stateDate = 'gone'; lu.stateHist = [{ s: '在场', idx: 2, date: 'd2' }];
         const ghost = { id: 'p_ghost', name: '幽灵', aliases: [], f: { role: { v: 'x', idx: 99, date: 'gone' } }, views: {}, tier: '配', state: '', seen: 1, first_idx: 99, first_date: 'gone', last_idx: 99 };
         data.people.push(ghost);
@@ -440,6 +455,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(!lu.f.knows, '退无可退就清掉');
         assert.strictEqual(lu.views['小刘'].v, '一般');
         assert.strictEqual(data.relation.v, '旧关系');
+        assert.strictEqual(data.principal.user.f.home.v, '旧家', '主角现状同样回退'); assert.ok(!data.principal.both.f.bond, '两人关系退无可退清掉');
         assert.strictEqual(lu.state, '在场');
         assert.ok(!lu.f.role.stale, '活着的值不动');
         assert.strictEqual(ghost.lost, true, '来源全失');
@@ -447,7 +463,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         D.mergeEntities(data, { cast: [{ name: '幽灵', tier: '配', seen: [2] }] }, { floors: [2] }, new Map([[2, chat[2]]]), []);
         assert.ok(!ghost.lost, '再被提到即恢复');
         data.people = data.people.filter(p => p !== ghost);
-        delete lu.f.age; delete lu.f.look; delete lu.views['小刘']; data.relation = savedRel; lu.stateHist = [];
+        delete lu.f.age; delete lu.f.look; delete lu.views['小刘']; data.relation = savedRel; lu.stateHist = []; delete data.principal.user.f.home; data.principal.both.f.bond = savedBond;
     });
     t('故事日归一化：全角数字转半角、汉字数字转阿拉伯、号→日，年份保留；无日期按 40 楼一段', () => {
         assert.strictEqual(D.normDate('２０２５年三月十二日'), '2025年3月12日');
@@ -497,6 +513,11 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         lu.f.role = { v: '手改身份', idx: 2, date: 'd2', manual: true };
         lu.views['用户'] = { v: '手改看法', trend: '亲密', idx: 2, date: 'd2', manual: true };
         data.relation = { v: '手改关系', idx: 2, date: 'd2', manual: true };
+        data.principal.user.f.role.manual = true;
+        D.mergeEntities(data, { principal: { '用户': { role: '副模型改的', floor: 2 }, 'Char': { knows: '知道用户有个弟弟；新秘密', floor: 2 } } }, { floors: [2] }, new Map([[2, chat[2]]]), []);
+        assert.strictEqual(data.principal.user.f.role.v, '副总监', '主角现状手改锁：副模型不覆盖');
+        assert.strictEqual(data.principal.char.f.knows.v, '知道用户已婚；知道用户有个弟弟；新秘密', 'knows 重报已有条不重复，新条追加');
+        delete data.principal.user.f.role.manual;
         D.mergeEntities(data, { relation: '副模型关系', people: [{ name: '陆衍', role: '副模型身份', age: '28', views: [{ to: '用户', v: '副模型看法' }, { to: '周远', v: '新看法' }], floor: 2 }] }, { floors: [2] }, new Map([[2, chat[2]]]), []);
         assert.strictEqual(lu.f.role.v, '手改身份'); assert.strictEqual(lu.f.age.v, '28', '未锁字段照常更新');
         assert.strictEqual(lu.views['用户'].v, '手改看法'); assert.strictEqual(lu.views['周远'].v, '新看法');
@@ -504,6 +525,15 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         delete lu.f.role.manual; delete lu.views['用户'].manual; data.relation.manual = false; delete lu.f.age;
         D.mergeEntities(data, { relation: '副模型关系', people: [{ name: '陆衍', role: '邻居', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }], floor: 19 }] }, { floors: [19] }, new Map([[19, chat[19]]]), []);
         assert.strictEqual(lu.f.role.v, '邻居'); assert.strictEqual(data.relation.v, '副模型关系');
+    });
+    t('主角现状面板：两人关系/态度两行输入 + user/char 两张钉卡，只列有值的白名单键，手改字段带锁', () => {
+        const html = D.principalHtml(data);
+        assert.ok(html.includes('id="em_bond"') && html.includes('id="em_rel"') && html.includes('value="副模型关系"'), '两行输入');
+        assert.strictEqual((html.match(/em-pr-card/g) || []).length, 2); assert.ok(html.includes('👤 用户') && html.includes('👤 Char'));
+        assert.ok(html.includes('职业身份</span><span class="em-ent-v">副总监') && !html.includes('住处</span>'), '只列有值的键');
+        data.principal.user.f.role.manual = true;
+        assert.ok(/副总监 <span class="em-lock"/.test(D.principalHtml(data)), '手改字段带锁');
+        delete data.principal.user.f.role.manual;
     });
 
     console.log('== 隐藏 / 恢复 ==');
@@ -523,8 +553,10 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         D.applyInjection?.();
         const b = D.buildBlock();
         assert.ok(b.text.includes('题13') && b.text.includes('题2'), '隐藏楼层条目应注入');
-        assert.ok(b.text.includes('## 正典') && b.text.includes('## 关系现状') && b.text.includes('## 人物志') && b.text.includes('## 物件'));
-        assert.ok(b.text.indexOf('## 人物志') < b.text.indexOf('## 正典'));
+        assert.ok(b.text.includes('## 正典') && b.text.includes('## 主角现状') && b.text.includes('## 人物志') && b.text.includes('## 物件'));
+        assert.ok(b.text.indexOf('## 主角现状') < b.text.indexOf('## 人物志') && b.text.indexOf('## 人物志') < b.text.indexOf('## 正典'));
+        assert.ok(/- 两人关系：(暧昧|同居)\(#\d+\)｜Char 对 用户：[^\n]+\(#\d+\)\n/.test(b.text), '两人关系一行 = 形态 + 态度：' + b.text);
+        assert.ok(/- 用户：职业身份 副总监\(#\d+\)\n/.test(b.text) && /- Char：婚姻家庭 未婚\(#\d+\)·知情 知道用户已婚；知道用户有个弟弟/.test(b.text), '主角各一行只列有值的键：' + b.text);
         assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙') && b.text.includes('远景 ='), '块首五行');
         assert.ok(/- 陆衍（小衍）｜身份：邻居｜性别：男｜称呼用户：您/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后');
         assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
