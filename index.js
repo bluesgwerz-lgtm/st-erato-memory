@@ -570,7 +570,7 @@
 用户角色：{{name1}}；对手角色：{{name2}}。其余出场者按原文名字记录。
 {{name1}} 与 {{name2}} 的亲属、朋友、同事、上司一律作为独立人物建档，即使只在对话、微信、电话或回忆里被提到、从未到场；不要把他们当成主角人设的一部分。
 
-## 已有档案（名字务必与此一致，不要给同一个人起第二个名字）
+## 已有档案（name 只写名字本身、与此处一致；称呼和别称放 aliases，不要给同一个人起第二个名字）
 {{roster}}
 
 ## 主角现状（上次记录：{{name2}} 对 {{name1}} 的态度，以及两人的长期变化）
@@ -688,10 +688,14 @@ C = 日常、闲聊、氛围、无后果的互动。
         return lines;
     }
 
+    // 人物一行一个、名字单独在行首（别称挪到行尾）：名字与别称粘在一起时副模型会把整段抄成 name（见 splitName）
     function rosterText(data) {
-        const p = data.people.map(x => `${x.name}${x.aliases?.length ? `（${x.aliases.join('/')}）` : ''}${x.tier ? `[${x.tier}]` : ''}${fv(x, 'sex') ? `·${fv(x, 'sex')}` : ''}${fv(x, 'role') ? `：${fv(x, 'role')}` : ''}`);
+        const p = data.people.map(x => {
+            const tag = [x.tier, fv(x, 'sex')].filter(Boolean).join('·');
+            return `- ${x.name}${tag ? ` [${tag}]` : ''}${fv(x, 'role') ? ` ${fv(x, 'role')}` : ''}${x.aliases?.length ? `；别称：${x.aliases.join('/')}` : ''}`;
+        });
         const i = data.items.map(x => `${x.name}${x.tier ? `[${x.tier}]` : ''}${x.state ? `(${x.state})` : ''}`);
-        return [p.length ? `人物：${p.join('、')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
+        return [p.length ? `人物：\n${p.join('\n')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
     }
 
     function floorMaterial(f) {
@@ -776,6 +780,12 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
 
     const findPerson = (data, name) => { const n = norm(name); return n ? data.people.find(p => norm(p.name) === n || (p.aliases || []).some(a => norm(a) === n)) || null : null; };
+    // 副模型把「杨晚星（星星/晚星妹妹）」整段抄成 name（Gemini 真机复现，aliases 留空）时，尾部括注剥成别称，否则同一人分成两档且永不合并
+    const splitName = name => {
+        const s = String(name || '').trim();
+        const m = /^(.+?)\s*[（(]([^（）()]+)[）)]$/.exec(s);
+        return m ? { name: m[1].trim(), aliases: m[2].split(/[\/／、,，;；|｜]/).map(x => x.trim()).filter(Boolean) } : { name: s, aliases: [] };
+    };
     const findItem = (data, name) => { const n = norm(name); return n ? data.items.find(x => norm(x.name) === n) || null : null; };
 
     // 人物志/物件/关系现状合并：同实体同字段，新的非空值覆盖旧值并更新来源楼层号；主角不建档，{{char}} 只更新关系行
@@ -813,7 +823,9 @@ C = 日常、闲聊、氛围、无后果的互动。
         const touch = (ent, idx) => { ent.last_idx = Math.max(ent.last_idx || 0, idx); if (ent.first_idx == null || idx < ent.first_idx) { ent.first_idx = idx; ent.first_date = dateOf(idx); } ent.updated_at = Date.now(); if (ent.lost) delete ent.lost; };
         const addAliases = (ent, list) => { for (const a of list) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a)) && !isLead(norm(a))) ent.aliases.push(a); };
         // 找到或新建；若按别称命中且模型明确把档案里的旧名列为别称，则升级为真名（「陆母」→「王秀英」）；墓碑里的名字不建档
-        const upsertPerson = (name, aliases, idx) => {
+        const upsertPerson = (rawName, rawAliases, idx) => {
+            const sp = splitName(rawName);
+            const name = sp.name, aliases = [...rawAliases, ...sp.aliases];
             const n = norm(name);
             if (!n || isLead(n)) return null;
             if (isTomb(data, 'p', name) || aliases.some(a => isTomb(data, 'p', a))) return null;
@@ -868,7 +880,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         for (const p of (Array.isArray(obj.people) ? obj.people : [])) {
             const name = String(p?.name || '').trim();
             if (!name) continue;
-            const n = norm(name);
+            const n = norm(splitName(name).name);
             if (n === them) {
                 const r = String(p.rel_user || '').trim();
                 if (!rel && r) setRelation(r, floorOf(p.floor));
@@ -1006,14 +1018,16 @@ C = 日常、闲聊、氛围、无后果的互动。
         for (const e of data.entries) {
             if (e.status !== 'ok') continue;
             const idx = e.src?.idx ?? 0;
-            for (const name of (e.characters || [])) {
+            for (const raw of (e.characters || [])) {
+                const sp = splitName(raw), name = sp.name;
                 const n = norm(name);
                 if (!n || n === me || n === them || isTomb(data, 'p', name)) continue;
-                let ent = findPerson(data, name);
+                let ent = findPerson(data, name) || sp.aliases.map(a => findPerson(data, a)).find(Boolean);
                 if (!ent) {
                     ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                     data.people.push(ent);
                 }
+                for (const a of sp.aliases) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a))) ent.aliases.push(a);
                 ent.seen = (ent.seen || 0) + 1;
                 if (idx < ent.first_idx) ent.first_idx = idx;
                 ent.last_idx = Math.max(ent.last_idx || 0, idx);
@@ -3852,7 +3866,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 控制台排障入口（手机上可配合 Eruda）：eratoMemory_debug.buildBlock() 等
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
-        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
+        getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, splitName, rosterText, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
         raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,

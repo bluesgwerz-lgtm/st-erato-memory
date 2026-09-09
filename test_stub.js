@@ -101,7 +101,7 @@ global.fetch = async (url, opt) => {
     if (mode.failQueue.length) { const f = mode.failQueue.shift(); return { ok: false, status: f.status, text: async () => JSON.stringify({ error: { message: f.msg } }) }; }
     if (mode.clearDuring) { mode.clearDuring = false; ctx.chatMetadata.eratoMemory = { version: 2 }; }
     let content, finish = 'stop';
-    const ev = i => ({ floors: [i], story_time: `3月${i}日 · 午后 · 厨房`, type: 'plot', title: `题${i}`, summary: `第${i}楼发生的事情，陆衍在厨房里做了决定，提到了${i}号钥匙。`, characters: ['陆衍', i === 2 ? '小刘' : '用户'], grade: i === 2 ? 'S' : 'B', tags: ['厨房'] });
+    const ev = i => ({ floors: [i], story_time: `3月${i}日 · 午后 · 厨房`, type: 'plot', title: `题${i}`, summary: `第${i}楼发生的事情，陆衍在厨房里做了决定，提到了${i}号钥匙。`, characters: [i === 19 ? '陆衍（小衍）' : '陆衍', i === 2 ? '小刘' : '用户'], grade: i === 2 ? 'S' : 'B', tags: ['厨房'] });
     if (floors.length > 2 && !mode.allowBig) content = '抱歉，我无法协助处理这段内容。';
     else if (mode.finishLength > 0) { mode.finishLength--; finish = 'length'; content = '{"cast": [{"name": "陆衍"'; }
     else {
@@ -115,7 +115,8 @@ global.fetch = async (url, opt) => {
         content = JSON.stringify({
             cast: [
                 // 后面的窗口故意把陆衍报成龙套：档位只升不降，应仍是配
-                { name: '陆衍', aliases: ['小衍'], tier: floors[0] >= 15 ? '龙套' : '配', role: '邻居', sex: '男', seen: floors },
+                // 最后一窗把档案行「名字（别称）」整段抄成 name、aliases 留空（Gemini 真机复现）：应并回同一人，括注拆成别称
+                { name: floors[0] === 19 ? '陆衍（小衍/隔壁小哥）' : '陆衍', aliases: floors[0] === 19 ? [] : ['小衍'], tier: floors[0] >= 15 ? '龙套' : '配', role: '邻居', sex: '男', seen: floors },
                 { name: '周远', tier: '配', role: '医生', sex: '不详', seen: [floors[0]] },   // 枚举外的性别忽略
                 ...(floors[0] <= 2 ? [{ name: '司机老王', tier: '龙套', role: '司机', seen: [floors[0]] }] : []),   // 只露一段，不该自动升配
                 { name: 'Char', tier: '主' }, { name: '用户', tier: '主' },
@@ -131,7 +132,7 @@ global.fetch = async (url, opt) => {
                 between: { v: floors[0] >= 15 ? '同居' : '暧昧', floor: floors[floors.length - 1] },
             },
             people: [
-                { name: '陆衍', aliases: ['小衍'], role: '邻居', addr: floors[0] <= 5 ? '您' : '昭昭', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
+                { name: floors[0] === 19 ? '陆衍（小衍/隔壁小哥）' : '陆衍', aliases: floors[0] === 19 ? [] : ['小衍'], role: '邻居', addr: floors[0] <= 5 ? '您' : '昭昭', rel_user: '暧昧', state: '在场', status: '在厨房忙', arc: '试探期', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }, { to: '陆衍', v: '自恋不算' }], floor: floors[0] },
                 { name: '周远', role: '医生', look: '（未知）', stance: '不详', state: floors[0] >= 15 ? '离场' : '', floor: floors[0] },   // 占位词不该入档
                 ...(floors[0] === 19 ? [{ name: '王秀英', status: '同名另一人的现状，不该并进来', floor: 19 }] : []),
                 { name: 'Char', rel_user: '不该建档' },
@@ -241,6 +242,10 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const floors = wins[0].floors.map(i => ({ idx: i, userText: 'U', content: 'C正文' + i, recap: { storyTime: '3月1日', narrative: 'N' } }));
         const msgs = D.buildMessages({ floors, recent: [], locked: [], data });
         assert.ok(!/\{\{(name1|name2|roster|relation|context|recent|locked|floor_range|floor_count|material|min_events|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
+        const roster = D.rosterText({ people: [{ name: '杨晚星', aliases: ['星星', '晚星妹妹'], tier: '配', f: { sex: { v: '女' }, role: { v: '妹妹' } } }], items: [] });
+        assert.strictEqual(roster, '人物：\n- 杨晚星 [配·女] 妹妹；别称：星星/晚星妹妹', '档案行名字单独在行首、别称在行尾：' + roster);
+        assert.deepStrictEqual(D.splitName('杨晚星（星星🌟/晚星妹妹、星星姐）'), { name: '杨晚星', aliases: ['星星🌟', '晚星妹妹', '星星姐'] });
+        assert.deepStrictEqual(D.splitName('沈眠的高中男同学'), { name: '沈眠的高中男同学', aliases: [] });
         assert.ok(msgs[1].content.includes('"cast"') && msgs[1].content.includes('亲属') && msgs[1].content.includes('"uncovered"') && msgs[1].content.includes(END), '模板应含点名表、亲属明文、覆盖申报与哨兵');
         assert.ok(msgs[1].content.includes('"sex"') && msgs[1].content.includes('"addr"') && msgs[1].content.includes('不从外貌推'), '模板应含性别、称呼与年龄填写规则');
         assert.ok(msgs[1].content.includes('"principal"') && msgs[1].content.includes('"between"') && msgs[1].content.includes('之后所有场景都会沿用'), '模板应含主角现状键与规则');
@@ -284,7 +289,8 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const names = data.people.map(p => p.name);
         assert.deepStrictEqual(names.sort(), ['司机老王', '周远', '小刘', '王秀英', '陆衍'].sort(), '人物：' + names.join(','));
         const lu = data.people.find(p => p.name === '陆衍');
-        assert.deepStrictEqual(lu.aliases, ['小衍']);
+        assert.deepStrictEqual(lu.aliases, ['小衍', '隔壁小哥'], '括注名字剥成别称：' + lu.aliases.join(','));
+        assert.strictEqual(data.people.filter(p => /陆衍/.test(p.name)).length, 1, '「陆衍（小衍/隔壁小哥）」不能另建一档');
         assert.strictEqual(lu.tier, '配', '后面窗口报龙套不能把配降下去');
         assert.strictEqual(lu.state, '在场');
         assert.strictEqual(lu.f.role.v, '邻居');
@@ -558,7 +564,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(/- 两人关系：(暧昧|同居)\(#\d+\)｜Char 对 用户：[^\n]+\(#\d+\)\n/.test(b.text), '两人关系一行 = 形态 + 态度：' + b.text);
         assert.ok(/- 用户：职业身份 副总监\(#\d+\)\n/.test(b.text) && /- Char：婚姻家庭 未婚\(#\d+\)·知情 知道用户已婚；知道用户有个弟弟/.test(b.text), '主角各一行只列有值的键：' + b.text);
         assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙') && b.text.includes('远景 ='), '块首五行');
-        assert.ok(/- 陆衍（小衍）｜身份：邻居｜性别：男｜称呼用户：您/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后');
+        assert.ok(/- 陆衍（小衍\/隔壁小哥）｜身份：邻居｜性别：男｜称呼用户：您/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后');
         assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
         const brief = /其他已登场：([^\n]*)/.exec(b.text)?.[1] || '';
         assert.ok(brief.includes('周远·医生·离场') && brief.includes('王秀英（母亲/陆母）·女·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带性别、别称与非在场状态）：' + brief);
