@@ -926,13 +926,15 @@ C = 日常、闲聊、氛围、无后果的互动。
                 const ent = upsertPerson(name, [], idx);
                 if (!ent) continue;
                 seenThisWin.add(ent.id);
-                if (e.grade === 'S' || e.grade === 'A') promote(ent, '配');
+                if (e.grade === 'S' || e.grade === 'A') promote(ent, '配', idx);
             }
         }
         for (const id of seenThisWin) {
             const ent = data.people.find(p => p.id === id); if (!ent) continue;
             ent.seen = (ent.seen || 0) + 1;
-            if (ent.seen >= PROMOTE_SEEN) promote(ent, '配');
+            // 手改过档位的人只数手改之后的段（seenSince），旧账不算——否则解锁一瞬间就被升回去
+            if (ent.tierIdx != null) { if (lastIdx > ent.tierIdx) ent.seenSince = (ent.seenSince || 0) + 1; if ((ent.seenSince || 0) >= PROMOTE_SEEN) promote(ent, '配'); }
+            else if (ent.seen >= PROMOTE_SEEN) promote(ent, '配');
         }
     }
 
@@ -941,9 +943,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!tier || !(tier in rank) || ent.tierLock) return;
         if ((rank[tier] || 0) > (rank[ent.tier] || 0)) ent.tier = tier;
     }
-    // 龙套 / 未定 → 配（不碰主，不碰手改）
-    function promote(ent, to) {
+    // 龙套 / 未定 → 配（不碰主，不碰手改）；手改过档位的人只认手改之后楼层里的证据（idx > tierIdx）
+    function promote(ent, to, idx = null) {
         if (ent.tierLock || (TIER_RANK[ent.tier] || 0) >= TIER_RANK[to]) return;
+        if (ent.tierIdx != null && idx != null && idx <= ent.tierIdx) return;
         ent.tier = to;
     }
     // 状态：最新一窗为准；面板手改过（stateLock）的不动；旧状态压进 stateHist（来源楼被删时退回）
@@ -2990,8 +2993,15 @@ C = 日常、闲聊、氛围、无后果的互动。
             renderPanel();
         });
         ents.on('click', '[data-xact]', function (ev) { ev.stopPropagation(); entityAction($(this).data('xact'), $(this).closest('.em-ent').data('id')); });
-        // 值旁的 🔒 = 解锁这一个值；只摘掉图标不重画面板，编辑态里没保存的输入不会丢
-        ents.on('click', '.em-unlock', function (ev) { ev.stopPropagation(); entityAction('unlock', $(this).closest('.em-ent').data('id'), String($(this).data('lk') || '')); $(this).remove(); });
+        // 值旁的 🔒 = 解锁这一个值；只摘掉图标不重画面板，编辑态里没保存的输入不会丢（同一值在卡头与编辑态各有一个图标，一起摘）
+        ents.on('click', '.em-unlock', function (ev) {
+            ev.stopPropagation();
+            const card = $(this).closest('.em-ent'), lk = String($(this).data('lk') || '');
+            entityAction('unlock', card.data('id'), lk);
+            card.find('.em-unlock').filter((_, e) => String($(e).data('lk') || '') === lk).remove();
+        });
+        // 卡头的 🔒N = 整卡全解（档位 / 状态 / 字段 / 看法），entityAction 里先确认
+        ents.on('click', '.em-unlock-all', function (ev) { ev.stopPropagation(); entityAction('unlock', $(this).closest('.em-ent').data('id'), 'all'); });
         $('#em_tombs, #em_tombs_i').on('click', '.em-tomb', function () { restoreTomb($(this).data('kind'), String($(this).data('name'))); });
         // 主角现状区：态度行（data.relation）/ 两人关系行（principal.both.f.bond）改了即锁；两张主角卡点头展开编辑
         const relSet = (id, v) => {
@@ -3215,8 +3225,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         const alias = kind === 'p' && x.aliases?.length ? `<span class="em-ent-alias">（${esc(x.aliases.join('/'))}）</span>` : '';
         const tierCls = kind === 'p' ? (x.tier === '龙套' ? 'x' : x.tier === '主' ? 'a' : 'b') : (x.tier === '摆设' ? 'x' : x.tier === '关键' ? 'a' : 'b');
         const badges = [];
-        if (x.tier) badges.push(`<span class="em-tier em-tier-${tierCls}" title="${x.tierLock ? '手改已锁定' : ''}">${esc(x.tier)}${x.tierLock ? '🔒' : ''}</span>`);
-        if (x.state && x.state !== '在场') badges.push(`<span class="em-tier em-state${kind === 'i' && isSettled(x) ? ' em-state-done' : ''}" title="${x.stateLock ? '手改已锁定' : ''}">${esc(x.state)}${x.stateLock ? '🔒' : ''}</span>`);
+        if (x.tier) badges.push(`<span class="em-tier em-tier-${tierCls}">${esc(x.tier)}${valMark(x.tierLock ? { manual: true } : null, 't:')}</span>`);
+        if (x.state && x.state !== '在场') badges.push(`<span class="em-tier em-state${kind === 'i' && isSettled(x) ? ' em-state-done' : ''}">${esc(x.state)}${valMark(x.stateLock ? { manual: true } : null, 's:')}</span>`);
+        const nLock = lockCount(x);
+        if (nLock) badges.push(`<span class="em-tier em-unlock-all" title="这张卡有 ${nLock} 项手改锁定：点一下全部解除（值不动，副 AI 之后可以再改）">🔒${nLock}</span>`);
         if (kind === 'p' && HEAT_LABEL[heat]) badges.push(`<span class="em-tier em-heat-${heat}">${HEAT_LABEL[heat]}</span>`);
         if (x.lost) badges.push('<span class="em-tier em-lost" title="首见楼与所有来源楼都已被删：不注入；再次被提到或手动保存即恢复">来源全失</span>');
         if (kind === 'p' && x.sexClash?.v) badges.push(`<span class="em-tier em-clash" title="副 AI 在 #${x.sexClash.idx} 报此人为「${esc(x.sexClash.v)}」，档案是「${esc(fv(x, 'sex'))}」：可能是同名的另一个人，那一段的更新没有并进来。保存本卡即清除；若真是两个人，改名字或别称区分">⚠性别冲突</span>`);
@@ -3229,8 +3241,8 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <label>名字<input class="text_pole em-x-name" value="${esc(x.name)}"></label>
                 ${kind === 'p' ? `<label>别称（顿号分隔）<input class="text_pole em-x-alias" value="${esc((x.aliases || []).join('、'))}"></label>` : ''}
                 <div class="em-ent-2col">
-                    <label>${kind === 'p' ? '档位' : '关键性'}${x.tierLock ? '（已锁，选「未定」解锁）' : '（手改后锁定，副 AI 不再改）'}${sel('em-x-tier', tiers, x.tier, '（未定）', t => (t === '龙套' || t === '摆设') ? '（不注入）' : '')}</label>
-                    <label>状态${x.stateLock ? '（已锁，选「未定」解锁）' : ''}${sel('em-x-state', states, x.state, '（未定）')}</label>
+                    <label>${kind === 'p' ? '档位' : '关键性'}${valMark(x.tierLock ? { manual: true } : null, 't:')}（手改后锁定，副 AI 不再改）${sel('em-x-tier', tiers, x.tier, '（未定）', t => (t === '龙套' || t === '摆设') ? '（不注入）' : '')}</label>
+                    <label>状态${valMark(x.stateLock ? { manual: true } : null, 's:')}${sel('em-x-state', states, x.state, '（未定）')}</label>
                 </div>
                 ${rows}
                 ${kind === 'p' ? `<label>对他人的看法（每行：对象｜趋势｜一句话；趋势可空）${lockedViews ? `<span class="em-hint">已锁定的看法：${lockedViews}</span>` : ''}<textarea class="text_pole em-x-views" rows="3">${esc(views.map(([to, v]) => `${to}｜${v.trend || ''}｜${v.v}`).join('\n'))}</textarea></label>` : ''}
@@ -3258,8 +3270,10 @@ C = 日常、闲聊、氛围、无后果的互动。
             : sort === 'seen' ? (a, b) => (b.seen || 0) - (a.seen || 0)
                 : (a, b) => (b.last_idx || 0) - (a.last_idx || 0);
 
-    // 值旁边的锁 / 待核标记（人物志卡、物件卡、主角卡共用）；🔒 本身就是解锁按钮，只解这一个值（key 形如 f:role / v:对象名）
+    // 值旁边的锁 / 待核标记（人物志卡、物件卡、主角卡共用）；🔒 本身就是解锁按钮，只解这一个值（key 形如 f:role / v:对象名 / t: 档位 / s: 状态）
     const valMark = (v, key) => `${v?.manual ? ` <span class="em-lock em-unlock" data-lk="${esc(key || '')}" title="手改过，副 AI 不再覆盖；点一下解锁">🔒</span>` : ''}${v?.stale ? ' <span class="em-stale" title="来源楼层已不存在，待核">?</span>' : ''}`;
+    // 一张卡上的锁数（档位 / 状态 / 各字段 / 各看法）：卡头「🔒N」点了整卡全解
+    const lockCount = x => (x.tierLock ? 1 : 0) + (x.stateLock ? 1 : 0) + Object.values(x.f || {}).filter(v => v?.manual).length + Object.values(x.views || {}).filter(v => v?.manual).length;
 
     // 主角现状区：两人关系（形态 + 态度）两行输入，下面 user / char 两张钉住的卡（只有白名单字段，没有档位/状态/删除）
     function principalHtml(data) {
@@ -3292,7 +3306,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
 
     // 保存提示按实际结果说：没锁任何字段就不说「已锁定」
-    const lockedNote = n => n ? `已保存，锁定 ${n} 项（副 AI 不再覆盖，点值旁的 🔒 可解）` : '已保存';
+    const lockedNote = n => n ? `已保存，锁定 ${n} 项（副 AI 不再覆盖，点 🔒 可解）` : '已保存';
 
     function principalAction(act, key, key2) {
         const data = getData(); if (!data) return;
@@ -3616,14 +3630,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (act === 'save') {
             let locked = 0;
             x.name = el.find('.em-x-name').val().trim() || x.name;
-            // 档位 / 状态：改了就锁（副 AI 不再覆盖），选回「未定」= 清空并解锁
+            // 档位 / 状态：改了就锁（副 AI 不再覆盖），选回「未定」= 清空。档位任何手改都记下楼号 tierIdx、露面段数从零重数，之后自动升配只认这楼以后的证据
             const tiers = kind === 'p' ? TIERS : ITEM_TIERS, states = kind === 'p' ? PERSON_STATES : ITEM_STATES;
-            const tier = String(el.find('.em-x-tier').val() || '');
-            if (!tier) { x.tier = ''; x.tierLock = false; }
-            else if (tiers.includes(tier) && tier !== x.tier) { x.tier = tier; x.tierLock = true; locked++; }
-            const state = String(el.find('.em-x-state').val() || '');
-            if (!state) { x.state = ''; x.stateLock = false; }
-            else if (states.includes(state) && state !== x.state) { x.state = state; x.stateLock = true; locked++; }
+            const tierVal = String(el.find('.em-x-tier').val() || ''), tier = tiers.includes(tierVal) ? tierVal : '';
+            if (tier !== x.tier) { x.tier = tier; x.tierLock = !!tier; x.tierIdx = Math.max(0, (getCtx().chat || []).length - 1); x.seenSince = 0; if (tier) locked++; }
+            const stateVal = String(el.find('.em-x-state').val() || ''), state = states.includes(stateVal) ? stateVal : '';
+            if (state !== x.state) { x.state = state; x.stateLock = !!state; if (state) locked++; }
             if (kind === 'p') {
                 x.aliases = el.find('.em-x-alias').val().split(/[、,，/]/).map(s => s.trim()).filter(Boolean);
                 // 看法：一行没变就沿用原对象（连锁定状态一起），变了才上锁——点开看看再保存不能把整张卡的看法全锁死
@@ -3650,10 +3662,25 @@ C = 日常、闲聊、氛围、无后果的互动。
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
             toast('success', lockedNote(locked));
         } else if (act === 'unlock') {
-            // 点值旁的 🔒：只解这一个字段 / 这一条看法（key 形如 f:role / v:对象名）
+            // 点值旁的 🔒：只解这一个（key 形如 f:role / v:对象名 / t: 档位 / s: 状态）；点卡头的 🔒N：确认后整卡全解。值都不动，只摘图标不重画面板
             const [group, k] = String(key || '').split(/:(.*)/);
-            const holder = group === 'v' ? x.views : x.f;
-            if (holder?.[k]) delete holder[k].manual;
+            if (group === 'all') {
+                const n = lockCount(x);
+                confirmBox(`解除「${x.name}」的全部 ${n} 项锁定？值不变，只是副 AI 之后可以再改`).then(ok => {
+                    if (!ok) return;
+                    x.tierLock = false; x.stateLock = false;
+                    for (const v of Object.values(x.f || {})) delete v.manual;
+                    for (const v of Object.values(x.views || {})) delete v.manual;
+                    el.find('.em-unlock, .em-unlock-all').remove();
+                    saveData(); toast('info', `已解除「${x.name}」的 ${n} 项锁定`);
+                });
+                return;
+            }
+            if (group === 't') x.tierLock = false;
+            else if (group === 's') x.stateLock = false;
+            else { const holder = group === 'v' ? x.views : x.f; if (holder?.[k]) delete holder[k].manual; }
+            if (!lockCount(x)) el.find('.em-unlock-all').remove();
+            else el.find('.em-unlock-all').text(`🔒${lockCount(x)}`);
             saveData(); toast('info', '已解锁，副 AI 之后可以再改这一项');
         } else if (act === 'del') {
             confirmBox(`删除「${x.name}」的档案？之后副 AI 再报这个名字也不会重新建档（人物志底部「已删除」可恢复）`).then(ok => {
@@ -3896,7 +3923,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, splitName, rosterText, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
-        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, entHtml, valMark, applyEntryEdit, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX, PERSON_ONCE,
+        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, entHtml, valMark, lockCount, applyEntryEdit, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX, PERSON_ONCE,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,

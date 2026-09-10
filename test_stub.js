@@ -550,6 +550,13 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const html = D.entHtml('p', lu, 'listed');
         assert.ok(html.includes('data-lk="f:role"') && html.includes('data-lk="v:周远"'), '字段与看法各自带键：' + html.slice(0, 200));
         assert.ok(!html.includes('data-lk="f:age"') && !html.includes('解除字段锁定'), '没锁的不带、整卡按钮没了');
+        assert.ok(html.includes('em-unlock-all') && html.includes('🔒2'), '卡头 🔒N 计数=2：' + html.slice(0, 300));
+        assert.strictEqual(D.lockCount(lu), 2);
+        lu.tierLock = true; lu.stateLock = true; lu.state = '离场';
+        const html2 = D.entHtml('p', lu, 'listed');
+        assert.ok(html2.includes('data-lk="t:"') && html2.includes('data-lk="s:"') && html2.includes('🔒4'), '档位/状态锁也是可点的 🔒，计入卡头计数：' + html2.slice(0, 400));
+        lu.tierLock = false; lu.stateLock = false; lu.state = '在场';
+        assert.ok(!D.entHtml('p', lu, 'listed').includes('data-lk="t:"'), '没锁档位不带 t:');
         D.entFilter.p.q = ''; D.expanded?.add?.(lu.id);
         assert.strictEqual(D.valMark({ manual: true, stale: true }, 'f:look').includes('em-unlock') && D.valMark({ manual: true, stale: true }, 'f:look').includes('em-stale'), true);
         assert.strictEqual(D.valMark({ v: 'x' }, 'f:look'), '', '没锁没待核 → 空');
@@ -936,6 +943,31 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         D.mergeEntities(data, { cast: [{ name: '收银员', tier: '龙套', seen: [2] }] }, { floors: [2] }, new Map([[2, chat[2]]]), [{ src: { idx: 2 }, characters: ['收银员'], grade: 'B' }]);
         assert.strictEqual(data.people.find(p => p.name === '收银员').tier, '龙套', 'B 事件不升');
         data.people = data.people.filter(p => !['门房', '保安', '收银员'].includes(p.name));
+    });
+    t('手改过档位的人只认手改之后的证据：旧 seen 不升配、手改前楼层的 S/A 不升、之后重新攒 3 段或进一次 S/A 才升', () => {
+        merge({ cast: [{ name: '跑堂', tier: '龙套', seen: [2] }] });
+        merge({ cast: [{ name: '跑堂', tier: '龙套', seen: [2] }] });
+        merge({ cast: [{ name: '跑堂', tier: '龙套', seen: [2] }] });
+        const pt = data.people.find(p => p.name === '跑堂');
+        assert.strictEqual(pt.tier, '配'); assert.strictEqual(pt.seen, 3);
+        // 面板手降成龙套（记楼号 5、段数清零）再解锁
+        pt.tier = '龙套'; pt.tierLock = true; pt.tierIdx = 5; pt.seenSince = 0; pt.tierLock = false;
+        merge({ cast: [{ name: '跑堂', tier: '龙套', seen: [2] }] });
+        assert.strictEqual(pt.tier, '龙套', '解锁后旧账 seen=4 不升'); assert.strictEqual(pt.seenSince || 0, 0, '楼号 ≤ tierIdx 的窗口不计段');
+        D.mergeEntities(data, { cast: [{ name: '跑堂', tier: '龙套', seen: [2] }] }, { floors: [2] }, new Map([[2, chat[2]]]), [{ src: { idx: 2 }, characters: ['跑堂'], grade: 'S' }]);
+        assert.strictEqual(pt.tier, '龙套', '手改前楼层的 S 事件不升');
+        const m6 = made => D.mergeEntities(data, { cast: [{ name: '跑堂', tier: '龙套', seen: [6] }] }, { floors: [6] }, new Map([[6, chat[6]]]), made || []);
+        m6(); m6();
+        assert.strictEqual(pt.tier, '龙套'); assert.strictEqual(pt.seenSince, 2, '手改后的段重新数');
+        m6();
+        assert.strictEqual(pt.tier, '配', '手改后第 3 段升回配');
+        pt.tier = '龙套'; pt.tierIdx = 5; pt.seenSince = 0;
+        m6([{ src: { idx: 6 }, characters: ['跑堂'], grade: 'A' }]);
+        assert.strictEqual(pt.tier, '配', '手改后楼层的 A 事件直接升');
+        pt.tier = '龙套'; pt.tierLock = true; pt.seenSince = 0;
+        m6(); m6(); m6();
+        assert.strictEqual(pt.tier, '龙套', '锁着时段数攒够也不升');
+        data.people = data.people.filter(p => p.name !== '跑堂');
     });
     t('活跃度与筛选：近期 = 最近几楼提到；沉寂 = 100 楼未露面；档位/状态/持有者/搜索各自可筛', () => {
         const lu = data.people.find(p => p.name === '陆衍');
