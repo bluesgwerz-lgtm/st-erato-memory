@@ -220,6 +220,8 @@
 /* ---------- v0.4：锁 / 待核 / 墓碑 / 远景 ---------- */
 .em-st-lock { background: transparent; }
 .em-lock { font-size: .8em; opacity: .8; }
+.em-unlock { cursor: pointer; }
+.em-unlock:hover { opacity: 1; }
 .em-stale { display: inline-block; min-width: 14px; padding: 0 4px; border-radius: 7px; background: #e6a23c; color: #fff; font-size: .75em; text-align: center; cursor: help; }
 .em-tombs { font-size: .78em; opacity: .7; padding: 4px 2px; line-height: 1.8; }
 .em-tomb { display: inline-block; padding: 0 6px; border-radius: 8px; background: rgba(128,128,128,.25); cursor: pointer; margin-right: 4px; }

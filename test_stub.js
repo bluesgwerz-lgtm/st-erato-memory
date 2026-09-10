@@ -247,7 +247,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.deepStrictEqual(D.splitName('杨晚星（星星🌟/晚星妹妹、星星姐）'), { name: '杨晚星', aliases: ['星星🌟', '晚星妹妹', '星星姐'] });
         assert.deepStrictEqual(D.splitName('沈眠的高中男同学'), { name: '沈眠的高中男同学', aliases: [] });
         assert.ok(msgs[1].content.includes('"cast"') && msgs[1].content.includes('亲属') && msgs[1].content.includes('"uncovered"') && msgs[1].content.includes(END), '模板应含点名表、亲属明文、覆盖申报与哨兵');
-        assert.ok(msgs[1].content.includes('"sex"') && msgs[1].content.includes('"addr"') && msgs[1].content.includes('不从外貌推'), '模板应含性别、称呼与年龄填写规则');
+        assert.ok(msgs[1].content.includes('"sex"') && msgs[1].content.includes('"addr"') && msgs[1].content.includes('不从外貌推') && msgs[1].content.includes('换了叫法时写'), '模板应含性别、称呼（改口才写）与年龄填写规则');
         assert.ok(msgs[1].content.includes('"principal"') && msgs[1].content.includes('"between"') && msgs[1].content.includes('之后所有场景都会沿用'), '模板应含主角现状键与规则');
         assert.ok(msgs[1].content.includes('【#2】') && msgs[1].content.includes('【#5】') && msgs[1].content.includes('#2–#5') && msgs[1].content.includes('用户角色：用户'));
     });
@@ -310,7 +310,9 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.deepStrictEqual({ v: mom.sexClash?.v, idx: mom.sexClash?.idx }, { v: '男', idx: 19 }, '性别相反 → 记冲突');
         assert.ok(!mom.f.status, '冲突那一窗对此人的 people 更新不并进来');
         assert.strictEqual(lu.f.sex.v, '男'); assert.ok(!lu.sexClash, '性别一致不冲突');
-        assert.strictEqual(lu.f.addr.v, '您', '称呼只写一次：后面窗口的「昭昭」不覆盖');
+        assert.strictEqual(lu.f.addr.v, '昭昭', '称呼最新为准：后面窗口的「昭昭」覆盖「您」');
+        assert.strictEqual(lu.f.addr.hist[0].v, '您', '旧称呼压进 hist');
+        assert.deepStrictEqual(D.PERSON_ONCE, ['sex'], '只写一次的只剩性别');
         assert.ok(!data.people.find(p => p.name === '周远').f.sex, '枚举外的性别值忽略');
         const liu = data.people.find(p => p.name === '小刘');
         assert.ok(liu && liu.first_idx === 2 && !liu.f.role, '事件 characters 反哺建档，只有名字与楼层');
@@ -538,8 +540,25 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual((html.match(/em-pr-card/g) || []).length, 2); assert.ok(html.includes('👤 用户') && html.includes('👤 Char'));
         assert.ok(html.includes('职业身份</span><span class="em-ent-v">副总监') && !html.includes('住处</span>'), '只列有值的键');
         data.principal.user.f.role.manual = true;
-        assert.ok(/副总监 <span class="em-lock"/.test(D.principalHtml(data)), '手改字段带锁');
+        assert.ok(/副总监 <span class="em-lock em-unlock" data-lk="f:role"/.test(D.principalHtml(data)), '手改字段带可点的锁，标出是哪个字段');
         delete data.principal.user.f.role.manual;
+        assert.ok(!D.principalHtml(data).includes('解除字段锁定'), '整卡解锁按钮已去掉');
+    });
+    t('锁的标记与解锁粒度：🔒 带 f:/v: 键；条目保存没改动不锁、改了才锁', () => {
+        const lu = data.people.find(p => p.name === '陆衍');
+        lu.f.role.manual = true; lu.views['周远'].manual = true;
+        const html = D.entHtml('p', lu, 'listed');
+        assert.ok(html.includes('data-lk="f:role"') && html.includes('data-lk="v:周远"'), '字段与看法各自带键：' + html.slice(0, 200));
+        assert.ok(!html.includes('data-lk="f:age"') && !html.includes('解除字段锁定'), '没锁的不带、整卡按钮没了');
+        D.entFilter.p.q = ''; D.expanded?.add?.(lu.id);
+        assert.strictEqual(D.valMark({ manual: true, stale: true }, 'f:look').includes('em-unlock') && D.valMark({ manual: true, stale: true }, 'f:look').includes('em-stale'), true);
+        assert.strictEqual(D.valMark({ v: 'x' }, 'f:look'), '', '没锁没待核 → 空');
+        delete lu.f.role.manual; delete lu.views['周远'].manual;
+        const e = { title: '标题', story_time: '4月1日 · 夜 · 厨房', summary: '摘要文字', emotion_shift: '', known_by: ['甲', '乙'], locked: false };
+        assert.strictEqual(D.applyEntryEdit(e, { title: '标题', story_time: '4月1日 · 夜 · 厨房', summary: '摘要文字', emotion_shift: '', known_by: ['甲', '乙'] }), false, '内容一样不算改');
+        assert.strictEqual(e.locked, false, '没改不锁');
+        assert.strictEqual(D.applyEntryEdit(e, { title: '标题', story_time: '4月1日 · 夜 · 厨房', summary: '摘要文字', emotion_shift: '', known_by: ['甲'] }), true, 'known_by 变了算改');
+        assert.ok(e.locked && e.known_by.length === 1, '改了才锁并写入');
     });
 
     console.log('== 隐藏 / 恢复 ==');
@@ -564,7 +583,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(/- 两人关系：(暧昧|同居)\(#\d+\)｜Char 对 用户：[^\n]+\(#\d+\)\n/.test(b.text), '两人关系一行 = 形态 + 态度：' + b.text);
         assert.ok(/- 用户：职业身份 副总监\(#\d+\)\n/.test(b.text) && /- Char：婚姻家庭 未婚\(#\d+\)·知情 知道用户已婚；知道用户有个弟弟/.test(b.text), '主角各一行只列有值的键：' + b.text);
         assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙') && b.text.includes('远景 ='), '块首五行');
-        assert.ok(/- 陆衍（小衍\/隔壁小哥）｜身份：邻居｜性别：男｜称呼用户：您/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后');
+        assert.ok(/- 陆衍（小衍\/隔壁小哥）｜身份：邻居｜性别：男｜称呼用户：昭昭/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后（称呼是最新值）');
         assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
         const brief = /其他已登场：([^\n]*)/.exec(b.text)?.[1] || '';
         assert.ok(brief.includes('周远·医生·离场') && brief.includes('王秀英（母亲/陆母）·女·用户的母亲') && brief.includes('小刘'), '没露面的只列名（带性别、别称与非在场状态）：' + brief);

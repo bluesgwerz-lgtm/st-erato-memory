@@ -27,10 +27,10 @@
 
     // 人物志 / 物件档案的字段（值带来源楼层号）；主角不进人物志，只记「主角现状」（见 PRINCIPAL_FIELDS）
     // arc = 此人此刻处在什么阶段（一句）；views = 对任意他人的看法（另存 p.views，不在此表）
-    // sex 来自点名表（身份表，龙套也有），addr = 此人怎么称呼 {{user}}；这两项只写一次不覆盖（性别不随剧情变，称呼升级是关系事件走 views/arc），面板可改
+    // sex 来自点名表（身份表，龙套也有），只写一次不覆盖（性别不随剧情变）；addr = 此人怎么称呼 {{user}}，最新为准（称呼升级要有落点，模板要求原文明确改口才写），面板可改
     const PERSON_FIELDS = ['role', 'sex', 'age', 'addr', 'rel_user', 'rel_char', 'look', 'stance', 'status', 'knows', 'arc'];
     const PERSON_LABEL = { role: '身份', sex: '性别', age: '年龄', addr: '称呼{{user}}', rel_user: '与{{user}}', rel_char: '与{{char}}', look: '外貌', stance: '立场', status: '现状', knows: '知情', arc: '阶段' };
-    const PERSON_ONCE = ['sex', 'addr'];
+    const PERSON_ONCE = ['sex'];
     // knows（知情范围）是单向累加的：知道了就不会变回不知道，新值按「；」拆开并进旧值，最多留这么多条（最老的先掉）
     const KNOWS_MAX = 10;
     // 主角现状：{{user}}/{{char}} 只记「之后所有场景都会沿用」的长期变化，与人物志同构（setF / hist / 回退 / 手改锁全复用），
@@ -618,7 +618,7 @@
     "between": {"v": "两人关系的形态：陌生/同事/朋友/恋人/同居/订婚/已婚/分手…，以及 {{name1}} 明言的约定或界限（如『说好只做朋友』）", "floor": 楼层号}
   },
   "people": [
-    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人怎么称呼{{name1}}（王哥/您/直呼其名），原文有才写", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
+    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人怎么称呼{{name1}}（王哥/您/直呼其名），只在原文明确出现这个称呼、且是第一次或换了叫法时写，否则不写这个键", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
   "items": [
     {"name": "物件名", "tier": "关键 | 次要 | 摆设", "state": "待用 | 在用 | 已使用 | 已转手 | 遗失 | 损毁 | 封存", "holder": "现在在谁手里", "note": "现状一句", "meaning": "对剧情或人物的意义", "floor": 楼层号}
@@ -2382,7 +2382,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (document.getElementById('em_ball')) return;
         const el = document.createElement('div');
         el.id = 'em_ball'; el.className = 'em-ball';
-        el.innerHTML = '<i class="fa-solid fa-brain"></i><span class="em-ball-badge" id="em_ball_badge"></span>';
+        el.innerHTML = '<i class="fa-solid fa-feather-pointed"></i><span class="em-ball-badge" id="em_ball_badge"></span>';
         document.body.appendChild(el);
 
         let start = null, dragging = false;
@@ -2434,7 +2434,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!menu.length) return;
         const panelItem = $(`
         <div id="em_wand" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
-            <div class="fa-solid fa-brain extensionsMenuExtensionButton"></div>
+            <div class="fa-solid fa-feather-pointed extensionsMenuExtensionButton"></div>
             <span id="em_wand_txt">记忆面板</span>
         </div>`);
         const sumItem = $(`
@@ -2793,7 +2793,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         <div class="em-settings">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b>🧠 Erato Memory</b>
+                    <b><i class="fa-solid fa-feather-pointed"></i> Erato Memory</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -2831,7 +2831,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         <div id="em_panel" class="em-panel" style="display:none">
             <div class="em-head">
                 <div id="em_back" class="em-back fa-solid fa-chevron-left interactable" tabindex="0" style="display:none"></div>
-                <div class="em-title"><span id="em_head_title">🧠 记忆</span></div>
+                <div class="em-title"><span id="em_head_title"><i class="fa-solid fa-feather-pointed"></i> 记忆</span></div>
                 <div id="em_close" class="em-close fa-solid fa-xmark interactable" tabindex="0"></div>
             </div>
             <div id="em_view_mem" class="em-view">
@@ -2990,6 +2990,8 @@ C = 日常、闲聊、氛围、无后果的互动。
             renderPanel();
         });
         ents.on('click', '[data-xact]', function (ev) { ev.stopPropagation(); entityAction($(this).data('xact'), $(this).closest('.em-ent').data('id')); });
+        // 值旁的 🔒 = 解锁这一个值；只摘掉图标不重画面板，编辑态里没保存的输入不会丢
+        ents.on('click', '.em-unlock', function (ev) { ev.stopPropagation(); entityAction('unlock', $(this).closest('.em-ent').data('id'), String($(this).data('lk') || '')); $(this).remove(); });
         $('#em_tombs, #em_tombs_i').on('click', '.em-tomb', function () { restoreTomb($(this).data('kind'), String($(this).data('name'))); });
         // 主角现状区：态度行（data.relation）/ 两人关系行（principal.both.f.bond）改了即锁；两张主角卡点头展开编辑
         const relSet = (id, v) => {
@@ -3013,6 +3015,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             renderPanel();
         });
         $('#em_rel_box').on('click', '[data-pact]', function (ev) { ev.stopPropagation(); principalAction($(this).data('pact'), $(this).closest('.em-pr-card').data('key')); });
+        $('#em_rel_box').on('click', '.em-pr-card .em-unlock', function (ev) { ev.stopPropagation(); principalAction('unlock', $(this).closest('.em-pr-card').data('key'), String($(this).data('lk') || '').replace(/^f:/, '')); $(this).remove(); });
         $('#em_outline').on('click', '.em-oline-head', function () {
             const id = $(this).closest('.em-oline').data('id');
             expanded.has(id) ? expanded.delete(id) : expanded.add(id);
@@ -3062,7 +3065,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_view_mem').toggle(panelTab === 'mem');
         $('#em_view_cfg').toggle(panelTab === 'cfg');
         $('#em_back').toggle(panelTab === 'cfg');
-        $('#em_head_title').text(panelTab === 'cfg' ? '⚙ 设置' : '🧠 记忆');
+        $('#em_head_title').html(panelTab === 'cfg' ? '⚙ 设置' : '<i class="fa-solid fa-feather-pointed"></i> 记忆');
         if (panelTab === 'cfg') renderModelSelect();
     }
 
@@ -3199,17 +3202,16 @@ C = 日常、闲聊、氛围、无后果的互动。
         const label = k => kind === 'p' ? personLabel(k) : ITEM_LABEL[k];
         const tiers = kind === 'p' ? TIERS : ITEM_TIERS;
         const states = kind === 'p' ? PERSON_STATES : ITEM_STATES;
-        const mark = valMark;
         const rows = fields.map(k => {
             const f = x.f?.[k];
-            if (open && k === 'sex') return `<label>${esc(label(k))}${f?.manual ? ' 🔒' : ''}<select class="em-x-f" data-k="sex"><option value="">（未定）</option>${SEXES.map(s => `<option value="${s}" ${f?.v === s ? 'selected' : ''}>${s}</option>`).join('')}</select></label>`;
-            if (open) return `<label>${esc(label(k))}${f?.manual ? ' 🔒' : ''}<input class="text_pole em-x-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
+            if (open && k === 'sex') return `<label>${esc(label(k))}${valMark(f, `f:${k}`)}<select class="em-x-f" data-k="sex"><option value="">（未定）</option>${SEXES.map(s => `<option value="${s}" ${f?.v === s ? 'selected' : ''}>${s}</option>`).join('')}</select></label>`;
+            if (open) return `<label>${esc(label(k))}${valMark(f, `f:${k}`)}<input class="text_pole em-x-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
             if (!f?.v) return '';
-            return `<div class="em-ent-row"><span class="em-ent-k">${esc(label(k))}</span><span class="em-ent-v">${esc(f.v)}${mark(f)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
+            return `<div class="em-ent-row"><span class="em-ent-k">${esc(label(k))}</span><span class="em-ent-v">${esc(f.v)}${valMark(f, `f:${k}`)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
         }).join('');
         const views = kind === 'p' ? Object.entries(x.views || {}).filter(([, v]) => v?.v) : [];
-        const viewRows = open ? '' : views.map(([to, v]) => `<div class="em-ent-row"><span class="em-ent-k">对${esc(to)}</span><span class="em-ent-v">${v.trend ? `[${esc(v.trend)}] ` : ''}${esc(v.v)}${mark(v)}</span><span class="em-floor em-jump" data-idx="${v.idx}" title="点击跳到该楼">#${v.idx}</span></div>`).join('');
-        const hasLock = Object.values(x.f || {}).some(v => v?.manual) || Object.values(x.views || {}).some(v => v?.manual);
+        const viewRows = open ? '' : views.map(([to, v]) => `<div class="em-ent-row"><span class="em-ent-k">对${esc(to)}</span><span class="em-ent-v">${v.trend ? `[${esc(v.trend)}] ` : ''}${esc(v.v)}${valMark(v, `v:${to}`)}</span><span class="em-floor em-jump" data-idx="${v.idx}" title="点击跳到该楼">#${v.idx}</span></div>`).join('');
+        const lockedViews = views.filter(([, v]) => v.manual).map(([to, v]) => `<span class="em-ent-k">对${esc(to)}</span>${valMark(v, `v:${to}`)}`).join(' ');
         const alias = kind === 'p' && x.aliases?.length ? `<span class="em-ent-alias">（${esc(x.aliases.join('/'))}）</span>` : '';
         const tierCls = kind === 'p' ? (x.tier === '龙套' ? 'x' : x.tier === '主' ? 'a' : 'b') : (x.tier === '摆设' ? 'x' : x.tier === '关键' ? 'a' : 'b');
         const badges = [];
@@ -3231,8 +3233,8 @@ C = 日常、闲聊、氛围、无后果的互动。
                     <label>状态${x.stateLock ? '（已锁，选「未定」解锁）' : ''}${sel('em-x-state', states, x.state, '（未定）')}</label>
                 </div>
                 ${rows}
-                ${kind === 'p' ? `<label>对他人的看法（每行：对象｜趋势｜一句话；趋势可空）<textarea class="text_pole em-x-views" rows="3">${esc(views.map(([to, v]) => `${to}｜${v.trend || ''}｜${v.v}`).join('\n'))}</textarea></label>` : ''}
-                <div class="em-actions"><div class="menu_button" data-xact="save">保存</div>${hasLock ? '<div class="menu_button" data-xact="unlockf">解除字段锁定</div>' : ''}<div class="menu_button em-danger" data-xact="del">删除</div></div>
+                ${kind === 'p' ? `<label>对他人的看法（每行：对象｜趋势｜一句话；趋势可空）${lockedViews ? `<span class="em-hint">已锁定的看法：${lockedViews}</span>` : ''}<textarea class="text_pole em-x-views" rows="3">${esc(views.map(([to, v]) => `${to}｜${v.trend || ''}｜${v.v}`).join('\n'))}</textarea></label>` : ''}
+                <div class="em-actions"><div class="menu_button" data-xact="save">保存</div><div class="menu_button em-danger" data-xact="del">删除</div></div>
             </div>` : `<div class="em-ent-rows">${rows}${viewRows}</div>`}
         </div>`;
     }
@@ -3256,8 +3258,8 @@ C = 日常、闲聊、氛围、无后果的互动。
             : sort === 'seen' ? (a, b) => (b.seen || 0) - (a.seen || 0)
                 : (a, b) => (b.last_idx || 0) - (a.last_idx || 0);
 
-    // 值旁边的锁 / 待核标记（人物志卡与主角卡共用）
-    const valMark = v => `${v?.manual ? ' <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span>' : ''}${v?.stale ? ' <span class="em-stale" title="来源楼层已不存在，待核">?</span>' : ''}`;
+    // 值旁边的锁 / 待核标记（人物志卡、物件卡、主角卡共用）；🔒 本身就是解锁按钮，只解这一个值（key 形如 f:role / v:对象名）
+    const valMark = (v, key) => `${v?.manual ? ` <span class="em-lock em-unlock" data-lk="${esc(key || '')}" title="手改过，副 AI 不再覆盖；点一下解锁">🔒</span>` : ''}${v?.stale ? ' <span class="em-stale" title="来源楼层已不存在，待核">?</span>' : ''}`;
 
     // 主角现状区：两人关系（形态 + 态度）两行输入，下面 user / char 两张钉住的卡（只有白名单字段，没有档位/状态/删除）
     function principalHtml(data) {
@@ -3269,16 +3271,15 @@ C = 日常、闲聊、氛围、无后果的互动。
             const keys = PRINCIPAL_FIELDS[key];
             const rows = keys.map(k => {
                 const f = x.f[k];
-                if (open) return `<label>${PRINCIPAL_LABEL[k]}${f?.manual ? ' 🔒' : ''}<input class="text_pole em-pr-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
+                if (open) return `<label>${PRINCIPAL_LABEL[k]}${valMark(f, `f:${k}`)}<input class="text_pole em-pr-f" data-k="${k}" value="${esc(f?.v || '')}"></label>`;
                 if (!f?.v) return '';
-                return `<div class="em-ent-row"><span class="em-ent-k">${PRINCIPAL_LABEL[k]}</span><span class="em-ent-v">${esc(f.v)}${valMark(f)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
+                return `<div class="em-ent-row"><span class="em-ent-k">${PRINCIPAL_LABEL[k]}</span><span class="em-ent-v">${esc(f.v)}${valMark(f, `f:${k}`)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
             }).join('');
-            const hasLock = keys.some(k => x.f[k]?.manual);
             const last = Math.max(-1, ...keys.map(k => x.f[k]?.idx ?? -1));
             return `
         <div class="em-ent em-pr-card" data-key="${key}">
             <div class="em-ent-head"><span class="em-ent-name">👤 ${esc(principalName(key))}<span class="em-tier em-tier-a">主角</span></span><span class="em-floor">${last >= 0 ? `最近变化 #${last}` : '无长期变化记录'}</span></div>
-            ${open ? `<div class="em-ent-body">${rows}<div class="em-actions"><div class="menu_button" data-pact="save">保存</div>${hasLock ? '<div class="menu_button" data-pact="unlockf">解除字段锁定</div>' : ''}<div class="menu_button" data-pact="cancel">取消</div></div></div>`
+            ${open ? `<div class="em-ent-body">${rows}<div class="em-actions"><div class="menu_button" data-pact="save">保存</div><div class="menu_button" data-pact="cancel">取消</div></div></div>`
                 : (rows ? `<div class="em-ent-rows">${rows}</div>` : '')}
         </div>`;
         };
@@ -3290,23 +3291,27 @@ C = 日常、闲聊、氛围、无后果的互动。
         <div class="em-ents em-pr">${card('user')}${card('char')}</div>`;
     }
 
-    function principalAction(act, key) {
+    // 保存提示按实际结果说：没锁任何字段就不说「已锁定」
+    const lockedNote = n => n ? `已保存，锁定 ${n} 项（副 AI 不再覆盖，点值旁的 🔒 可解）` : '已保存';
+
+    function principalAction(act, key, key2) {
         const data = getData(); if (!data) return;
         const x = data.principal[key]; if (!x) return;
         const id = `pr_${key}`;
         if (act === 'save') {
+            let locked = 0;
             $(`#em_rel_box .em-pr-card[data-key="${key}"] .em-pr-f`).each(function () {
                 const k = $(this).data('k');
                 const v = this.value.trim();
                 if (!v) { delete x.f[k]; return; }
-                if (x.f[k]?.v !== v) x.f[k] = { v, idx: x.f[k]?.idx ?? Math.max(0, (getCtx().chat || []).length - 1), date: x.f[k]?.date || '', manual: true };
+                if (x.f[k]?.v !== v) { x.f[k] = { v, idx: x.f[k]?.idx ?? Math.max(0, (getCtx().chat || []).length - 1), date: x.f[k]?.date || '', manual: true }; locked++; }
             });
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
-            toast('success', '已保存（改过的字段已锁定，副 AI 不再覆盖）');
-        } else if (act === 'unlockf') {
-            for (const k of Object.keys(x.f)) delete x.f[k].manual;
-            saveData(); renderPanel();
-            toast('info', '已解除字段锁定');
+            toast('success', lockedNote(locked));
+        } else if (act === 'unlock') {
+            // 点值旁的 🔒：只解这一个字段
+            if (x.f[key2]) delete x.f[key2].manual;
+            saveData(); toast('info', '已解锁，副 AI 之后可以再改这一项');
         } else if (act === 'cancel') {
             expanded.delete(id); renderPanel();
         }
@@ -3346,7 +3351,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         return `
         <div class="em-oline${l.level === 2 ? ' em-oline-2' : ''}" data-id="${l.id}">
             <div class="em-oline-head"><span class="em-oline-key">${esc(l.key)}</span>${l.level === 2 ? `<span class="em-tier em-tier-b">时期${l.merged ? `·${l.merged} 日` : ''}</span>` : ''}${l.manual ? '<span class="em-tier">🔒</span>' : ''}<span class="em-floor">#${l.idx}${l.last != null && l.last !== l.idx ? `–#${l.last}` : ''} · ${(l.from || []).length} 条</span></div>
-            ${open ? `<div class="em-ent-body"><textarea class="text_pole em-o-text" rows="3">${esc(l.text)}</textarea><div class="em-actions"><div class="menu_button" data-oact="save">保存</div><div class="menu_button em-danger" data-oact="del">删除</div></div></div>`
+            ${open ? `<div class="em-ent-body"><textarea class="text_pole em-o-text" rows="3">${esc(l.text)}</textarea><div class="em-actions"><div class="menu_button" data-oact="save">保存</div>${l.manual ? '<div class="menu_button" data-oact="unlock">解锁（恢复自动折叠）</div>' : ''}<div class="menu_button em-danger" data-oact="del">删除</div></div></div>`
                 : `<div class="em-oline-text">${esc(l.text)}</div>`}
         </div>`;
     }
@@ -3475,6 +3480,17 @@ C = 日常、闲聊、氛围、无后果的互动。
         return window.confirm(text);
     }
 
+    // 把面板输入写回条目：任一字段与原值不同才算手改（上锁）；返回是否有改动
+    function applyEntryEdit(e, next) {
+        const same = (a, b) => (Array.isArray(a) ? a.join('、') : String(a || '')) === (Array.isArray(b) ? b.join('、') : String(b || ''));
+        const changed = Object.keys(next).some(k => !same(e[k], next[k]));
+        if (!changed) return false;
+        Object.assign(e, next);
+        e.locked = true;
+        e.updated_at = Date.now();
+        return true;
+    }
+
     function cycleGrade(id) {
         const data = getData(); const e = data?.entries.find(x => x.id === id); if (!e) return;
         if (e.pinned) return toast('info', '已钉选的条目等级锁定为 S，长按可取消钉选');
@@ -3500,13 +3516,16 @@ C = 日常、闲聊、氛围、无后果的互动。
         const e = data.entries.find(x => x.id === id); if (!e) return;
         const card = $(`#em_list .em-card[data-id="${id}"]`);
         if (act === 'save') {
-            e.title = card.find('.em-e-title').val().trim() || e.title;
-            e.story_time = card.find('.em-e-time').val().trim();
-            e.summary = card.find('.em-e-summary').val().trim() || e.summary;
-            e.emotion_shift = card.find('.em-e-emotion').val().trim();
-            e.known_by = card.find('.em-e-known').val().split(/[、,，]/).map(s => s.trim()).filter(Boolean);
-            e.locked = true;
-            e.updated_at = Date.now();
+            // 只有内容真变了才上锁：点开看看再保存不算手改
+            const next = {
+                title: card.find('.em-e-title').val().trim() || e.title,
+                story_time: card.find('.em-e-time').val().trim(),
+                summary: card.find('.em-e-summary').val().trim() || e.summary,
+                emotion_shift: card.find('.em-e-emotion').val().trim(),
+                known_by: card.find('.em-e-known').val().split(/[、,，]/).map(s => s.trim()).filter(Boolean),
+            };
+            const changed = applyEntryEdit(e, next);
+            if (!changed) { expanded.delete(id); renderPanel(); return toast('info', '没有改动'); }
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
             if (vecOn() && e.status === 'ok') vecIndexEntries(data, [e]).then(() => saveData()).catch(err => warn('向量更新失败：', err.message));
             toast('success', '已保存（已锁定：重跑本段时保留）');
@@ -3588,31 +3607,34 @@ C = 日常、闲聊、氛围、无后果的互动。
         return n;
     }
 
-    function entityAction(act, id) {
+    function entityAction(act, id, key) {
         const data = getData(); if (!data) return;
         const kind = data.people.some(x => x.id === id) ? 'p' : 'i';
         const list = kind === 'p' ? data.people : data.items;
         const x = list.find(v => v.id === id); if (!x) return;
         const el = $(`#em_panel .em-ent[data-id="${id}"]`);
         if (act === 'save') {
+            let locked = 0;
             x.name = el.find('.em-x-name').val().trim() || x.name;
             // 档位 / 状态：改了就锁（副 AI 不再覆盖），选回「未定」= 清空并解锁
             const tiers = kind === 'p' ? TIERS : ITEM_TIERS, states = kind === 'p' ? PERSON_STATES : ITEM_STATES;
             const tier = String(el.find('.em-x-tier').val() || '');
             if (!tier) { x.tier = ''; x.tierLock = false; }
-            else if (tiers.includes(tier) && tier !== x.tier) { x.tier = tier; x.tierLock = true; }
+            else if (tiers.includes(tier) && tier !== x.tier) { x.tier = tier; x.tierLock = true; locked++; }
             const state = String(el.find('.em-x-state').val() || '');
             if (!state) { x.state = ''; x.stateLock = false; }
-            else if (states.includes(state) && state !== x.state) { x.state = state; x.stateLock = true; }
+            else if (states.includes(state) && state !== x.state) { x.state = state; x.stateLock = true; locked++; }
             if (kind === 'p') {
                 x.aliases = el.find('.em-x-alias').val().split(/[、,，/]/).map(s => s.trim()).filter(Boolean);
+                // 看法：一行没变就沿用原对象（连锁定状态一起），变了才上锁——点开看看再保存不能把整张卡的看法全锁死
                 const views = {};
                 for (const line of String(el.find('.em-x-views').val() || '').split('\n')) {
                     const [to, trend, ...rest] = line.split(/[｜|]/).map(s => s.trim());
                     const v = rest.join('｜').trim();
                     if (!to || !v) continue;
-                    const old = x.views?.[to];
-                    views[to] = { v, trend: TRENDS.includes(trend) ? trend : '', idx: old?.idx ?? x.last_idx ?? 0, date: old?.date || '', manual: true };
+                    const old = x.views?.[to], tr = TRENDS.includes(trend) ? trend : '';
+                    if (old && old.v === v && (old.trend || '') === tr) { views[to] = old; continue; }
+                    views[to] = { v, trend: tr, idx: old?.idx ?? x.last_idx ?? 0, date: old?.date || '', manual: true }; locked++;
                 }
                 x.views = views;
             }
@@ -3620,19 +3642,19 @@ C = 日常、闲聊、氛围、无后果的互动。
                 const k = $(this).data('k');
                 const v = this.value.trim();
                 if (!v) { delete x.f[k]; return; }
-                if (x.f[k]?.v !== v) x.f[k] = { v, idx: x.f[k]?.idx ?? x.last_idx ?? 0, date: x.f[k]?.date || '', manual: true };
+                if (x.f[k]?.v !== v) { x.f[k] = { v, idx: x.f[k]?.idx ?? x.last_idx ?? 0, date: x.f[k]?.date || '', manual: true }; locked++; }
             });
             x.updated_at = Date.now();
             delete x.lost;
             delete x.sexClash;
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
-            toast('success', '已保存（改过的字段已锁定，副 AI 不再覆盖）');
-        } else if (act === 'unlockf') {
-            // 解除本卡全部字段锁：副 AI 之后可以再覆盖
-            for (const k of Object.keys(x.f || {})) delete x.f[k].manual;
-            for (const k of Object.keys(x.views || {})) delete x.views[k].manual;
-            saveData(); renderPanel();
-            toast('info', '已解除字段锁定');
+            toast('success', lockedNote(locked));
+        } else if (act === 'unlock') {
+            // 点值旁的 🔒：只解这一个字段 / 这一条看法（key 形如 f:role / v:对象名）
+            const [group, k] = String(key || '').split(/:(.*)/);
+            const holder = group === 'v' ? x.views : x.f;
+            if (holder?.[k]) delete holder[k].manual;
+            saveData(); toast('info', '已解锁，副 AI 之后可以再改这一项');
         } else if (act === 'del') {
             confirmBox(`删除「${x.name}」的档案？之后副 AI 再报这个名字也不会重新建档（人物志底部「已删除」可恢复）`).then(ok => {
                 if (!ok) return;
@@ -3674,9 +3696,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (act === 'ccancel') { expanded.delete('canon'); renderPanel(); return; }
         if (act === 'csave') {
             const text = String($('#em_canon .em-c-text').val() || '').trim();
-            if (text) { data.canon.text = text; data.canon.manual = true; data.canon.builtAt = Date.now(); }
+            const changed = !!text && text !== data.canon.text;
+            if (changed) { data.canon.text = text; data.canon.manual = true; data.canon.builtAt = Date.now(); }
             expanded.delete('canon'); saveData(); applyInjection(); renderPanel();
-            toast('success', '正典已保存并锁定：删 S、加 S 都不再自动重压，解锁或重建后恢复');
+            toast(changed ? 'success' : 'info', changed ? '正典已保存并锁定：删 S、加 S 都不再自动重压，解锁或重建后恢复' : '没有改动');
             return;
         }
         if (act === 'cunlock') { data.canon.manual = false; expanded.delete('canon'); saveData(); renderPanel(); toast('info', '正典已解锁'); return; }
@@ -3684,8 +3707,14 @@ C = 日常、闲聊、氛围、无后果的互动。
         const el = $(`#em_outline .em-oline[data-id="${id}"]`);
         if (act === 'save') {
             const text = el.find('.em-o-text').val().trim();
-            if (text) { line.text = text; line.manual = true; line.at = Date.now(); }
+            const changed = !!text && text !== line.text;
+            if (changed) { line.text = text; line.manual = true; line.at = Date.now(); }
             expanded.delete(id); saveData(); applyInjection(); renderPanel();
+            toast(changed ? 'success' : 'info', changed ? '已保存并锁定：之后折叠不覆盖这一行，同日新内容另起「·续」行' : '没有改动');
+        } else if (act === 'unlock') {
+            line.manual = false;
+            expanded.delete(id); saveData(); renderPanel();
+            toast('info', '已解锁：之后折叠可以合并重写这一行');
         } else if (act === 'del') {
             confirmBox(`删除这行远景（${line.key}）？被它覆盖的 ${line.from?.length || 0} 条记忆会重新回到往事（预算不够时再次被裁掉并重新折叠）`).then(ok => {
                 if (!ok) return;
@@ -3867,7 +3896,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, splitName, rosterText, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
-        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX,
+        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, entHtml, valMark, applyEntryEdit, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX, PERSON_ONCE,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
