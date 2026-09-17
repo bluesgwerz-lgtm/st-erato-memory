@@ -1022,6 +1022,12 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     console.log('== 抠取 / JSON ==');
     t('说戏 COT 不进正文', () => { const c = D.extractContent(chat[2].mes); assert.ok(!c.text.includes('备选走向') && c.text.includes('正文第2楼') && !c.fallback); });
     t('缺 </content> 走兜底', () => { const c = D.extractContent('<think>x</think><content>正文<details>d</details>'); assert.ok(c.fallback && c.text === '正文'); });
+    t('COT 句中提到 <content> 不当正文起点（先剥思考块再找 <content>）', () => {
+        const c = D.extractContent('<think>\n【回读】\n输出件顺序：thinking → 预检 → <content> → 状态栏\n【文学彩排】\n彩排段落\n</think>\n\n<content>\n真正文\n</content>\n<details><summary>📍状态</summary>x</details>');
+        assert.ok(!c.fallback && c.text === '真正文' && !c.text.includes('彩排'), '思考块内的 <content> 被跳过：' + c.text);
+        const d = D.extractContent('<thinking>输出件 <content> 提及</thinking><content>正文Z</content>');
+        assert.ok(!d.fallback && d.text === '正文Z', 'thinking 标签同样先剥：' + d.text);
+    });
     t('非 Erato 预设：无正文标签整楼当正文；自定义提取正则（捕获组 / 无捕获组）与额外剥除正则；无效正则忽略；留空回默认', () => {
         let c = D.extractContent('<thought>备选走向A</thought>正文一段<status>HP 80</status>');
         assert.ok(c.fallback && c.text.includes('<thought>备选走向A</thought>') && c.text.includes('<status>HP 80</status>'), '默认清单不认别家标签，连标签带内容整楼当正文：' + c.text);

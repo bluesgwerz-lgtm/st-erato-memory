@@ -303,14 +303,15 @@
     const customStripRxs = () => String(settings.stripRegex || '').split('\n').map(s => s.trim()).filter(Boolean).map(s => compileRx(s, 'gi')).filter(Boolean);
     const badRxLines = (text, flags) => String(text || '').split('\n').map(s => s.trim()).filter(Boolean).filter(s => { try { new RegExp(s, flags); return false; } catch { return true; } });
 
-    // 优先取 <content> 块（或设置里的自定义正则，捕获组 1 为正文、无捕获组取整段）；缺标签时按已知块逐个剥除，剩下的当正文并标记 fallback
+    // 先剥思考块再找 <content>：COT 里句中提到的 <content>（回读列输出件）不能当正文起点，否则后半截 COT 会混进材料。
+    // 然后优先取 <content> 块（或设置里的自定义正则，捕获组 1 为正文、无捕获组取整段）；缺标签时按已知块逐个剥除，剩下的当正文并标记 fallback
     function extractContent(mes) {
         let text = String(mes || '');
         for (const r of customStripRxs()) text = text.replace(r, '');
+        for (const r of RX.thinkBlocks) text = text.replace(r, '');
         const m = (customContentRx() || RX.content).exec(text);
         if (m) return { text: stripCommon(m[1] ?? m[0]).trim(), fallback: false };
         let t = text;
-        for (const r of RX.thinkBlocks) t = t.replace(r, '');
         const open = t.search(/<content>/i);
         if (open >= 0) t = t.slice(open + '<content>'.length);
         t = t.replace(RX.recap, '').replace(RX.plot, '').replace(RX.details, '').replace(RX.contentTags, '');
