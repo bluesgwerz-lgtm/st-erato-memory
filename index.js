@@ -193,6 +193,7 @@
             vec: { entries: {}, raw: {}, source: '', model: '', at: 0 },   // 向量库对账表：条目 id → 数字 hash；楼层 send_date → { h: 正文哈希, hs: [chunk hash] }
             skip: {},
             hidden: {},   // 本插件隐藏过的楼层 send_date → true；只恢复自己藏的
+            customRx: false,   // 本聊天是否启用设置里的自定义正文提取/剥除正则（按聊天记：测别家预设的聊天勾上，Erato 聊天不受影响）
             stats: { lastIngestAt: 0, lastError: '', failStreak: 0 },
             rawLog: [],   // 最近几次副 API 原始回复 { at, win, model, finish, text }，诊断用
         };
@@ -288,7 +289,8 @@
 
     const stripCommon = t => t.replace(RX.prop, '').replace(RX.toy, '').replace(RX.newspaper, '');
 
-    // 非 Erato 预设：设置里可换正文提取正则与额外剥除正则；无效的正则忽略并在控制台提示一次，留空 = 上面的 Erato 默认
+    // 非 Erato 预设：设置里可换正文提取正则与额外剥除正则；正则全局存、开关按聊天存（data.customRx），没勾的聊天一律走 Erato 默认，
+    // 这样测别家预设的聊天勾上、回 Erato 聊天不用清空正则也不会把已总结窗口判成过期重跑。无效的正则忽略并在控制台提示一次
     const rxCache = new Map();
     function compileRx(src, flags) {
         const key = flags + '/' + src;
@@ -299,8 +301,9 @@
         }
         return rxCache.get(key);
     }
-    const customContentRx = () => { const s = String(settings.contentRegex || '').trim(); return s ? compileRx(s, 'i') : null; };
-    const customStripRxs = () => String(settings.stripRegex || '').split('\n').map(s => s.trim()).filter(Boolean).map(s => compileRx(s, 'gi')).filter(Boolean);
+    const customRxOn = () => !!getData()?.customRx;
+    const customContentRx = () => { if (!customRxOn()) return null; const s = String(settings.contentRegex || '').trim(); return s ? compileRx(s, 'i') : null; };
+    const customStripRxs = () => customRxOn() ? String(settings.stripRegex || '').split('\n').map(s => s.trim()).filter(Boolean).map(s => compileRx(s, 'gi')).filter(Boolean) : [];
     const badRxLines = (text, flags) => String(text || '').split('\n').map(s => s.trim()).filter(Boolean).filter(s => { try { new RegExp(s, flags); return false; } catch { return true; } });
 
     // 先剥思考块再找 <content>：COT 里句中提到的 <content>（回读列输出件）不能当正文起点，否则后半截 COT 会混进材料。
@@ -2312,10 +2315,11 @@ C = 日常、闲聊、氛围、无后果的互动。
         const bad = c.failed + c.refused;
         const N = Math.max(0, Number(settings.autoInterval) || 0);
         const injectLine = `本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（预算裁掉 ${lastInject.dropped}）` : ''}${lastInject.outline ? ` · 远景 ${lastInject.outline} 行` : ''}${lastInject.fallback ? ` · 保底 ${lastInject.fallback}` : ''}${lastInject.recalled || lastInject.raw ? ` · 召回 ${lastInject.recalled}${lastInject.raw ? `+原文 ${lastInject.raw}` : ''}` : ''}${rc.error ? ` · ${rc.error}` : ''}`;
-        const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}），单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼`;
+        const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}，不含最新两楼），单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼`;
         $('.em-status').text(`已总结 ${c.done} 楼 / ${c.events} 条 · 待总结 ${c.todo} 楼 · 失败 ${bad} 段 · 人物 ${c.people} · 物件 ${c.items} · 已隐藏 ${c.hidden} · ${injectLine}`);
 
         $('#em_n_ok').text(c.done); $('#em_n_todo').text(c.todo); $('#em_n_hidden').text(c.hidden); $('#em_n_bad').text(bad);
+        $('#em_x_on').prop('checked', customRxOn());
         $('#em_tile_bad').toggle(bad > 0);
         $('#em_inject_line').text(injectLine);
         $('#em_auto_line').text(autoLine);
@@ -2578,9 +2582,10 @@ C = 日常、闲聊、氛围、无后果的互动。
             </div>
             <hr>
             <div class="em-sec">正文提取（用 Erato 预设不用填）</div>
+            <label class="checkbox_label"><input type="checkbox" id="em_x_on"><span>本聊天启用下面的自定义提取/剥除正则（按聊天记，Erato 聊天不勾；正则本身全局保存，换回 Erato 不用清空）</span></label>
             <label>正文提取正则（留空 = 取 &lt;content&gt;…&lt;/content&gt;；捕获组 1 当正文，没有捕获组就取整段匹配）<input id="em_x_content" class="text_pole" placeholder="<content>([\\s\\S]*?)</content>" autocomplete="off" spellcheck="false"></label>
             <label>额外剥除正则（一行一条，取正文前先从整楼剥掉；填自家预设的思考块、状态栏标签）<textarea id="em_x_strip" class="text_pole" rows="3" placeholder="<thought>[\\s\\S]*?</thought>\n<status>[\\s\\S]*?</status>" spellcheck="false"></textarea></label>
-            <div class="em-hint">别家预设没有正文标签时提取正则留空即可：插件会把整楼减去 think / thinking / think_format / COT_Director、&lt;details&gt;、&lt;recap&gt;、&lt;plot_directions&gt; 后当正文。自家的思考块和状态栏标签不在这张清单里的，写进「额外剥除」，否则思考里的备选走向、状态栏里的数值快照会被当成事件记下来。正则无效会被忽略（控制台有提示）。改动后已总结的段落会被判为「过期」并在下次总结时重跑。</div>
+            <div class="em-hint">别家预设没有正文标签时提取正则留空即可：插件会把整楼减去 think / thinking / think_format / COT_Director、&lt;details&gt;、&lt;recap&gt;、&lt;plot_directions&gt; 后当正文。自家的思考块和状态栏标签不在这张清单里的，写进「额外剥除」，否则思考里的备选走向、状态栏里的数值快照会被当成事件记下来。正则无效会被忽略（控制台有提示）。勾选或改动正则后，本聊天已总结的段落会被判为「过期」并在下次总结时重跑，所以新聊天先勾、填好再总结。</div>
             <hr>
             <div class="em-sec">调试</div>
             <label class="checkbox_label"><input type="checkbox" id="em_debug"><span>控制台调试日志</span></label>
@@ -2755,12 +2760,19 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_header').val(settings.headerText).attr('placeholder', DEFAULT_HEADER.join('\n')).on('change', function () { settings.headerText = this.value; saveSettings(); applyInjection(); });
         $('#em_auto_fold').val(['always', 'batch', 'manual'].includes(settings.autoFold) ? settings.autoFold : 'batch').on('change', function () { settings.autoFold = this.value; saveSettings(); });
         const rxChanged = (key, value, flags) => {
-            const had = getData().windows.length > 0;
+            const had = customRxOn() && getData().windows.length > 0;
             settings[key] = value; saveSettings();
             const bad = badRxLines(value, flags);
             if (bad.length) toast('warning', `正则无效，已忽略：${bad[0].slice(0, 60)}`);
             else if (had) toast('info', '正文提取规则已改：已总结的段落会被判为过期，下次总结时重跑');
         };
+        $('#em_x_on').prop('checked', customRxOn()).on('change', function () {
+            const data = getData();
+            if (!data) { this.checked = false; return toast('warning', '先打开一个聊天'); }
+            data.customRx = this.checked; saveData();
+            reconcile(); renderPanel(); refreshStatus();
+            if (data.windows.length) toast('info', `本聊天${this.checked ? '已启用' : '已停用'}自定义提取：提取规则变了，已总结的段落会被判为过期，下次总结时重跑`);
+        });
         $('#em_x_content').val(settings.contentRegex).on('change', function () { rxChanged('contentRegex', this.value.trim(), 'i'); });
         $('#em_x_strip').val(settings.stripRegex).on('change', function () { rxChanged('stripRegex', this.value, 'gi'); });
         $('#em_debug').prop('checked', settings.debug).on('change', function () { settings.debug = this.checked; saveSettings(); });

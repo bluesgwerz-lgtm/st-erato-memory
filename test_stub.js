@@ -1032,8 +1032,13 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         let c = D.extractContent('<thought>备选走向A</thought>正文一段<status>HP 80</status>');
         assert.ok(c.fallback && c.text.includes('<thought>备选走向A</thought>') && c.text.includes('<status>HP 80</status>'), '默认清单不认别家标签，连标签带内容整楼当正文：' + c.text);
         D.settings.stripRegex = '<thought>[\\s\\S]*?</thought>\n<status>[\\s\\S]*?</status>\n';
+        D.settings.contentRegex = '<body>([\\s\\S]*?)</body>';
+        c = D.extractContent('<thought>x</thought>前言<body>正文二段</body>后记');
+        assert.ok(c.fallback && c.text.includes('<thought>x</thought>') && c.text.includes('<body>'), '本聊天没勾启用：填了正则也不生效，照走 Erato 默认：' + c.text);
+        D.getData().customRx = true;
+        D.settings.contentRegex = '';
         c = D.extractContent('<thought>备选走向A</thought>正文一段<status>HP 80</status>');
-        assert.ok(c.fallback && c.text === '正文一段', '额外剥除后只剩正文：' + c.text);
+        assert.ok(c.fallback && c.text === '正文一段', '勾上后额外剥除只剩正文：' + c.text);
         D.settings.contentRegex = '<body>([\\s\\S]*?)</body>';
         c = D.extractContent('<thought>x</thought>前言<body>正文二段</body>后记');
         assert.ok(!c.fallback && c.text === '正文二段', '捕获组 1 当正文：' + c.text);
@@ -1046,7 +1051,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         D.settings.stripRegex = '<status>[\\s\\S]*?</status>\n[未闭合';
         c = D.extractContent('正文五段<status>HP</status>');
         assert.ok(c.text === '正文五段', '剥除清单里坏的一行忽略、好的照用：' + c.text);
-        D.settings.contentRegex = ''; D.settings.stripRegex = '';
+        D.settings.contentRegex = ''; D.settings.stripRegex = ''; D.getData().customRx = false;
         c = D.extractContent(chat[2].mes);
         assert.ok(!c.fallback && c.text.includes('正文第2楼') && !c.text.includes('备选走向'), '留空回 Erato 默认');
     });
