@@ -536,7 +536,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     });
     t('主角现状面板：两人关系/态度两行输入 + user/char 两张钉卡，只列有值的白名单键，手改字段带锁', () => {
         const html = D.principalHtml(data);
-        assert.ok(html.includes('id="em_bond"') && html.includes('id="em_rel"') && html.includes('value="副模型关系"'), '两行输入');
+        assert.ok(html.includes('<textarea id="em_bond"') && html.includes('<textarea id="em_rel"') && html.includes('>副模型关系</textarea>'), '两行输入是 textarea、值在标签体内');
         assert.strictEqual((html.match(/em-pr-card/g) || []).length, 2); assert.ok(html.includes('👤 用户') && html.includes('👤 Char'));
         assert.ok(html.includes('职业身份</span><span class="em-ent-v">副总监') && !html.includes('住处</span>'), '只列有值的键');
         data.principal.user.f.role.manual = true;

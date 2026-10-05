@@ -3026,9 +3026,11 @@ C = 日常、闲聊、氛围、无后果的互动。
         };
         const relUnlock = id => { const data = getData(); if (!data) return; if (id === 'em_rel') data.relation.manual = false; else if (data.principal.both.f.bond) delete data.principal.both.f.bond.manual; };
         $('#em_rel_box').on('change', '#em_rel, #em_bond', function () {
-            relSet(this.id, this.value.trim());
+            // 框是 textarea 但值要保持一行：手敲的换行折成「；」，注入块那一行不被撕开
+            relSet(this.id, this.value.replace(/\s*\n+\s*/g, '；').trim());
             saveData(); applyInjection(); renderPanel(); toast('success', '已保存并锁定（副 AI 不再覆盖）');
         });
+        $('#em_rel_box').on('input', '.em-rel-ta', function () { fitRelTa(this); });
         $('#em_rel_box').on('click', '#em_rel_unlock, #em_bond_unlock', function () {
             relUnlock(this.id.replace('_unlock', '')); saveData(); renderPanel(); toast('info', '已解锁');
         });
@@ -3289,10 +3291,12 @@ C = 日常、闲聊、氛围、无后果的互动。
     const lockCount = x => (x.tierLock ? 1 : 0) + (x.stateLock ? 1 : 0) + Object.values(x.f || {}).filter(v => v?.manual).length + Object.values(x.views || {}).filter(v => v?.manual).length;
 
     // 主角现状区：两人关系（形态 + 态度）两行输入，下面 user / char 两张钉住的卡（只有白名单字段，没有档位/状态/删除）
+    // 两行输入是 textarea 不是 input：副模型写的内容随剧情变长，单行框在手机上只能拖光标看；按内容自动撑高（CSS field-sizing + fitRelTa 兜底）
+    // 值本身仍是一行（change 时换行折成「；」），注入块与喂回副模型的「两人关系：形态｜态度」格式不变
     function principalHtml(data) {
         const pr = data.principal, rel = data.relation || {}, bond = pr.both.f.bond || {};
-        const line = (id, label, v, ph) => `<label>${label}${v.idx != null ? ` <span class="em-floor em-jump" data-idx="${v.idx}">#${v.idx}</span>` : ''}${v.manual ? ` <span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span> <span id="${id}_unlock" class="em-floor em-link">解锁</span>` : ''}
-            <input id="${id}" class="text_pole" value="${esc(v.v || '')}" placeholder="${ph}"></label>`;
+        const line = (id, label, v, ph) => `<label><span class="em-rel-lab"><span>${label}</span>${v.idx != null ? `<span class="em-floor em-jump" data-idx="${v.idx}">#${v.idx}</span>` : ''}${v.manual ? `<span class="em-lock" title="手改过，副 AI 不再覆盖">🔒</span><span id="${id}_unlock" class="em-floor em-link">解锁</span>` : ''}</span>
+            <textarea id="${id}" class="text_pole em-rel-ta" rows="1" placeholder="${ph}">${esc(v.v || '')}</textarea></label>`;
         const card = key => {
             const x = pr[key], id = `pr_${key}`, open = expanded.has(id);
             const keys = PRINCIPAL_FIELDS[key];
@@ -3344,10 +3348,17 @@ C = 日常、闲聊、氛围、无后果的互动。
         }
     }
 
+    // 两人关系 / 态度的 textarea 按内容撑高：老 WebView 不认 CSS field-sizing 时靠这个；面板收着（scrollHeight 为 0）时不动，等下次 input / 重画
+    function fitRelTa(el) {
+        const els = el ? [el] : $('#em_rel_box .em-rel-ta').get();
+        for (const ta of els) { ta.style.height = 'auto'; if (ta.scrollHeight) ta.style.height = `${ta.scrollHeight + 2}px`; }
+    }
+
     function renderEntities(data) {
         const ctx = getCtx();
         const chat = ctx.chat || [];
         $('#em_rel_box').html(principalHtml(data));
+        fitRelTa();
         const tombHtml = kind => {
             const names = [...new Set(Object.values(data.tombstones?.[kind] || {}).map(t => t.name))];
             return names.length ? `已删除（不再自动建档，点名字恢复）：${names.map(n => `<span class="em-tomb" data-kind="${kind}" data-name="${esc(n)}">${esc(n)} ×</span>`).join(' ')}` : '';

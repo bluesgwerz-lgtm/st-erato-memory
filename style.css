@@ -179,9 +179,14 @@
 
 /* ---------- 人物与物件 ---------- */
 .em-ents { display: flex; flex-direction: column; gap: 6px; }
-.em-rel label { display: flex; flex-direction: column; font-size: .8em; gap: 2px; }
-.em-rel input { width: 100%; box-sizing: border-box; }
-.em-rel { display: flex; flex-direction: column; gap: 6px; }
+.em-rel label { display: flex; flex-direction: column; font-size: .8em; gap: 2px; min-width: 0; }
+/* 标签行：说明文字可折行，楼号 / 锁 / 解锁跟在后面，窄屏不再把楼号挤出屏幕 */
+.em-rel-lab { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; min-width: 0; }
+.em-rel-lab > span:first-child { flex: 1 1 auto; min-width: 0; }
+.em-rel-lab .em-floor { margin-left: 0; }
+/* 两行输入是 textarea：内容多长就撑多高，手机上不用拖光标；值仍是一行（换行保存时折成「；」） */
+.em-rel textarea { width: 100%; box-sizing: border-box; resize: none; overflow: hidden; line-height: 1.45; min-height: 2.2em; field-sizing: content; }
+.em-rel { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .em-pr { margin: 6px 0 10px; }
 .em-link { cursor: pointer; text-decoration: underline dotted; }
 .em-ent { border: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); border-radius: 8px; background: var(--black30a, rgba(0,0,0,.25)); padding: 6px 10px; }
