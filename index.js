@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.17';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.18';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -1886,8 +1886,9 @@ C = 日常、闲聊、氛围、无后果的互动。
             .replace(/([〇零一二两三四五六七八九十]+)(?=[年月日号])/g, (m, s) => { const n = cnNumber(s); return n === null ? m : String(n); })
             .replace(/号/g, '日').replace(/\s+/g, '').trim();
     }
+    // 跨日段「2025年10月24日至25日」「11月7日至9日中午」按起始日归档：截掉「至/到/~/—」及其后（不含 ASCII「-」，2025-10-24 这种写法里有它）
     const dayKey = e => {
-        const t = normDate(String(e.story_time || '').split(/[·|｜]/)[0]);
+        const t = normDate(String(e.story_time || '').split(/[·|｜]/)[0]).split(/至|到|~|～|—|–/)[0];
         return t && t.length <= 14 && !/^（?未知/.test(t) ? t : `#${Math.floor((e.src?.idx ?? 0) / 40) * 40} 楼段`;
     };
 

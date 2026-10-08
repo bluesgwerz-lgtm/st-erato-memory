@@ -479,6 +479,10 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(D.dayKey({ story_time: '三月四日 · 午后 · 厨房', src: { idx: 2 } }), '3月4日');
         assert.strictEqual(D.dayKey({ story_time: '2026年3月4日 · 夜', src: { idx: 2 } }), '2026年3月4日', '年份保留');
         assert.strictEqual(D.dayKey({ story_time: '（未知）', src: { idx: 85 } }), '#80 楼段');
+        assert.strictEqual(D.dayKey({ story_time: '2025年10月24日至25日 · 渝州', src: { idx: 22 } }), '2025年10月24日', '跨日段按起始日归档（1008 真机：15 字超长被判成楼段）');
+        assert.strictEqual(D.dayKey({ story_time: '2025年11月7日至9日中午 · 云栖林语', src: { idx: 60 } }), '2025年11月7日');
+        assert.strictEqual(D.dayKey({ story_time: '2025年10月25日深夜至26日晨', src: { idx: 26 } }), '2025年10月25日深夜', '「至」前仍带时段词时原样保留（≤14 字）');
+        assert.strictEqual(D.dayKey({ story_time: '2025-10-24 · 夜', src: { idx: 2 } }), '2025-10-24', 'ASCII 连字符不当分隔');
     });
 
     console.log('== 锁 / 墓碑 / 字段锁 ==');
