@@ -427,6 +427,9 @@
         if (status === 429 || (status >= 500 && status < 600)) return true;
         if (status >= 400 && status < 500) return false;
         if (/\b(400|401|403|404)\b|unauthorized|forbidden|invalid.{0,20}key|api key|model.{0,20}not (found|exist)/i.test(msg)) return false;
+        // 中转站把上游错误吞成「<none>」「null」或空串（1008 真机：gcli 中转上游过载时就这样），没有任何可判的信息；
+        // 既不是明确 4xx，就按暂时性退避一次比直接判死划算（鉴权/参数错不会是空消息）
+        if (/^\s*(<\s*none\s*>|none|null|undefined|unknown( error)?|error)?\s*\.?\s*$/i.test(msg)) return true;
         return /\b(429|50[0-9]|502|503|504)\b|too many|rate.?limit|overloaded|resource.?exhausted|quota|timeout|timed out|unavailable|bad gateway|ECONN|ETIMEDOUT|socket|fetch failed/i.test(msg);
     };
     async function callApiRetry(messages, maxTokens, signal, onFail) {

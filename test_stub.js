@@ -1142,6 +1142,8 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(!D.isTransient(401, '') && !D.isTransient(403, 'Forbidden') && !D.isTransient(400, 'bad request') && !D.isTransient(404, ''));
         assert.ok(D.isTransient(200, 'Too Many Requests') && D.isTransient(200, 'rate limit exceeded') && D.isTransient(200, 'RESOURCE_EXHAUSTED') && D.isTransient(200, '网络错误：ECONNRESET'), '酒馆后端 200+error 只能按文字判');
         assert.ok(!D.isTransient(200, 'Invalid API key') && !D.isTransient(200, 'model gpt-x not found') && !D.isTransient(200, '疑似拒答'));
+        assert.ok(D.isTransient(200, '<none>') && D.isTransient(200, 'null') && D.isTransient(200, '') && D.isTransient(200, 'Unknown error'), '中转站吞掉上游错误只剩占位符：按暂时性退避');
+        assert.ok(!D.isTransient(401, '<none>') && !D.isTransient(400, ''), '明确 4xx 即便消息为空也不重试');
     });
     t('占位词判定', () => {
         for (const s of ['未知', '（未知）', '(不详)', '未提及', '暂无', 'N/A', 'unknown', '【待定】']) assert.ok(D.PLACEHOLDER_RX.test(s), s);
