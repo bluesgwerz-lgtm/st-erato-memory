@@ -1757,6 +1757,56 @@ C = 日常、闲聊、氛围、无后果的互动。
         return { text, count, chars: text.length, dropped, droppedIds, fallback: pool.filter(p => p.fb).length, outline: outline.length, recalled: recall.entries.length, raw: recall.raw.length, sizes };
     }
 
+    // 前史文本（v0.4.13）：把本聊天的记忆整理成一段可贴进世界书 / 作者注释的纯文本，给「换个窗口接着这条线」用。
+    // 不是迁移：贴出去的是冻结快照，新聊天插件会另起档案。为了两份不打架，这里只保留「不会过时」的东西——
+    //   事件（远景 + 正典）照搬；人物只留身份类字段（身份/性别/年龄/称呼/关系/外貌/立场/知情/看法），状态(在场/离场)、现状、阶段这些会过时的不写，死亡/下落不明是事实保留；
+    //   物件去掉待用/在用这类临时状态与带楼号的履历，已了结的一行；主角现状整块标「截至前史结束时」；往事不进（正典 + 远景够了，正典远景都空时才附 A 级要点兜底）。
+    //   全程不带楼号（新聊天里楼号没意义），开头一行把优先级说清：现在的状态以对话里最新描述为准。
+    function prehistoryText(data) {
+        if (!data) return '';
+        const ok = data.entries.filter(e => e.status === 'ok');
+        const S = ok.filter(e => e.grade === 'S' || e.pinned);
+        const outline = (data.outline?.lines || []).slice().sort((a, b) => a.idx - b.idx).map(l => `- ${l.key}：${l.text}`);
+        const canon = S.length ? canonLines(data, S) : [];
+        const parts = [
+            '[前史：以下是此前一段剧情的记录，均为已发生的事实，截至该段结束为止。可回调、呼应、形成对比，不复述、不总结。',
+            '人物与两人关系这里写的是「截至前史结束时」的样子，只作背景；他们现在是什么状态，以本次对话里的最新描述为准，两者冲突时信对话。]',
+        ];
+        const pr = principalLines(data, false);
+        if (pr.length) parts.push('', '## 主角（截至前史结束时）', ...pr);
+        const people = data.people.filter(p => !isExtra(p) && !p.lost);
+        if (people.length) {
+            const KEEP = PERSON_FIELDS.filter(k => !['status', 'arc'].includes(k));
+            const lines = people.slice().sort((a, b) => (a.first_idx || 0) - (b.first_idx || 0)).map(p => {
+                const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
+                const f = [];
+                if (['死亡', '下落不明'].includes(p.state)) f.push(p.state);
+                f.push(...KEEP.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
+                const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
+                if (views.length) f.push(`看法：${views.join('；')}`);
+                return `- ${head}${f.length ? '｜' + f.join('｜') : ''}`;
+            });
+            parts.push('', '## 人物（截至前史结束时）', ...lines);
+        }
+        const items = data.items.filter(it => !isProp(it) && !it.lost);
+        if (items.length) {
+            const live = [], settled = [];
+            for (const it of items) {
+                if (isSettled(it)) { settled.push(`${it.name}（${it.state}${fv(it, 'holder') ? `·${fv(it, 'holder')}` : ''}）`); continue; }
+                live.push(`- ${it.name}${ITEM_FIELDS.filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`);
+            }
+            parts.push('', '## 物件', ...live);
+            if (settled.length) parts.push(`- 已了结：${settled.join('、')}`);
+        }
+        if (outline.length) parts.push('', '## 远景（更早时期的骨架）', ...outline);
+        if (canon.length) parts.push('', '## 正典（定了的事，不可违背）', ...canon);
+        if (!outline.length && !canon.length) {
+            const A = ok.filter(e => e.grade === 'A').sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0));
+            if (A.length) parts.push('', '## 要点', ...A.map(e => fmtEntry(e, false)));
+        }
+        return parts.join('\n') + '\n';
+    }
+
     function applyInjection() {
         const ctx = getCtx();
         const depth = Number(settings.injectDepth) || 6;
@@ -2874,6 +2924,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     <div class="em-menu-item" data-act="unhide">取消隐藏（恢复本插件藏起来的楼层）</div>
                     <div class="em-menu-item" data-act="export">导出 JSON</div>
                     <div class="em-menu-item" data-act="import">导入 JSON</div>
+                    <div class="em-menu-item" data-act="prehistory">导出前史文本 (.txt)（贴进新聊天的世界书用）</div>
                     <div class="em-menu-item" data-act="cfg">设置</div>
                     <div class="em-menu-item em-danger" data-act="clear">清空本聊天的记忆</div>
                     <input type="file" id="em_import_file" accept="application/json" hidden>
@@ -3830,6 +3881,15 @@ C = 日常、闲聊、氛围、无后果的互动。
             downloadText(`erato-memory-${String(ctx.chatId || 'chat').replace(/[^\w.-]+/g, '_')}.json`, JSON.stringify({ chatId: ctx.chatId, exportedAt: new Date().toISOString(), data }, null, 2), 'application/json');
         } else if (act === 'import') {
             $('#em_import_file').val('').trigger('click');
+        } else if (act === 'prehistory') {
+            const text = prehistoryText(data);
+            if (!data.entries.length && !data.people.length && !data.outline.lines.length) return toast('info', '本聊天还没有记忆，没什么可导的');
+            const ctx = getCtx();
+            downloadText(`erato-prehistory-${String(ctx.chatId || 'chat').replace(/[^\w.-]+/g, '_')}.txt`, text, 'text/plain;charset=utf-8');
+            // 顺手进剪贴板（手机 WebView 可能没有 clipboard 权限，失败就只靠下载的文件）
+            let copied = false;
+            try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); copied = true; } } catch { /* 没权限就算了 */ }
+            toast('success', `前史文本已导出（${text.length} 字）${copied ? '，也复制进剪贴板了' : ''}。贴进新聊天的世界书（建议用「聊天世界书」，别贴进角色世界书，会带到这个角色的所有聊天）`);
         } else if (act === 'clear') {
             if (!await confirmBox(`清空当前聊天的全部记忆（${data.entries.length} 条、${data.people.length} 个人物、${data.items.length} 件物件、远景 ${data.outline.lines.length} 行）？不可恢复（建议先导出）。本插件隐藏的楼层会一并恢复显示`)) return;
             stopRun();   // 正在飞的调用返回后会发现库已换，结果作废
@@ -3954,6 +4014,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
+        prehistoryText, panelAction,
     };
 
     jQuery(() => {

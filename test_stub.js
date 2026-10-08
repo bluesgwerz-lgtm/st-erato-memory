@@ -1088,6 +1088,48 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(downloads.length, 0, '空记录不导出');
     });
 
+    console.log('== 前史文本（贴世界书用） ==');
+    await ta('前史文本：只留不会过时的字段、不带楼号、龙套/摆设不进、死亡保留、往事不进；菜单项下载 .txt', async () => {
+        const base = JSON.parse(JSON.stringify(data));
+        base.people = [
+            { id: 'p_a', name: '周远', aliases: ['老周'], tier: '配', state: '离场', first_idx: 3, last_idx: 9, f: { role: { v: '医生', idx: 3 }, sex: { v: '男', idx: 3 }, status: { v: '正在值夜班', idx: 9 }, arc: { v: '试探', idx: 9 }, addr: { v: '小姐', idx: 5 } }, views: { '{{user}}': { v: '欣赏', trend: '投缘' } } },
+            { id: 'p_b', name: '吴妈', tier: '龙套', state: '在场', first_idx: 4, last_idx: 4, f: { role: { v: '厨娘', idx: 4 } } },
+            { id: 'p_c', name: '老爷', tier: '主', state: '死亡', first_idx: 1, last_idx: 7, f: { role: { v: '家主', idx: 1 } } },
+        ];
+        base.items = [
+            { id: 'i_a', name: '玉佩', tier: '关键', state: '在用', first_idx: 2, last_idx: 8, f: { holder: { v: '{{user}}', idx: 8 }, meaning: { v: '母亲遗物', idx: 2 } } },
+            { id: 'i_b', name: '花瓶', tier: '摆设', state: '待用', f: {} },
+            { id: 'i_c', name: '密信', tier: '次要', state: '损毁', f: { holder: { v: '周远', idx: 6 } } },
+        ];
+        base.outline = { lines: [{ id: 'o1', idx: 2, key: '三月初一', text: '周远初诊', from: [] }], pending: [] };
+        base.canon = { text: '', builtFrom: [] };
+        base.relation = { v: '表面买主与乐伎', idx: 9 };   // 桩假 API 写的关系值里自带「（#N）」字样，换掉以便查「全程不带楼号」
+        base.entries = [
+            { id: 'e_s', status: 'ok', grade: 'S', title: '定亲', summary: '老爷临终前把玉佩交给{{user}}', story_time: '三月初三', src: { idx: 7 } },
+            { id: 'e_b', status: 'ok', grade: 'B', title: '喝茶', summary: '闲聊', story_time: '三月初二', src: { idx: 5 } },
+        ];
+        const text = D.prehistoryText(base);
+        assert.ok(text.startsWith('[前史：') && text.includes('以本次对话里的最新描述为准'), '开头是优先级说明');
+        assert.ok(/- 周远（老周）｜身份：医生｜性别：男｜称呼.+：小姐｜看法：对\{\{user\}\}·投缘·欣赏/.test(text), '人物只留身份类字段：' + text);
+        assert.ok(!text.includes('离场') && !text.includes('值夜班') && !text.includes('试探') && !text.includes('阶段'), '状态/现状/阶段这些会过时的不写');
+        assert.ok(text.includes('- 老爷｜死亡｜身份：家主'), '死亡是事实保留');
+        assert.ok(!text.includes('吴妈') && !text.includes('花瓶'), '龙套与摆设不进');
+        assert.ok(text.includes('- 玉佩｜持有者：{{user}}｜意义：母亲遗物') && !text.includes('在用') && !text.includes('履历'), '物件去临时状态与履历');
+        assert.ok(text.includes('- 已了结：密信（损毁·周远）'));
+        assert.ok(text.includes('## 远景') && text.includes('- 三月初一：周远初诊') && text.includes('## 正典') && text.includes('「定亲」老爷临终前'), '远景正典照搬');
+        assert.ok(!text.includes('喝茶') && !text.includes('## 要点'), '有正典/远景时往事不进');
+        assert.ok(!/#\d+/.test(text), '全程不带楼号：' + text);
+        // 正典远景都空 → A 级要点兜底；都没有 → 也不塞往事
+        base.outline.lines = []; base.entries = [{ id: 'e_a', status: 'ok', grade: 'A', title: '赠伞', summary: '周远借伞', story_time: '三月初二', src: { idx: 5 } }, base.entries[1]];
+        const t2 = D.prehistoryText(base);
+        assert.ok(t2.includes('## 要点') && t2.includes('「赠伞」') && !t2.includes('喝茶'), 'A 级兜底、B 不进');
+        // 菜单项：下载 erato-prehistory-<chat>.txt，内容 = prehistoryText
+        downloads.length = 0;
+        await D.panelAction('prehistory');
+        assert.strictEqual(downloads.length, 1); assert.ok(/^erato-prehistory-chat1\.txt$/.test(downloads[0].name), downloads[0].name);
+        assert.strictEqual(lastBlob.text, D.prehistoryText(data)); assert.ok(lastBlob.type.startsWith('text/plain'));
+    });
+
     console.log('== 暂时性失败退避重试 / 鉴权错直接失败 / 占位词 ==');
     t('失败分类：429/5xx/限流文字/网络错可重试；401/403/400/密钥/模型名错不重试', () => {
         assert.ok(D.isTransient(429, '') && D.isTransient(503, '') && D.isTransient(500, 'Internal'));
