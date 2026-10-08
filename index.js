@@ -1760,7 +1760,8 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 前史文本（v0.4.13）：把本聊天的记忆整理成一段可贴进世界书 / 作者注释的纯文本，给「换个窗口接着这条线」用。
     // 不是迁移：贴出去的是冻结快照，新聊天插件会另起档案。为了两份不打架，这里只保留「不会过时」的东西——
     //   事件（远景 + 正典）照搬；人物只留身份类字段（身份/性别/年龄/称呼/关系/外貌/立场/知情/看法），状态(在场/离场)、现状、阶段这些会过时的不写，死亡/下落不明是事实保留；
-    //   物件去掉待用/在用这类临时状态与带楼号的履历，已了结的一行；主角现状整块标「截至前史结束时」；往事不进（正典 + 远景够了，正典远景都空时才附 A 级要点兜底）。
+    //   物件去掉待用/在用这类临时状态、「叠在箱中」这类备注与带楼号的履历，只留持有者与意义，已了结的一行；主角现状整块标「截至前史结束时」；
+    //   只有身份/性别的人物合成一行「其他已登场」；事件 = 远景 + 正典 + A 级要点（排除已折进远景的），B 级往事不进。
     //   全程不带楼号（新聊天里楼号没意义），开头一行把优先级说清：现在的状态以对话里最新描述为准。
     function prehistoryText(data) {
         if (!data) return '';
@@ -1777,33 +1778,40 @@ C = 日常、闲聊、氛围、无后果的互动。
         const people = data.people.filter(p => !isExtra(p) && !p.lost);
         if (people.length) {
             const KEEP = PERSON_FIELDS.filter(k => !['status', 'arc'].includes(k));
-            const lines = people.slice().sort((a, b) => (a.first_idx || 0) - (b.first_idx || 0)).map(p => {
+            const full = [], brief = [];
+            for (const p of people.slice().sort((a, b) => (a.first_idx || 0) - (b.first_idx || 0))) {
                 const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
                 const f = [];
                 if (['死亡', '下落不明'].includes(p.state)) f.push(p.state);
                 f.push(...KEEP.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
                 const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
                 if (views.length) f.push(`看法：${views.join('；')}`);
-                return `- ${head}${f.length ? '｜' + f.join('｜') : ''}`;
-            });
-            parts.push('', '## 人物（截至前史结束时）', ...lines);
+                // 只有身份/性别、没有任何关系与看法的人（1008 真机样本里占一半），一行点名即可
+                const thin = !views.length && f.every(s => /^(身份|性别)：/.test(s));
+                if (thin) brief.push(`${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}`);
+                else full.push(`- ${head}${f.length ? '｜' + f.join('｜') : ''}`);
+            }
+            parts.push('', '## 人物（截至前史结束时）', ...full);
+            if (brief.length) parts.push(`- 其他已登场：${brief.join('、')}`);
         }
+        // 物件：备注（note）写的是「叠在箱中」「摆在门口」这类当下位置，会过时，不进；只留持有者与意义
         const items = data.items.filter(it => !isProp(it) && !it.lost);
         if (items.length) {
             const live = [], settled = [];
             for (const it of items) {
                 if (isSettled(it)) { settled.push(`${it.name}（${it.state}${fv(it, 'holder') ? `·${fv(it, 'holder')}` : ''}）`); continue; }
-                live.push(`- ${it.name}${ITEM_FIELDS.filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`);
+                live.push(`- ${it.name}${['holder', 'meaning'].filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`);
             }
-            parts.push('', '## 物件', ...live);
+            parts.push('', '## 物件（截至前史结束时）', ...live);
             if (settled.length) parts.push(`- 已了结：${settled.join('、')}`);
         }
         if (outline.length) parts.push('', '## 远景（更早时期的骨架）', ...outline);
         if (canon.length) parts.push('', '## 正典（定了的事，不可违背）', ...canon);
-        if (!outline.length && !canon.length) {
-            const A = ok.filter(e => e.grade === 'A').sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0));
-            if (A.length) parts.push('', '## 要点', ...A.map(e => fmtEntry(e, false)));
-        }
+        // 要点：A 级始终附上（1008 真机样本里这是最有用的一段），只排除已折进远景的；B 级不进
+        const folded = new Set();
+        for (const l of (data.outline?.lines || [])) for (const id of (l.from || [])) folded.add(id);
+        const A = ok.filter(e => e.grade === 'A' && !e.pinned && !folded.has(e.id)).sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0));
+        if (A.length) parts.push('', '## 要点（远景与正典之外的重要事件）', ...A.map(e => fmtEntry(e, false)));
         return parts.join('\n') + '\n';
     }
 
