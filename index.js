@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.16';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.17';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -1771,7 +1771,8 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!data) return '';
         const ok = data.entries.filter(e => e.status === 'ok');
         const S = ok.filter(e => e.grade === 'S' || e.pinned);
-        const outline = (data.outline?.lines || []).slice().sort((a, b) => a.idx - b.idx).map(l => `- ${l.key}：${l.text}`);
+        // 远景行没有日期时折叠拿楼号当标题（「#40 楼段」）；新聊天里楼号没意义，前史里换成「（时间未知）」
+        const outline = (data.outline?.lines || []).slice().sort((a, b) => a.idx - b.idx).map(l => `- ${/^#\d+ 楼段$/.test(l.key) ? '（时间未知）' : l.key}：${l.text}`);
         const canon = S.length ? canonLines(data, S) : [];
         const parts = [
             '[前史：以下是此前一段剧情的记录，均为已发生的事实，截至该段结束为止。可回调、呼应、形成对比，不复述、不总结。',

@@ -1103,7 +1103,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
             { id: 'i_b', name: '花瓶', tier: '摆设', state: '待用', f: {} },
             { id: 'i_c', name: '密信', tier: '次要', state: '损毁', f: { holder: { v: '周远', idx: 6 } } },
         ];
-        base.outline = { lines: [{ id: 'o1', idx: 2, key: '三月初一', text: '周远初诊', from: [] }], pending: [] };
+        base.outline = { lines: [{ id: 'o1', idx: 2, key: '三月初一', text: '周远初诊', from: [] }, { id: 'o2', idx: 40, key: '#40 楼段', text: '无日期的一段', from: [] }], pending: [] };
         base.canon = { text: '', builtFrom: [] };
         base.relation = { v: '表面买主与乐伎', idx: 9 };   // 桩假 API 写的关系值里自带「（#N）」字样，换掉以便查「全程不带楼号」
         base.entries = [
@@ -1123,6 +1123,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(text.includes('- 玉佩｜持有者：{{user}}｜意义：母亲遗物') && !text.includes('在用') && !text.includes('叠在箱中') && !text.includes('履历'), '物件去临时状态、备注与履历');
         assert.ok(text.includes('- 已了结：密信（损毁·周远）'));
         assert.ok(text.includes('## 远景') && text.includes('- 三月初一：周远初诊') && text.includes('## 正典') && text.includes('「定亲」老爷临终前'), '远景正典照搬');
+        assert.ok(text.includes('- （时间未知）：无日期的一段') && !text.includes('楼段'), '远景无日期行的楼号标题换成（时间未知）');
         assert.ok(text.includes('## 要点') && text.includes('「赠伞」') && !text.includes('「初诊」') && !text.includes('喝茶'), 'A 级始终附、已折进远景的不重复、B 不进：' + text);
         assert.ok(!/#\d+/.test(text), '全程不带楼号：' + text);
         // 正典远景都空 → 要点仍在（1008 真机样本就是这种中等楼数的聊天）
