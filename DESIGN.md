@@ -1317,3 +1317,7 @@ Window.uncovered = [idx] // 副模型申报无事 + 核验补出的未覆盖楼
 
 定案：`isTransient` 加一条——消息为空或只剩 `<none>` / `null` / `undefined` / `unknown (error)` / `error` 这类占位，且 status 不是明确 4xx，返回 true（退避两次）。鉴权/参数错不会是空消息，误伤面为零；最坏多等 11 秒。桩测 72 项（`isTransient` 项扩两条断言）。
 
+### 20.29 面板显示版本号（v0.4.16，2026-10-08）
+
+用户提出：升级后不知道有没有成功（1008 当晚就发生了——用 0.4.13 导的前史以为是 0.4.14 的）。加 `VERSION` 常量，面板头「记忆」与设置页「Erato Memory」后各跟一个小字灰色 `v0.4.16`（`.em-ver`）。manifest.json 与常量两处要同步，桩测加一项读 manifest 对比，漏改即红。桩测 73 项。
+

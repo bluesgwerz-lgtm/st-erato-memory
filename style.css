@@ -243,3 +243,4 @@
 .em-clash { background: rgba(240,160,40,.4); }
 .em-canon-view { cursor: pointer; }
 .em-canon textarea { width: 100%; box-sizing: border-box; margin-top: 4px; }
+.em-ver { font-weight: normal; font-size: .75em; opacity: .55; margin-left: 2px; }

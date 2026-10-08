@@ -1136,6 +1136,13 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(lastBlob.text, D.prehistoryText(data)); assert.ok(lastBlob.type.startsWith('text/plain'));
     });
 
+    console.log('== 版本号 ==');
+    t('index.js 的 VERSION 与 manifest.json 一致（面板标题显示的就是它，改版本两处要同步）', () => {
+        const m = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
+        assert.strictEqual(D.VERSION, m.version);
+        assert.ok(src.includes('<span class="em-ver">v${VERSION}</span>'), '面板/设置页标题带版本号');
+    });
+
     console.log('== 暂时性失败退避重试 / 鉴权错直接失败 / 占位词 ==');
     t('失败分类：429/5xx/限流文字/网络错可重试；401/403/400/密钥/模型名错不重试', () => {
         assert.ok(D.isTransient(429, '') && D.isTransient(503, '') && D.isTransient(500, 'Internal'));

@@ -11,6 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
+    const VERSION = '0.4.16';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -2870,7 +2871,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         <div class="em-settings">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b><i class="fa-solid fa-feather-pointed"></i> Erato Memory</b>
+                    <b><i class="fa-solid fa-feather-pointed"></i> Erato Memory <span class="em-ver">v${VERSION}</span></b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -2908,7 +2909,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         <div id="em_panel" class="em-panel" style="display:none">
             <div class="em-head">
                 <div id="em_back" class="em-back fa-solid fa-chevron-left interactable" tabindex="0" style="display:none"></div>
-                <div class="em-title"><span id="em_head_title"><i class="fa-solid fa-feather-pointed"></i> 记忆</span></div>
+                <div class="em-title"><span id="em_head_title"><i class="fa-solid fa-feather-pointed"></i> 记忆</span> <span class="em-ver">v${VERSION}</span></div>
                 <div id="em_close" class="em-close fa-solid fa-xmark interactable" tabindex="0"></div>
             </div>
             <div id="em_view_mem" class="em-view">
@@ -4025,7 +4026,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
-        prehistoryText, panelAction,
+        prehistoryText, panelAction, VERSION,
     };
 
     jQuery(() => {
