@@ -1201,6 +1201,28 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(w.status, 'ok');
     });
 
+    console.log('== 裁剪：A 与 B/C 同一把尺（§20.31） ==');
+    t('权重：A 半衰 200 楼、B 60 楼，老到 150 楼以上的 A 低于刚发生的 B，100 楼内的 A 仍高于它；老 B 永远先走', () => {
+        assert.ok(D.weightAt('A', 0, 101) > D.weightAt('B', 100, 101), '100 楼的 A 仍高于新 B');
+        assert.ok(D.weightAt('A', 0, 301) < D.weightAt('B', 300, 301), '300 楼的 A 让位给新 B');
+        assert.ok(D.weightAt('B', 200, 301) < D.weightAt('A', 0, 301), '100 楼的老 B 比 300 楼的老 A 更先走');
+        assert.strictEqual(D.weightAt('S', 0, 9999), Infinity, 'S 永不丢');
+    });
+    t('注入裁剪：预算不够时最老的 A 先于新 B 被裁（不再「非 A 丢完才丢 A」）', () => {
+        const d = D.getData();
+        const n0 = chat.length, saved = { max: D.settings.maxInjectChars, ents: d.entries.slice() };
+        for (let i = n0; i < n0 + 380; i++) chat.push(mkMsg(i, i % 2 === 1));
+        const len = chat.length;
+        const mk = (id, idx, grade) => ({ id, win: 'w_' + id, ord: 0, status: 'ok', title: id, summary: id + ' 的摘要文字，用来占预算的一段普通叙述', grade, type: 'plot', characters: [], src: { idx, floors: [idx], dates: [chat[idx].send_date] } });
+        d.entries.push(mk('oldA', 2, 'A'), mk('newB', len - 12, 'B'), mk('oldB', 40, 'B'));
+        D.settings.maxInjectChars = 1;
+        const b = D.buildBlock({ dry: true });
+        const at = id => b.droppedIds.indexOf(id);
+        assert.ok(at('oldA') >= 0 && at('newB') >= 0 && at('oldB') >= 0, '三条都该被裁：' + JSON.stringify(b.droppedIds));
+        assert.ok(at('oldB') < at('oldA') && at('oldA') < at('newB'), '裁剪顺序应为 oldB → oldA → newB：' + JSON.stringify(b.droppedIds));
+        chat.length = n0; d.entries = saved.ents; D.settings.maxInjectChars = saved.max;
+    });
+
     console.log('== 设置迁移：楼数单位 ==');
     t('v0.3.1 旧设置（AI 楼计）加载时翻倍；新装用新默认；已迁移的不重复翻倍；v0.2 直升不把默认值翻倍；v0.3 设置补齐 recall 组', () => {
         const load = saved => { ctx.extensionSettings = saved ? { 'erato-memory': saved } : {}; new Function(src)(); return ctx.extensionSettings['erato-memory']; };

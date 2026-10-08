@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.18';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.19';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -1727,10 +1727,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         const droppedIds = [];
         let dropped = 0;
         while (pool.length && size() > budget) {
-            // 先丢权重最低的非 A（保底行按 B 算），非 A 丢完再丢 A；S 永不丢
+            // 丢权重最低的一条：A 与 B/C 同一把尺（等级基数 × 时间衰减，保底行按 B 算），老到约 150 楼以上的 A 才会让位给刚发生的 B，
+            // 这样远景层才是真正的「更早时期」而不是「同一时期里不够重要的」；S/钉选不在 pool 里，永不丢（§20.31）
             let k = -1, kw = Infinity;
-            pool.forEach((p, i) => { if (p.grade === 'A') return; const w = p.e ? weight(p.e, len) : weightAt('B', p.idx, len); if (w < kw) { kw = w; k = i; } });
-            if (k < 0) k = pool.findIndex(p => p.grade === 'A');
+            pool.forEach((p, i) => { const w = p.e ? weight(p.e, len) : weightAt('B', p.idx, len); if (w < kw) { kw = w; k = i; } });
             if (k < 0) break;
             const [gone] = pool.splice(k, 1);
             dropped++;
@@ -4022,7 +4022,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, splitName, rosterText, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
         raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, entHtml, valMark, lockCount, applyEntryEdit, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX, PERSON_ONCE,
-        visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run,
+        visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run, weight, weightAt,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
