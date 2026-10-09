@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.21';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.22';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -233,6 +233,8 @@
         for (const p of d.people) if (p.state === undefined) p.state = '';
         // v0.4.21：已存档案里的相对称谓别称（「我妈/你妈」）清掉；已经被它合并成一个的人物代码拆不开，由用户在面板里手改
         for (const p of d.people) if (Array.isArray(p.aliases) && p.aliases.some(isRelative)) p.aliases = p.aliases.filter(a => !isRelative(a));
+        // v0.4.22：旧版「后写覆盖」留下的乱序（旧窗失败补跑把新值盖回旧值）换回主位；新写入规则下不再产生，此后空跑
+        repairOrder(d);
         return d;
     }
 
@@ -824,15 +826,19 @@ C = 日常、闲聊、氛围、无后果的互动。
         const HIST_MAX = 3;
         // 覆盖前把旧值压进 hist（最近 3 版），来源楼被删时能退回上一版；手改过的字段（manual）副模型不覆盖；只写一次的字段（PERSON_ONCE）有值后不换；
         // 「（未知）」「不详」这类占位词按空处理：不入档、不注入、不占只写一次的名额；knows 累加不覆盖（见 mergeKnows）
+        // v0.4.22 写入按楼号不按先后：窗口失败重试 / 手动重跑旧窗时旧窗最后落笔，楼号比主位小的值不覆盖，只按楼号插进 hist（真机：0-39 窗补跑把十二月的现状盖回十月）
         const setF = (ent, key, val, idx) => {
             let v = String(val || '').trim();
             if (!v || PLACEHOLDER_RX.test(v) || ent.f[key]?.manual) return;
             const old = ent.f[key];
             if (key === 'knows' && old?.v) v = mergeKnows(old.v, v);
-            if (old?.v === v) { old.idx = idx; old.date = dateOf(idx); return; }
+            const earlier = !!(old?.v && !notEarlier(idx, old.idx));
+            if (old?.v === v) { if (!earlier) { old.idx = idx; old.date = dateOf(idx); } return; }
             if (old?.v && PERSON_ONCE.includes(key)) return;
-            const hist = old?.v ? [{ v: old.v, idx: old.idx, date: old.date }, ...(old.hist || [])].slice(0, HIST_MAX) : (old?.hist || []);
-            ent.f[key] = { v, idx, date: dateOf(idx), hist };
+            if (earlier && key !== 'knows') { old.hist = pushHist(old.hist, { v, idx, date: dateOf(idx) }, HIST_MAX); return; }
+            const ni = earlier ? old.idx : idx;   // knows 是并集，内容照并，来源楼保留主位的
+            const hist = old?.v ? pushHist(old.hist, { v: old.v, idx: old.idx, date: old.date }, HIST_MAX) : (old?.hist || []);
+            ent.f[key] = { v, idx: ni, date: dateOf(ni), hist };
         };
         // 性别当身份护栏：档案里已有性别、本窗报的相反 → 不合并，记冲突（面板标 ⚠），本窗对此人的 people 更新跳过；报的与档案相同则清冲突
         const clashed = new Set();
@@ -874,8 +880,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         const setRelation = (v, idx) => {
             if (!v || PLACEHOLDER_RX.test(v) || data.relation?.manual) return;
             const old = data.relation || {};
-            if (old.v === v) { old.idx = idx; old.date = dateOf(idx); return; }
-            const hist = old.v ? [{ v: old.v, idx: old.idx, date: old.date }, ...(old.hist || [])].slice(0, HIST_MAX) : (old.hist || []);
+            const earlier = !!(old.v && !notEarlier(idx, old.idx));
+            if (old.v === v) { if (!earlier) { old.idx = idx; old.date = dateOf(idx); } return; }
+            if (earlier) { old.hist = pushHist(old.hist, { v, idx, date: dateOf(idx) }, HIST_MAX); return; }
+            const hist = old.v ? pushHist(old.hist, { v: old.v, idx: old.idx, date: old.date }, HIST_MAX) : (old.hist || []);
             data.relation = { v, idx, date: dateOf(idx), hist };
         };
         if (rel) setRelation(rel, lastIdx);
@@ -925,8 +933,10 @@ C = 日常、闲聊、氛围、无后果的互动。
                 if (!to || !text || norm(to) === norm(ent.name) || ent.views[to]?.manual) continue;
                 const trend = TRENDS.includes(String(v.trend || '').trim()) ? String(v.trend).trim() : '';
                 const old = ent.views[to];
-                if (old?.v === text && old.trend === trend) { old.idx = idx; old.date = dateOf(idx); continue; }
-                const hist = old?.v ? [{ v: old.v, trend: old.trend, idx: old.idx, date: old.date }, ...(old.hist || [])].slice(0, HIST_MAX) : (old?.hist || []);
+                const earlier = !!(old?.v && !notEarlier(idx, old.idx));
+                if (old?.v === text && old.trend === trend) { if (!earlier) { old.idx = idx; old.date = dateOf(idx); } continue; }
+                if (earlier) { old.hist = pushHist(old.hist, { v: text, trend, idx, date: dateOf(idx) }, HIST_MAX); continue; }
+                const hist = old?.v ? pushHist(old.hist, { v: old.v, trend: old.trend, idx: old.idx, date: old.date }, HIST_MAX) : (old?.hist || []);
                 ent.views[to] = { v: text, trend, idx, date: dateOf(idx), hist };
             }
             seenThisWin.add(ent.id);
@@ -976,13 +986,49 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (ent.tierIdx != null && idx != null && idx <= ent.tierIdx) return;
         ent.tier = to;
     }
-    // 状态：最新一窗为准；面板手改过（stateLock）的不动；旧状态压进 stateHist（来源楼被删时退回）
+    // 写入按楼号不按先后（v0.4.22）：notEarlier = 新楼号不早于主位楼号（主位没楼号算早于一切）；pushHist = 按楼号降序插进历史并截到 max
+    const notEarlier = (idx, cur) => cur == null || (idx != null && idx >= cur);
+    const pushHist = (hist, rec, max = 3) => [...(hist || []), rec].sort((a, b) => (b.idx ?? -1) - (a.idx ?? -1)).slice(0, max);
+    // 状态：楼号最新一窗为准；面板手改过（stateLock）的不动；旧状态压进 stateHist（来源楼被删时退回）；楼号更早的窗后落笔只进 stateHist
     function setState(ent, val, allowed, idx = null, date = '') {
         const s = String(val || '').trim();
         if (!s || !allowed.includes(s) || ent.stateLock) return;
-        if (ent.state === s) { if (idx != null) { ent.stateIdx = idx; ent.stateDate = date; } return; }
-        if (ent.state) ent.stateHist = [{ s: ent.state, idx: ent.stateIdx ?? null, date: ent.stateDate || '' }, ...(ent.stateHist || [])].slice(0, 3);
+        const earlier = !!(ent.state && !notEarlier(idx, ent.stateIdx));
+        if (ent.state === s) { if (idx != null && !earlier) { ent.stateIdx = idx; ent.stateDate = date; } return; }
+        if (earlier) { ent.stateHist = pushHist(ent.stateHist, { s, idx, date }); return; }
+        if (ent.state) ent.stateHist = pushHist(ent.stateHist, { s: ent.state, idx: ent.stateIdx ?? null, date: ent.stateDate || '' });
         ent.state = s; ent.stateIdx = idx; ent.stateDate = date;
+    }
+    // 加载修复（v0.4.22）：旧版「后写覆盖」留下的乱序——历史里有楼号比主位大的版本 → 换回主位，主位退进历史；手改的不动，knows 是并集不换。改完后乱序不再产生，此后是空跑
+    function repairOrder(d) {
+        let n = 0;
+        const fix = (holder, key) => {
+            const c = holder[key];
+            if (!c?.v || c.manual || key === 'knows' || !Array.isArray(c.hist) || !c.hist.length) return;
+            const best = c.hist.reduce((m, h) => (!m || (h.idx ?? -1) > (m.idx ?? -1)) ? h : m, null);
+            if (best && (best.idx ?? -1) > (c.idx ?? -1)) {
+                const rest = c.hist.filter(h => h !== best);
+                const { hist, ...cur } = c;
+                holder[key] = { ...best, hist: pushHist(rest, cur) };
+                n++;
+            }
+        };
+        for (const list of [d.people, d.items]) for (const x of list) {
+            for (const k of Object.keys(x.f || {})) fix(x.f, k);
+            for (const k of Object.keys(x.views || {})) fix(x.views, k);
+            if (x.state && !x.stateLock && Array.isArray(x.stateHist) && x.stateHist.length) {
+                const best = x.stateHist.reduce((m, h) => (!m || (h.idx ?? -1) > (m.idx ?? -1)) ? h : m, null);
+                if (best && (best.idx ?? -1) > (x.stateIdx ?? -1)) {
+                    const rest = x.stateHist.filter(h => h !== best);
+                    x.stateHist = pushHist(rest, { s: x.state, idx: x.stateIdx ?? null, date: x.stateDate || '' });
+                    x.state = best.s; x.stateIdx = best.idx; x.stateDate = best.date || '';
+                    n++;
+                }
+            }
+        }
+        for (const key of Object.keys(PRINCIPAL_FIELDS)) for (const k of Object.keys(d.principal?.[key]?.f || {})) fix(d.principal[key].f, k);
+        if (d.relation?.v) { const h = { relation: d.relation }; fix(h, 'relation'); d.relation = h.relation; }
+        return n;
     }
 
     // 回退：把「来源楼已死」的档案值退回最近一个来源楼还活着的旧版，退无可退就清掉；手改的值不动只标待核。
@@ -4056,7 +4102,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
-        prehistoryText, panelAction, VERSION,
+        prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist,
     };
 
     jQuery(() => {

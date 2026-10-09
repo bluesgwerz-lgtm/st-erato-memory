@@ -530,12 +530,14 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(data.principal.user.f.role.v, '副总监', '主角现状手改锁：副模型不覆盖');
         assert.strictEqual(data.principal.char.f.knows.v, '知道用户已婚；知道用户有个弟弟；新秘密', 'knows 重报已有条不重复，新条追加');
         delete data.principal.user.f.role.manual;
-        D.mergeEntities(data, { relation: '副模型关系', people: [{ name: '陆衍', role: '副模型身份', age: '28', views: [{ to: '用户', v: '副模型看法' }, { to: '周远', v: '新看法' }], floor: 2 }] }, { floors: [2] }, new Map([[2, chat[2]]]), []);
+        // v0.4.22 写入按楼号：档案值来自前面测试写过的更高楼，这里从当前最末楼重报（2 楼后落笔不再覆盖，那是乱序测试的事）
+        const top = chat.length - 1;
+        D.mergeEntities(data, { relation: '副模型关系', people: [{ name: '陆衍', role: '副模型身份', age: '28', views: [{ to: '用户', v: '副模型看法' }, { to: '周远', v: '新看法' }] }] }, { floors: [top] }, new Map([[top, chat[top]]]), []);
         assert.strictEqual(lu.f.role.v, '手改身份'); assert.strictEqual(lu.f.age.v, '28', '未锁字段照常更新');
         assert.strictEqual(lu.views['用户'].v, '手改看法'); assert.strictEqual(lu.views['周远'].v, '新看法');
         assert.strictEqual(data.relation.v, '手改关系');
         delete lu.f.role.manual; delete lu.views['用户'].manual; data.relation.manual = false; delete lu.f.age;
-        D.mergeEntities(data, { relation: '副模型关系', people: [{ name: '陆衍', role: '邻居', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }], floor: 19 }] }, { floors: [19] }, new Map([[19, chat[19]]]), []);
+        D.mergeEntities(data, { relation: '副模型关系', people: [{ name: '陆衍', role: '邻居', views: [{ to: '用户', v: '越来越依赖', trend: '亲密' }, { to: '周远', v: '提防', trend: '反感' }] }] }, { floors: [top] }, new Map([[top, chat[top]]]), []);
         assert.strictEqual(lu.f.role.v, '邻居'); assert.strictEqual(data.relation.v, '副模型关系');
     });
     t('主角现状面板：两人关系/态度两行输入 + user/char 两张钉卡，只列有值的白名单键，手改字段带锁', () => {
@@ -900,6 +902,9 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
 
     console.log('== 档位 / 状态：只升不降、手改锁、自动升配、终态物件、活跃度、筛选 ==');
     const merge = obj => D.mergeEntities(data, obj, { floors: [2] }, new Map([[2, chat[2]]]), []);
+    // v0.4.22 写入按楼号：状态类字段的档案值来自前面测试写过的更高楼，要改它得从当前最末楼报，2 楼后落笔不再覆盖（那是乱序测试的事）
+    const topFloor = () => chat.length - 1;
+    const mergeTop = obj => D.mergeEntities(data, obj, { floors: [topFloor()] }, new Map([[topFloor(), chat[topFloor()]]]), []);
     t('相对称谓（我妈/你妈）不当别称、不拿来匹配旧档案、不单独建档（v0.4.21）', () => {
         assert.ok(D.isRelative('我妈') && D.isRelative('你爸') && D.isRelative('他哥哥') && D.isRelative('我们老师') && D.isRelative('（你妈）'), '相对称谓识别');
         assert.ok(!D.isRelative('林昭的母亲') && !D.isRelative('陆母') && !D.isRelative('王秀英') && !D.isRelative('妈妈'), '带名字的、单独亲属词不算');
@@ -927,6 +932,46 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(D.mergeKnows('不知旧情', '完全不知二人偷情'), '不知旧情；完全不知二人偷情', '互不包含照旧各留');
         assert.strictEqual(D.mergeKnows('a；b', 'b；a'), 'a；b', '一字不差去重不变');
     });
+    t('写入按楼号不按先后：旧窗后落笔不盖新值只进历史，同楼或更晚照常覆盖；关系/看法/状态同一把尺，知情照并（v0.4.22）', () => {
+        const by = new Map([[2, chat[2]], [5, chat[5]]]);
+        const m = (obj, floors) => D.mergeEntities(data, obj, { floors }, by, []);
+        const rel0 = data.relation;
+        data.relation = { v: '', idx: null, date: '', hist: [] };   // 前面测试把关系写到了更高楼，这里从空开始
+        m({ relation: '十二月关系', people: [{ name: '乱序甲', role: '测试', stance: '十二月态', state: '离场', knows: '甲知新', floor: 5, views: [{ to: '用户', v: '十二月看法', trend: '亲密' }] }] }, [5]);
+        m({ relation: '十月关系', people: [{ name: '乱序甲', stance: '十月态', state: '在场', knows: '甲知旧', floor: 2, views: [{ to: '用户', v: '十月看法', trend: '陌生' }] }] }, [2]);
+        const a = data.people.find(p => p.name === '乱序甲');
+        assert.strictEqual(D.fv(a, 'stance'), '十二月态', '旧窗后落笔不盖');
+        assert.strictEqual(a.f.stance.idx, 5); assert.strictEqual(a.f.stance.hist[0].v, '十月态', '旧值进历史：' + JSON.stringify(a.f.stance.hist));
+        assert.strictEqual(a.state, '离场'); assert.strictEqual(a.stateHist[0].s, '在场', '状态同尺');
+        assert.strictEqual(a.views['用户'].v, '十二月看法'); assert.strictEqual(a.views['用户'].hist[0].v, '十月看法', '看法同尺');
+        assert.strictEqual(data.relation.v, '十二月关系'); assert.strictEqual(data.relation.hist[0].v, '十月关系', '关系同尺');
+        assert.strictEqual(D.fv(a, 'knows'), '甲知新；甲知旧', '知情是并集，顺序乱了也照并'); assert.strictEqual(a.f.knows.idx, 5, '知情来源楼保留主位的');
+        // 同值但更早的窗：不把楼号往回拨
+        m({ people: [{ name: '乱序甲', stance: '十二月态', floor: 2 }] }, [2]);
+        assert.strictEqual(a.f.stance.idx, 5, '同值更早不回拨楼号');
+        // 同楼重跑 / 更晚的窗照常覆盖
+        m({ people: [{ name: '乱序甲', stance: '十二月改', floor: 5 }] }, [5]);
+        assert.strictEqual(D.fv(a, 'stance'), '十二月改', '同楼重跑覆盖');
+        assert.strictEqual(a.f.stance.hist[0].v, '十二月态'); assert.strictEqual(a.f.stance.hist[1].v, '十月态', '历史按楼号降序');
+        data.people = data.people.filter(p => p !== a); data.relation = rel0;
+    });
+    t('加载修复：旧版留下的乱序（历史里楼号比主位大）换回主位，主位退进历史；字段/关系/状态三处，手改的不动（v0.4.22）', () => {
+        const a = { id: 'p_ord', name: '乱序乙', aliases: [], tier: '配', seen: 1, first_idx: 2, last_idx: 5, views: {}, state: '在场', stateIdx: 2, stateDate: 'd2', stateHist: [{ s: '离场', idx: 5, date: 'd5' }],
+            f: { stance: { v: '十月态', idx: 2, date: 'd2', hist: [{ v: '十二月态', idx: 5, date: 'd5' }, { v: '九月态', idx: 1, date: 'd1' }] }, role: { v: '手改', idx: 2, date: 'd2', manual: true, hist: [{ v: '副模型', idx: 5, date: 'd5' }] } } };
+        data.people.push(a);
+        const rel0 = data.relation;
+        data.relation = { v: '十月关系', idx: 2, date: 'd2', hist: [{ v: '十二月关系', idx: 5, date: 'd5' }] };
+        assert.strictEqual(D.repairOrder(data), 3, '字段 + 状态 + 关系各修一处');
+        assert.strictEqual(D.fv(a, 'stance'), '十二月态'); assert.strictEqual(a.f.stance.idx, 5);
+        assert.deepStrictEqual(a.f.stance.hist.map(h => h.v), ['十月态', '九月态'], '主位退进历史、降序');
+        assert.strictEqual(D.fv(a, 'role'), '手改', '手改不动');
+        assert.strictEqual(a.state, '离场'); assert.strictEqual(a.stateHist[0].s, '在场');
+        assert.strictEqual(data.relation.v, '十二月关系'); assert.strictEqual(data.relation.hist[0].v, '十月关系');
+        assert.strictEqual(D.repairOrder(data), 0, '幂等');
+        D.getData();
+        assert.strictEqual(D.fv(a, 'stance'), '十二月态', '加载时跑过不退回');
+        data.people = data.people.filter(p => p !== a); data.relation = rel0;
+    });
     t('档位只升不降；手改锁住后副 AI 报更高档也不动；选回未定即解锁', () => {
         const lu = data.people.find(p => p.name === '陆衍');
         merge({ cast: [{ name: '陆衍', tier: '龙套', seen: [2] }] });
@@ -940,12 +985,12 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     });
     t('状态最新为准、手改锁；物件关键性只升不降', () => {
         const lu = data.people.find(p => p.name === '陆衍');
-        merge({ people: [{ name: '陆衍', state: '离场', floor: 2 }] });
+        mergeTop({ people: [{ name: '陆衍', state: '离场' }] });
         assert.strictEqual(lu.state, '离场');
-        merge({ people: [{ name: '陆衍', state: '乱写', floor: 2 }] });
+        mergeTop({ people: [{ name: '陆衍', state: '乱写' }] });
         assert.strictEqual(lu.state, '离场', '不在枚举里的忽略');
         lu.stateLock = true;
-        merge({ people: [{ name: '陆衍', state: '死亡', floor: 2 }] });
+        mergeTop({ people: [{ name: '陆衍', state: '死亡' }] });
         assert.strictEqual(lu.state, '离场', '手改锁住不动');
         lu.state = '在场'; lu.stateLock = false;
         const bag = data.items.find(i => i.name === '牛皮笔袋');
@@ -960,7 +1005,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
     });
     t('终态物件：注入降成一行「已了结」，不再出完整卡', () => {
         const bag = data.items.find(i => i.name === '牛皮笔袋');
-        merge({ items: [{ name: '牛皮笔袋', state: '已使用', floor: 2 }] });
+        mergeTop({ items: [{ name: '牛皮笔袋', state: '已使用' }] });
         assert.strictEqual(bag.state, '已使用');
         const text = D.buildBlock().text;
         assert.ok(text.includes('已了结：牛皮笔袋（已使用·陆衍）'), text);
