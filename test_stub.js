@@ -900,6 +900,33 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
 
     console.log('== 档位 / 状态：只升不降、手改锁、自动升配、终态物件、活跃度、筛选 ==');
     const merge = obj => D.mergeEntities(data, obj, { floors: [2] }, new Map([[2, chat[2]]]), []);
+    t('相对称谓（我妈/你妈）不当别称、不拿来匹配旧档案、不单独建档（v0.4.21）', () => {
+        assert.ok(D.isRelative('我妈') && D.isRelative('你爸') && D.isRelative('他哥哥') && D.isRelative('我们老师') && D.isRelative('（你妈）'), '相对称谓识别');
+        assert.ok(!D.isRelative('林昭的母亲') && !D.isRelative('陆母') && !D.isRelative('王秀英') && !D.isRelative('妈妈'), '带名字的、单独亲属词不算');
+        const n0 = data.people.length;
+        merge({ cast: [{ name: '林昭的母亲', aliases: ['我妈'], tier: '配', seen: [2] }], people: [{ name: '林昭的母亲', aliases: ['我妈'], role: '林昭母亲', sex: '女', floor: 2 }] });
+        const lm = data.people.find(p => p.name === '林昭的母亲');
+        assert.ok(lm && !lm.aliases.includes('我妈'), '「我妈」不入别称：' + JSON.stringify(lm?.aliases));
+        // 另一个人说的「我妈」：带着「我妈」别称来，不能命中林昭的母亲、把身份覆盖成程睿母亲
+        merge({ cast: [{ name: '程睿母亲', aliases: ['我妈', '你妈'], tier: '配', seen: [2] }], people: [{ name: '程睿母亲', aliases: ['我妈'], role: '程睿的母亲', sex: '女', floor: 2 }] });
+        const cm = data.people.find(p => p.name === '程睿母亲');
+        assert.ok(cm && cm !== lm && D.fv(lm, 'role') === '林昭母亲', '两个人不合并、旧档案身份不被覆盖');
+        assert.strictEqual(data.people.length, n0 + 2);
+        // 名字本身就是相对称谓 → 不建档
+        merge({ cast: [{ name: '我妈', tier: '配', seen: [2] }] });
+        assert.ok(!data.people.find(p => p.name === '我妈'), '「我妈」不单独建档');
+        // 存量档案里的相对称谓别称在加载时清掉
+        lm.aliases.push('你妈');
+        D.getData();
+        assert.ok(!lm.aliases.includes('你妈'), '加载时清掉存量相对称谓别称');
+        data.people = data.people.filter(p => p !== lm && p !== cm);
+    });
+    t('知情累加包含去重：短句被长句包含只留长的，原位替换；措辞各异的仍各留（v0.4.21）', () => {
+        assert.strictEqual(D.mergeKnows('不知林昭存在；沈行知常失约', '不知林昭存在及沈行知的背叛'), '不知林昭存在及沈行知的背叛；沈行知常失约', '新句包旧句 → 替换旧句原位');
+        assert.strictEqual(D.mergeKnows('不知林昭存在及沈行知的背叛', '不知林昭存在'), '不知林昭存在及沈行知的背叛', '旧句包新句 → 不加');
+        assert.strictEqual(D.mergeKnows('不知旧情', '完全不知二人偷情'), '不知旧情；完全不知二人偷情', '互不包含照旧各留');
+        assert.strictEqual(D.mergeKnows('a；b', 'b；a'), 'a；b', '一字不差去重不变');
+    });
     t('档位只升不降；手改锁住后副 AI 报更高档也不动；选回未定即解锁', () => {
         const lu = data.people.find(p => p.name === '陆衍');
         merge({ cast: [{ name: '陆衍', tier: '龙套', seen: [2] }] });

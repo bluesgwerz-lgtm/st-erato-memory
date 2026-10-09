@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.20';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.21';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -60,6 +60,10 @@
     const TRENDS = ['破裂', '厌恶', '反感', '陌生', '投缘', '亲密', '交融'];
     // 副模型不知道时爱填的占位词：整段只有这个的字段视为没写（模板也要求不写这个键，这里是兜底）
     const PLACEHOLDER_RX = /^[（(【\[]?\s*(未知|不详|未提及|未明确|未描写|未说明|不明|待定|无|暂无|N\/A|none|null|unknown)\s*[）)】\]]?$/i;
+    // 相对称谓：「我妈」「你爸」「他哥」「我们老师」这类词随说话人变，不是某个人的名字——不入别称、不拿来匹配旧档案、不单独建档
+    // （1009 真机样本：程睿一楼说的「我妈」按别称命中了林昭母亲的档案，两个人合成一个、身份被覆盖成「程睿母亲」）
+    const RELATIVE_RX = /^[（(]?(我|你|他|她|咱|您|我们|你们|他们|咱们|自己)(的)?(妈|妈妈|母亲|老妈|爸|爸爸|父亲|老爸|爹|娘|爹娘|父母|爷|爷爷|奶|奶奶|外公|外婆|姥爷|姥姥|哥|哥哥|姐|姐姐|弟|弟弟|妹|妹妹|老婆|老公|媳妇|丈夫|妻子|夫人|先生|儿子|女儿|孩子|家人|朋友|闺蜜|老师|领导|上司|老板|同事|同学|师兄|师弟|师姐|师妹|秘书|司机|助理|未婚夫|未婚妻|男朋友|女朋友|男友|女友|对象|前任|前夫|前妻)[）)]?$/;
+    const isRelative = s => RELATIVE_RX.test(String(s || '').trim());
     const RAW_LOG_MAX = 8;      // 保留最近几次副 API 原始回复供诊断（一次总结三四个窗口各带一次重试也能放下）
     const RAW_LOG_CHARS = 12000;    // 每条截多少字：40 楼窗口的完整 JSON 也要存得下，否则「查截断」的记录自己先被截断
     // 结束哨兵：副模型在 JSON/正文之后另起一行输出它。缺哨兵 = 截断，不管 finish_reason 报什么（供应商会错报）
@@ -227,6 +231,8 @@
             if (it.state === undefined) it.state = '';
         }
         for (const p of d.people) if (p.state === undefined) p.state = '';
+        // v0.4.21：已存档案里的相对称谓别称（「我妈/你妈」）清掉；已经被它合并成一个的人物代码拆不开，由用户在面板里手改
+        for (const p of d.people) if (Array.isArray(p.aliases) && p.aliases.some(isRelative)) p.aliases = p.aliases.filter(a => !isRelative(a));
         return d;
     }
 
@@ -757,7 +763,19 @@ C = 日常、闲聊、氛围、无后果的互动。
     const asArr = v => Array.isArray(v) ? v.map(x => String(x).trim()).filter(Boolean) : [];
     const norm = s => String(s || '').trim().toLowerCase();
     // 知情范围累加：旧值与新值按「；」拆条去重合并（副模型重写全量也不会重复），超过 KNOWS_MAX 条丢最老的
-    const mergeKnows = (oldV, v) => { const parts = []; for (const s of `${oldV}；${v}`.split(/[；;\n]/)) { const t = s.trim(); if (t && !parts.some(p => norm(p) === norm(t))) parts.push(t); } return parts.slice(-KNOWS_MAX).join('；'); };
+    // 知情累加：按「；」拆开并进旧值。去重两层：一字不差的丢；一句包含另一句的只留长的（「不知林昭存在」⊂「不知林昭存在及沈行知的背叛」，
+    // 1009 真机样本同一人三条）——新句包旧句就替换旧句原位，旧句包新句就不加；措辞各异的近义句代码不认，靠副模型「只写本段新知道的」
+    const mergeKnows = (oldV, v) => {
+        const parts = [];
+        for (const s of `${oldV}；${v}`.split(/[；;\n]/)) {
+            const t = s.trim(); if (!t) continue;
+            const n = norm(t);
+            const i = parts.findIndex(p => { const q = norm(p); return q === n || q.includes(n) || n.includes(q); });
+            if (i < 0) parts.push(t);
+            else if (n.length > norm(parts[i]).length) parts[i] = t;
+        }
+        return parts.slice(-KNOWS_MAX).join('；');
+    };
     // 事件密度下限：每 minEventsPer 个 AI 楼至少 1 条；0 = 不核验
     const minEventsFor = n => { const per = Number(settings.minEventsPer) || 0; return per > 0 ? Math.max(1, Math.ceil(n / per)) : 1; };
 
@@ -829,13 +847,14 @@ C = 日常、闲聊、氛围、无后果的互动。
         const me = norm(ctx.name1), them = norm(ctx.name2);
         const isLead = n => n === me || n === them;
         const touch = (ent, idx) => { ent.last_idx = Math.max(ent.last_idx || 0, idx); if (ent.first_idx == null || idx < ent.first_idx) { ent.first_idx = idx; ent.first_date = dateOf(idx); } ent.updated_at = Date.now(); if (ent.lost) delete ent.lost; };
-        const addAliases = (ent, list) => { for (const a of list) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a)) && !isLead(norm(a))) ent.aliases.push(a); };
-        // 找到或新建；若按别称命中且模型明确把档案里的旧名列为别称，则升级为真名（「陆母」→「王秀英」）；墓碑里的名字不建档
+        const addAliases = (ent, list) => { for (const a of list) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a)) && !isLead(norm(a)) && !isRelative(a)) ent.aliases.push(a); };
+        // 找到或新建；若按别称命中且模型明确把档案里的旧名列为别称，则升级为真名（「陆母」→「王秀英」）；墓碑里的名字不建档；
+        // 相对称谓（「我妈」）不当名字建档、不拿来匹配旧档案
         const upsertPerson = (rawName, rawAliases, idx) => {
             const sp = splitName(rawName);
-            const name = sp.name, aliases = [...rawAliases, ...sp.aliases];
+            const name = sp.name, aliases = [...rawAliases, ...sp.aliases].filter(a => !isRelative(a));
             const n = norm(name);
-            if (!n || isLead(n)) return null;
+            if (!n || isLead(n) || isRelative(name)) return null;
             if (isTomb(data, 'p', name) || aliases.some(a => isTomb(data, 'p', a))) return null;
             let ent = findPerson(data, name);
             if (!ent) {
@@ -1030,15 +1049,15 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (e.status !== 'ok') continue;
             const idx = e.src?.idx ?? 0;
             for (const raw of (e.characters || [])) {
-                const sp = splitName(raw), name = sp.name;
+                const sp = splitName(raw), name = sp.name, aliases = sp.aliases.filter(a => !isRelative(a));
                 const n = norm(name);
-                if (!n || n === me || n === them || isTomb(data, 'p', name)) continue;
-                let ent = findPerson(data, name) || sp.aliases.map(a => findPerson(data, a)).find(Boolean);
+                if (!n || n === me || n === them || isRelative(name) || isTomb(data, 'p', name)) continue;
+                let ent = findPerson(data, name) || aliases.map(a => findPerson(data, a)).find(Boolean);
                 if (!ent) {
                     ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                     data.people.push(ent);
                 }
-                for (const a of sp.aliases) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a))) ent.aliases.push(a);
+                for (const a of aliases) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a))) ent.aliases.push(a);
                 ent.seen = (ent.seen || 0) + 1;
                 if (idx < ent.first_idx) ent.first_idx = idx;
                 ent.last_idx = Math.max(ent.last_idx || 0, idx);
@@ -4030,7 +4049,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     window.eratoMemory_debug = {
         extractContent, extractRecap, parseJson, buildBlock, buildMessages, reconcile, ingest, summarizeAll, fetchModels,
         getData, counts, uncoveredFloors, retryWindows, planWindows, splitWindow, runWindow, applyWindowResult, checkResult, mergeEntities, splitName, rosterText, backfillPeople, minEventsFor, coverage, floorSpan, spanOf, winFloors,
-        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, entHtml, valMark, lockCount, applyEntryEdit, mergeKnows, PRINCIPAL_FIELDS, KNOWS_MAX, PERSON_ONCE,
+        raiseTier, promote, setState, heatOf, matchEnt, entFilter, principalLines, principalHtml, entHtml, valMark, lockCount, applyEntryEdit, mergeKnows, isRelative, fv, PRINCIPAL_FIELDS, KNOWS_MAX, PERSON_ONCE,
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run, weight, weightAt,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
