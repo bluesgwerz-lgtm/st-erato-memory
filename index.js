@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.22';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.23';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -999,19 +999,20 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (ent.state) ent.stateHist = pushHist(ent.stateHist, { s: ent.state, idx: ent.stateIdx ?? null, date: ent.stateDate || '' });
         ent.state = s; ent.stateIdx = idx; ent.stateDate = date;
     }
-    // 加载修复（v0.4.22）：旧版「后写覆盖」留下的乱序——历史里有楼号比主位大的版本 → 换回主位，主位退进历史；手改的不动，knows 是并集不换。改完后乱序不再产生，此后是空跑
+    // 加载修复（v0.4.22）：旧版「后写覆盖」留下的乱序——历史里有楼号比主位大的版本 → 换回主位，主位退进历史；手改的不动，knows 是并集只拨楼号不换内容（v0.4.23）。改完后乱序不再产生，此后是空跑
     function repairOrder(d) {
         let n = 0;
         const fix = (holder, key) => {
             const c = holder[key];
-            if (!c?.v || c.manual || key === 'knows' || !Array.isArray(c.hist) || !c.hist.length) return;
+            if (!c?.v || c.manual || !Array.isArray(c.hist) || !c.hist.length) return;
             const best = c.hist.reduce((m, h) => (!m || (h.idx ?? -1) > (m.idx ?? -1)) ? h : m, null);
-            if (best && (best.idx ?? -1) > (c.idx ?? -1)) {
-                const rest = c.hist.filter(h => h !== best);
-                const { hist, ...cur } = c;
-                holder[key] = { ...best, hist: pushHist(rest, cur) };
-                n++;
-            }
+            if (!best || (best.idx ?? -1) <= (c.idx ?? -1)) return;
+            // knows 是并集：内容不换（历史版本比现值少），只把来源楼拨回历史里最大的那个（v0.4.23；1009 真机样本：知情栏含十一月底的事却标 #38）
+            if (key === 'knows') { c.idx = best.idx; c.date = best.date || c.date; n++; return; }
+            const rest = c.hist.filter(h => h !== best);
+            const { hist, ...cur } = c;
+            holder[key] = { ...best, hist: pushHist(rest, cur) };
+            n++;
         };
         for (const list of [d.people, d.items]) for (const x of list) {
             for (const k of Object.keys(x.f || {})) fix(x.f, k);
@@ -1617,15 +1618,22 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
     const weightAt = (grade, idx, len) => GRADE_BASE[grade] * Math.pow(0.5, Math.max(0, len - 1 - idx) / GRADE_HALFLIFE[grade]);
 
+    // 拼接前把副模型交上来的一段压成一行、剥掉尾句号（v0.4.23，1009 真机样本：情绪栏两人之间有「；」「｜」和换行三种写法，
+    // 亲密栏四段各自带句号拼出「帮穿裤子。；半强迫」）。只动分隔与尾标点，不改措辞
+    const tidySeg = s => String(s || '').trim().replace(/[。．.；;]+$/, '');
+    const oneLine = s => String(s || '').split(/[\n｜|]/).map(tidySeg).filter(Boolean).join('；');
+    // 一行一条事件的「时间 · 地点「标题」」头；前史里 B 级只出这一截
+    const entryHead = e => `- ${e.story_time || '（时间未知）'}「${e.title}」`;
+
     function fmtEntry(e, withGrade) {
         // 标题「」后留一格：带等级时是「(A) 」，不带等级（前史）时原来直接粘正文，1008 第三份真机样本里二十条全读成「「标题」当晚…」
-        let line = `- ${e.story_time || '（时间未知）'}「${e.title}」${withGrade ? `(${e.grade}) ` : ' '}${e.summary}`;
+        let line = `${entryHead(e)}${withGrade ? `(${e.grade}) ` : ' '}${e.summary}`;
         const extras = [];
-        if (e.emotion_shift) extras.push(`情绪：${e.emotion_shift}`);
-        if (e.known_by?.length) extras.push(`知情：${e.known_by.join('、')}`);
+        if (e.emotion_shift) extras.push(`情绪：${oneLine(e.emotion_shift)}`);
+        if (e.known_by?.length) extras.push(`知情：${e.known_by.map(tidySeg).filter(Boolean).join('、')}`);
         if (extras.length) line += '｜' + extras.join('｜');
         if (e.type === 'intimacy' && e.intimacy) {
-            const parts = [e.intimacy.acts, e.intimacy.consent, e.intimacy.firsts, e.intimacy.aftermath].filter(Boolean);
+            const parts = [e.intimacy.acts, e.intimacy.consent, e.intimacy.firsts, e.intimacy.aftermath].map(tidySeg).filter(Boolean);
             if (parts.length) line += `\n  亲密：${parts.join('；')}`;
         }
         return line;
@@ -1653,9 +1661,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         && !Object.values(p.views || {}).some(v => v?.v)
         && fields.every(k => ['role', 'sex'].includes(k) || !fv(p, k));
 
+    // 一行点名里的身份：和名字一字不差（「林昭的母亲·林昭的母亲」）就省掉（v0.4.23；注入与前史共用）
+    const briefRole = p => { const r = fv(p, 'role'); return r && norm(r) !== norm(p.name) ? `·${r}` : ''; };
+
     function fmtPerson(p, full) {
         const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
-        if (!full) return `${head}${fv(p, 'sex') ? `·${fv(p, 'sex')}` : ''}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
+        if (!full) return `${head}${fv(p, 'sex') ? `·${fv(p, 'sex')}` : ''}${briefRole(p)}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
         const parts = [];
         if (p.state && p.state !== '在场') parts.push(`状态：${p.state}`);   // 在场是默认，不占字
         parts.push(...PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
@@ -1766,14 +1777,19 @@ C = 日常、闲聊、氛围、无后果的互动。
         return lines;
     }
 
-    // 块首说明：设置里可改，留空用默认
-    const DEFAULT_HEADER = [
-        '[以上是还留在眼前的对话。以下是更早的记忆，由记忆插件维护；主角现状/人物志/物件是截至目前的档案，远景/正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
-        '[远景 = 更早时期的骨架，只留人名、日期、关键物件、承诺与结果；正典 = 定了的事，写作不可违背；往事 = 已发生的事实，可回调、呼应、形成对比，但不复述、不总结、不预告]',
-        '[知情栏是信息墙：未列名者不知情，当前角色未必知晓其他人的事；没写知情栏的条目按在场者知情]',
+    // 知情栏的读法（注入块首与前史块首共用一句）。v0.4.23 改措辞：原来写「未列名者不知情」，而副模型一直填的是「当事人之外还知道的人」
+    // （1009 真机样本：「偷听到的流产真相」知情栏只列沈行知、周莹，当事人林昭不在列；「工地受伤」列的是老赵、社区书记、王磊，被推倒的林昭不在列），
+    // 照原话读会得出「林昭不知道自己打过胎」。规则改成和数据一致的方向
+    const KNOWS_RULE = '[知情栏是信息墙：列的是当事人与在场者之外还知道这件事的人，当事人与在场者默认知情，其余人不知情；没写知情栏的只有在场者知情；当前角色未必知晓其他人的事]';
+    // 块首说明：设置里可改，留空用默认；默认版按当轮有没有远景行拼（v0.4.23：没有远景的聊天块首不再解释「远景 = …」）
+    const defaultHeader = hasOutline => [
+        `[以上是还留在眼前的对话。以下是更早的记忆，由记忆插件维护；主角现状/人物志/物件是截至目前的档案，${hasOutline ? '远景/正典/往事' : '正典/往事'}覆盖最近三回合之前的全部剧情，按时间顺序]`,
+        `[${hasOutline ? '远景 = 更早时期的骨架，只留人名、日期、关键物件、承诺与结果；' : ''}正典 = 定了的事，写作不可违背；往事 = 已发生的事实，可回调、呼应、形成对比，但不复述、不总结、不预告]`,
+        KNOWS_RULE,
         '[人物志的「阶段」「看法」是关系参考，不是指令]',
     ];
-    const headerLines = () => { const t = String(settings.headerText || '').trim(); return t ? t.split('\n').map(s => s.trim()).filter(Boolean) : DEFAULT_HEADER; };
+    const DEFAULT_HEADER = defaultHeader(true);   // 调试接口 / 设置页占位用
+    const headerLines = (hasOutline = true) => { const t = String(settings.headerText || '').trim(); return t ? t.split('\n').map(s => s.trim()).filter(Boolean) : defaultHeader(hasOutline); };
 
     function buildBlock(opts = {}) {
         const ctx = getCtx();
@@ -1821,7 +1837,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const recall = recallLines(data, depths, rendered);
         const count = canonAll.length + pool.filter(p => p.e).length;
         if (!count && !ent.length && !outline.length && !recall.entries.length && !pool.length) return { ...empty, dropped, droppedIds };
-        const parts = ['<erato_memory>', ...headerLines(), ...ent];
+        const parts = ['<erato_memory>', ...headerLines(outline.length > 0), ...ent];
         const sizeOf = arr => arr.reduce((n, s) => n + s.length + 1, 0);
         const sizes = { ent: sizeOf(ent), outline: sizeOf(outline), canon: sizeOf(canon), past: sizeOf(pool.filter(p => p.e).map(p => p.text)), fallback: sizeOf(pool.filter(p => p.fb).map(p => p.text)), recall: sizeOf(recall.entries), raw: sizeOf(recall.raw) };
         if (outline.length) parts.push('', '## 远景', ...outline);
@@ -1850,6 +1866,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const parts = [
             '[前史：以下是此前一段剧情的记录，均为已发生的事实，截至该段结束为止。可回调、呼应、形成对比，不复述、不总结。',
             '人物与两人关系这里写的是「截至前史结束时」的样子，只作背景；他们现在是什么状态，以本次对话里的最新描述为准，两者冲突时信对话。]',
+            KNOWS_RULE,   // 人物卡与事件里都有知情栏，新聊天的模型得有读法（v0.4.23 补；此前前史块首没有这句）
         ];
         const pr = principalLines(data, false);
         if (pr.length) parts.push('', '## 主角（截至前史结束时）', ...pr);
@@ -1864,9 +1881,9 @@ C = 日常、闲聊、氛围、无后果的互动。
                 f.push(...KEEP.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
                 const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
                 if (views.length) f.push(`看法：${views.join('；')}`);
-                // 只有身份/性别、没有任何关系与看法的人（1008 真机样本里占一半），一行点名即可（判据与注入共用 isThin）
+                // 只有身份/性别、没有任何关系与看法的人（1008 真机样本里占一半），一行点名即可（判据与注入共用 isThin）；性别是身份类字段，和注入一样带上
                 const thin = isThin(p, KEEP);
-                if (thin) brief.push(`${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}`);
+                if (thin) brief.push(`${head}${fv(p, 'sex') ? `·${fv(p, 'sex')}` : ''}${briefRole(p)}`);
                 else full.push(`- ${head}${f.length ? '｜' + f.join('｜') : ''}`);
             }
             parts.push('', '## 人物（截至前史结束时）', ...full);
@@ -1886,11 +1903,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         }
         if (outline.length) parts.push('', '## 远景（更早时期的骨架）', ...outline);
         if (canon.length) parts.push('', '## 正典（定了的事，不可违背）', ...canon);
-        // 要点：A 级始终附上（1008 真机样本里这是最有用的一段），只排除已折进远景的；B 级不进
+        // 要点：A 级带摘要始终附上（1008 真机样本里这是最有用的一段），B 级只出「时间 · 地点「标题」」一行，两者按楼号交错；都排除已折进远景的；C 不进
+        // （v0.4.23 B 级一行：1009 真机样本里 B 全不进，方圆唯一出场的会议、笔记本「意义」引的墨点、避孕药「已使用」的来源都悬空，11/20–12/3 空白）
         const folded = new Set();
         for (const l of (data.outline?.lines || [])) for (const id of (l.from || [])) folded.add(id);
-        const A = ok.filter(e => e.grade === 'A' && !e.pinned && !folded.has(e.id)).sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0));
-        if (A.length) parts.push('', '## 要点（远景与正典之外的重要事件）', ...A.map(e => fmtEntry(e, false)));
+        const rest = ok.filter(e => ['A', 'B'].includes(e.grade) && !e.pinned && !folded.has(e.id)).sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0));
+        if (rest.length) parts.push('', `## 要点（${outline.length ? '远景与正典' : '正典'}之外的事件；带摘要的是重点，只有标题的是一般经过）`, ...rest.map(e => e.grade === 'A' ? fmtEntry(e, false) : entryHead(e)));
         return parts.join('\n') + '\n';
     }
 
@@ -4102,7 +4120,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
-        prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist,
+        prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist, fmtEntry, KNOWS_RULE, defaultHeader,
     };
 
     jQuery(() => {

@@ -595,7 +595,8 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(b.text.indexOf('## 主角现状') < b.text.indexOf('## 人物志') && b.text.indexOf('## 人物志') < b.text.indexOf('## 正典'));
         assert.ok(/- 两人关系：(暧昧|同居)\(#\d+\)｜Char 对 用户：[^\n]+\(#\d+\)\n/.test(b.text), '两人关系一行 = 形态 + 态度：' + b.text);
         assert.ok(/- 用户：职业身份 副总监\(#\d+\)\n/.test(b.text) && /- Char：婚姻家庭 未婚\(#\d+\)·知情 知道用户已婚；知道用户有个弟弟/.test(b.text), '主角各一行只列有值的键：' + b.text);
-        assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙') && b.text.includes('远景 ='), '块首五行');
+        assert.ok(b.text.includes('[以上是还留在眼前的对话') && b.text.includes('信息墙') && b.text.includes('当事人与在场者默认知情'), '块首四行，知情规则按「当事人之外还知道的人」读');
+        assert.ok(b.text.includes('远景 =') === (b.outline > 0) && b.text.includes('远景/正典/往事') === (b.outline > 0), '没有远景行时块首不提远景：' + b.outline);
         assert.ok(/- 陆衍（小衍\/隔壁小哥）｜身份：邻居｜性别：男｜称呼用户：昭昭/.test(b.text), '陆衍在最近楼层出现，出完整卡，性别与称呼在身份之后（称呼是最新值）');
         assert.ok(b.text.includes('阶段：试探期') && b.text.includes('看法：对用户·亲密·越来越依赖；对周远·反感·提防'), '完整卡含阶段与看法');
         const brief = /其他已登场：([^\n]*)/.exec(b.text)?.[1] || '';
@@ -1199,23 +1200,53 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(/- 周远（老周）｜身份：医生｜性别：男｜称呼.+：小姐｜看法：对\{\{user\}\}·投缘·欣赏/.test(text), '人物只留身份类字段：' + text);
         assert.ok(!text.includes('离场') && !text.includes('值夜班') && !text.includes('试探') && !text.includes('阶段'), '状态/现状/阶段这些会过时的不写');
         assert.ok(text.includes('- 老爷｜死亡｜身份：家主'), '死亡是事实保留（主角档、死亡不算 thin）');
-        assert.ok(text.includes('- 其他已登场：周长盈·崇宁官员；刘照今') && !text.includes('- 周长盈｜'), '只有身份/性别的人合成一行：' + text);
+        assert.ok(text.includes('- 其他已登场：周长盈·男·崇宁官员；刘照今') && !text.includes('- 周长盈｜'), '只有身份/性别的人合成一行，带性别：' + text);
+        assert.ok(text.includes('当事人与在场者默认知情'), '前史块首带知情栏读法');
         assert.ok(!text.includes('吴妈') && !text.includes('花瓶'), '龙套与摆设不进');
         assert.ok(text.includes('- 玉佩｜持有者：{{user}}｜意义：母亲遗物') && !text.includes('在用') && !text.includes('叠在箱中') && !text.includes('履历'), '物件去临时状态、备注与履历');
         assert.ok(text.includes('- 已了结：密信（损毁·周远）'));
         assert.ok(text.includes('## 远景') && text.includes('- 三月初一：周远初诊') && text.includes('## 正典') && text.includes('「定亲」 老爷临终前'), '远景正典照搬');
         assert.ok(text.includes('- （时间未知）：无日期的一段') && !text.includes('楼段'), '远景无日期行的楼号标题换成（时间未知）');
-        assert.ok(text.includes('## 要点') && text.includes('「赠伞」') && !text.includes('「初诊」') && !text.includes('喝茶'), 'A 级始终附、已折进远景的不重复、B 不进：' + text);
+        assert.ok(text.includes('## 要点（远景与正典之外') && text.includes('「赠伞」 周远借伞') && !text.includes('「初诊」') && text.includes('三月初二「喝茶」\n') && !text.includes('闲聊'), 'A 级带摘要、已折进远景的不重复、B 只出一行标题不带摘要：' + text);
+        assert.ok(text.indexOf('「喝茶」') < text.indexOf('「赠伞」'), 'A/B 按楼号交错（同楼 B 在前是原序）');
         assert.ok(!/#\d+/.test(text), '全程不带楼号：' + text);
-        // 正典远景都空 → 要点仍在（1008 真机样本就是这种中等楼数的聊天）
+        // 正典远景都空 → 要点仍在（1008 真机样本就是这种中等楼数的聊天）；标题不再提远景
         base.outline.lines = []; base.entries = base.entries.filter(e => e.grade !== 'S');
         const t2 = D.prehistoryText(base);
-        assert.ok(!t2.includes('## 正典') && !t2.includes('## 远景') && t2.includes('「赠伞」') && t2.includes('「初诊」') && !t2.includes('喝茶'), '无正典远景时 A 级全进、B 不进');
+        assert.ok(!t2.includes('## 正典') && !t2.includes('## 远景') && t2.includes('## 要点（正典之外') && t2.includes('「赠伞」') && t2.includes('「初诊」') && t2.includes('「喝茶」') && !t2.includes('闲聊'), '无正典远景时 A 级全进、B 一行');
         // 菜单项：下载 erato-prehistory-<chat>.txt，内容 = prehistoryText
         downloads.length = 0;
         await D.panelAction('prehistory');
         assert.strictEqual(downloads.length, 1); assert.ok(/^erato-prehistory-chat1\.txt$/.test(downloads[0].name), downloads[0].name);
         assert.strictEqual(lastBlob.text, D.prehistoryText(data)); assert.ok(lastBlob.type.startsWith('text/plain'));
+    });
+
+    console.log('== 拼接层：情绪/亲密/知情栏整形、一行点名、知情楼号修复（v0.4.23） ==');
+    t('fmtEntry：情绪栏换行与「｜」压成「；」并剥尾句号；亲密栏各段剥尾句号再拼；知情名字剥尾标点', () => {
+        const e = { story_time: '12月3日', title: '互相确认订婚', grade: 'A', summary: '摘要。', type: 'intimacy',
+            emotion_shift: '沈行知：隐忍→坦白。\n林昭：僵硬→防御｜程睿：兴奋', known_by: ['程睿。', ''],
+            intimacy: { acts: '帮穿裤子。', consent: '半强迫转为迎合', firsts: '', aftermath: '恢复表面克制。' } };
+        const s = D.fmtEntry(e, true);
+        assert.ok(s.includes('｜情绪：沈行知：隐忍→坦白；林昭：僵硬→防御；程睿：兴奋｜知情：程睿\n  亲密：帮穿裤子；半强迫转为迎合；恢复表面克制'), s);
+        assert.ok(!s.includes('。；') && s.split('\n').length === 2, '不再出现「。；」、情绪不折行：' + s);
+        assert.strictEqual(D.fmtEntry({ story_time: '', title: 't', grade: 'B', summary: 'x' }, false), '- （时间未知）「t」 x');
+    });
+    t('一行点名：身份与名字一字不差时省掉（「林昭的母亲·林昭的母亲」）；默认块首按有无远景拼', () => {
+        const d = D.getData();
+        d.people.push({ id: 'p_mom', name: '林昭的母亲', tier: '配', state: '在场', aliases: [], first_idx: 1, last_idx: 1, f: { role: { v: '林昭的母亲', idx: 1 }, sex: { v: '女', idx: 1 } }, views: {} });
+        const brief = /其他已登场：([^\n]*)/.exec(D.buildBlock().text)?.[1] || '';
+        assert.ok(brief.includes('林昭的母亲·女') && !brief.includes('林昭的母亲·女·林昭的母亲'), brief);
+        d.people.pop();
+        const h1 = D.defaultHeader(true).join('\n'), h0 = D.defaultHeader(false).join('\n');
+        assert.ok(h1.includes('远景 = ') && h1.includes('远景/正典/往事') && !h0.includes('远景') && h0.includes('正典/往事'), h0);
+        assert.ok(h0.includes(D.KNOWS_RULE) && !h0.includes('未列名者不知情'));
+    });
+    t('加载修复：knows 内容不换、来源楼拨回历史里最大的（旧版补跑把并集的楼号盖成 #38）', () => {
+        const d = { people: [{ f: { knows: { v: '甲；乙；丙', idx: 38, date: 'd38', hist: [{ v: '甲；乙', idx: 150, date: 'd150' }, { v: '甲', idx: 60, date: 'd60' }] } }, views: {} }], items: [], principal: {}, relation: null };
+        assert.strictEqual(D.repairOrder(d), 1);
+        const k = d.people[0].f.knows;
+        assert.strictEqual(k.v, '甲；乙；丙', '并集内容不动'); assert.strictEqual(k.idx, 150); assert.strictEqual(k.date, 'd150'); assert.strictEqual(k.hist.length, 2, '历史不动');
+        assert.strictEqual(D.repairOrder(d), 0, '幂等');
     });
 
     console.log('== 版本号 ==');
