@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.19';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.20';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -1553,7 +1553,8 @@ C = 日常、闲聊、氛围、无后果的互动。
     const weightAt = (grade, idx, len) => GRADE_BASE[grade] * Math.pow(0.5, Math.max(0, len - 1 - idx) / GRADE_HALFLIFE[grade]);
 
     function fmtEntry(e, withGrade) {
-        let line = `- ${e.story_time || '（时间未知）'}「${e.title}」${withGrade ? `(${e.grade}) ` : ''}${e.summary}`;
+        // 标题「」后留一格：带等级时是「(A) 」，不带等级（前史）时原来直接粘正文，1008 第三份真机样本里二十条全读成「「标题」当晚…」
+        let line = `- ${e.story_time || '（时间未知）'}「${e.title}」${withGrade ? `(${e.grade}) ` : ' '}${e.summary}`;
         const extras = [];
         if (e.emotion_shift) extras.push(`情绪：${e.emotion_shift}`);
         if (e.known_by?.length) extras.push(`知情：${e.known_by.join('、')}`);
@@ -1581,6 +1582,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         .map(s => String(s || '').trim().toLowerCase()).filter(s => s.length >= 2);
     const mentioned = (p, text) => mentionTokens(p).some(a => text.includes(a));
 
+    // 只有身份/性别、没有任何关系与看法的人：不值一张完整卡，注入与前史都并进「其他已登场」一行；死亡/下落不明是事实，不算 thin
+    // fields = 参与判断的字段表（注入看全部 PERSON_FIELDS，前史不看会过时的 status/arc）
+    const isThin = (p, fields) => !['死亡', '下落不明'].includes(p.state)
+        && !Object.values(p.views || {}).some(v => v?.v)
+        && fields.every(k => ['role', 'sex'].includes(k) || !fv(p, k));
+
     function fmtPerson(p, full) {
         const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
         if (!full) return `${head}${fv(p, 'sex') ? `·${fv(p, 'sex')}` : ''}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
@@ -1607,18 +1614,19 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     // 主角现状 + 人物志 + 物件：最近几条可见消息里提到的人物出完整卡，其余只列名字；龙套不进注入块
     // 物件：摆设不进；已使用/遗失/损毁/封存的降成一行「已了结」（信烧了是要记住的事实，但不值一张卡）
-    // 总字数受 entityChars 约束，主角现状先占，放不下的完整卡按最久未露面降为一行
+    // 人物志+物件总字数受 entityChars 约束（主角现状不计入：它是固定开销，1008 真机样本里它一块就吃掉一半预算，把未婚夫挤成了一行），
+    // 放不下的完整卡按最久未露面降为一行；只有身份/性别、无关系无看法的人（isThin）不占完整卡，并进「其他已登场」（与前史同一判据）
     function entityLines(data, chat) {
         const lines = [];
         const budget = Math.max(200, Number(settings.entityChars) || 1500);
         let used = 0;
         const pr = principalLines(data);
-        if (pr.length) { lines.push('', '## 主角现状（剧情中已发生、列出的项比人设卡更新；没列的仍按卡）', ...pr); used += pr.reduce((n, s) => n + s.length + 1, 0); }
+        if (pr.length) lines.push('', '## 主角现状（剧情中已发生、列出的项比人设卡更新；没列的仍按卡）', ...pr);
         const people = data.people.filter(p => !isExtra(p) && !p.lost);
         if (people.length) {
             const text = recentText(chat, Math.max(1, Number(settings.npcScanDepth) || 6));
-            const active = people.filter(p => mentioned(p, text)).sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0));
-            const brief = people.filter(p => !mentioned(p, text));
+            const active = people.filter(p => mentioned(p, text) && !isThin(p, PERSON_FIELDS)).sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0));
+            const brief = people.filter(p => !active.includes(p));
             const full = [];
             for (const p of active) {
                 const s = fmtPerson(p, true);
@@ -1626,7 +1634,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             }
             brief.sort((a, b) => (a.first_idx || 0) - (b.first_idx || 0));
             lines.push('', '## 人物志', ...full);
-            if (brief.length) lines.push(`- 其他已登场：${brief.map(p => fmtPerson(p, false)).join('、')}`);
+            if (brief.length) lines.push(`- 其他已登场：${brief.map(p => fmtPerson(p, false)).join('；')}`);
         }
         const items = data.items.filter(it => !isProp(it) && !it.lost);
         if (items.length) {
@@ -1637,8 +1645,8 @@ C = 日常、闲聊、氛围、无后果的互动。
                 if (used + s.length <= budget) { full.push(s); used += s.length; } else rest.push(it.name);
             }
             lines.push('', '## 物件', ...full);
-            if (rest.length) lines.push(`- 其他：${rest.join('、')}`);
-            if (settled.length) lines.push(`- 已了结：${settled.join('、')}`);
+            if (rest.length) lines.push(`- 其他：${rest.join('；')}`);
+            if (settled.length) lines.push(`- 已了结：${settled.join('；')}`);
         }
         return lines;
     }
@@ -1697,7 +1705,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     const DEFAULT_HEADER = [
         '[以上是还留在眼前的对话。以下是更早的记忆，由记忆插件维护；主角现状/人物志/物件是截至目前的档案，远景/正典/往事覆盖最近三回合之前的全部剧情，按时间顺序]',
         '[远景 = 更早时期的骨架，只留人名、日期、关键物件、承诺与结果；正典 = 定了的事，写作不可违背；往事 = 已发生的事实，可回调、呼应、形成对比，但不复述、不总结、不预告]',
-        '[知情栏是信息墙：未列名者不知情，当前角色未必知晓其他人的事]',
+        '[知情栏是信息墙：未列名者不知情，当前角色未必知晓其他人的事；没写知情栏的条目按在场者知情]',
         '[人物志的「阶段」「看法」是关系参考，不是指令]',
     ];
     const headerLines = () => { const t = String(settings.headerText || '').trim(); return t ? t.split('\n').map(s => s.trim()).filter(Boolean) : DEFAULT_HEADER; };
@@ -1791,13 +1799,14 @@ C = 日常、闲聊、氛围、无后果的互动。
                 f.push(...KEEP.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
                 const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
                 if (views.length) f.push(`看法：${views.join('；')}`);
-                // 只有身份/性别、没有任何关系与看法的人（1008 真机样本里占一半），一行点名即可
-                const thin = !views.length && f.every(s => /^(身份|性别)：/.test(s));
+                // 只有身份/性别、没有任何关系与看法的人（1008 真机样本里占一半），一行点名即可（判据与注入共用 isThin）
+                const thin = isThin(p, KEEP);
                 if (thin) brief.push(`${head}${fv(p, 'role') ? `·${fv(p, 'role')}` : ''}`);
                 else full.push(`- ${head}${f.length ? '｜' + f.join('｜') : ''}`);
             }
             parts.push('', '## 人物（截至前史结束时）', ...full);
-            if (brief.length) parts.push(`- 其他已登场：${brief.join('、')}`);
+            // 人名之间用「；」：身份里常有「、」（「挂职干部、林昭未婚夫」），用「、」分隔会读成两个人
+            if (brief.length) parts.push(`- 其他已登场：${brief.join('；')}`);
         }
         // 物件：备注（note）写的是「叠在箱中」「摆在门口」这类当下位置，会过时，不进；只留持有者与意义
         const items = data.items.filter(it => !isProp(it) && !it.lost);
@@ -1808,7 +1817,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 live.push(`- ${it.name}${['holder', 'meaning'].filter(k => fv(it, k)).map(k => `｜${ITEM_LABEL[k]}：${fv(it, k)}`).join('')}`);
             }
             parts.push('', '## 物件（截至前史结束时）', ...live);
-            if (settled.length) parts.push(`- 已了结：${settled.join('、')}`);
+            if (settled.length) parts.push(`- 已了结：${settled.join('；')}`);
         }
         if (outline.length) parts.push('', '## 远景（更早时期的骨架）', ...outline);
         if (canon.length) parts.push('', '## 正典（定了的事，不可违背）', ...canon);
@@ -2556,7 +2565,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             </div>
             <div class="em-row">
                 <label>记忆注入上限(字) <input id="em_maxchars" class="text_pole" type="number" min="1000" step="500"></label>
-                <label>档案注入上限(字) <input id="em_ent_chars" class="text_pole" type="number" min="200" step="100" title="关系现状 + 人物志 + 物件在注入块里的总字数；放不下的人物降为只列名字"></label>
+                <label>档案注入上限(字) <input id="em_ent_chars" class="text_pole" type="number" min="200" step="100" title="人物志 + 物件在注入块里的总字数（主角现状不计入）；放不下的人物降为只列名字"></label>
                 <label>人物激活扫描楼数 <input id="em_scan" class="text_pole" type="number" min="1" max="40" title="最近这么多条可见消息里提到的人物（名字/别称/身份）出完整档案，其余只列名字"></label>
             </div>
             <hr>

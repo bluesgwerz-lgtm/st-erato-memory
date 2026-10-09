@@ -607,10 +607,15 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const b0 = D.buildBlock();
         assert.ok(b0.fallback === 1 && b0.text.includes('#36·作者摘要'), '保底深度设 0 时 #36 走 recap 保底');
         D.settings.recapWindow = 20;
-        // 身份激活：最近楼层提到「医生」→ 周远出完整卡
+        // 身份激活：最近楼层提到「医生」→ 周远出完整卡。
+        // v0.4.20：只有身份/性别的人（isThin）即使被提到也不占完整卡（完整卡和一行点名信息相同），所以先给周远一项立场再验激活
         const saved = chat[chat.length - 1].mes;
         chat[chat.length - 1].mes = '<content>去找医生。</content>';
-        assert.ok(/- 周远｜状态：离场｜身份：医生/.test(D.buildBlock().text), '身份词激活完整卡');
+        assert.ok(/其他已登场：[^\n]*周远·医生·离场/.test(D.buildBlock().text) && !/- 周远｜/.test(D.buildBlock().text), '只有身份的人被提到也不占完整卡');
+        const zy = data.people.find(p => p.name === '周远');
+        zy.f.stance = { v: '唯利是图', idx: 30 };
+        assert.ok(/- 周远｜状态：离场｜身份：医生｜立场：唯利是图/.test(D.buildBlock().text), '身份词激活完整卡');
+        delete zy.f.stance;
         chat[chat.length - 1].mes = saved;
         // 关键物件履历：条目里提到物件名
         const bag = data.items.find(i => i.name === '牛皮笔袋');
@@ -1122,11 +1127,11 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(/- 周远（老周）｜身份：医生｜性别：男｜称呼.+：小姐｜看法：对\{\{user\}\}·投缘·欣赏/.test(text), '人物只留身份类字段：' + text);
         assert.ok(!text.includes('离场') && !text.includes('值夜班') && !text.includes('试探') && !text.includes('阶段'), '状态/现状/阶段这些会过时的不写');
         assert.ok(text.includes('- 老爷｜死亡｜身份：家主'), '死亡是事实保留（主角档、死亡不算 thin）');
-        assert.ok(text.includes('- 其他已登场：周长盈·崇宁官员、刘照今') && !text.includes('- 周长盈｜'), '只有身份/性别的人合成一行：' + text);
+        assert.ok(text.includes('- 其他已登场：周长盈·崇宁官员；刘照今') && !text.includes('- 周长盈｜'), '只有身份/性别的人合成一行：' + text);
         assert.ok(!text.includes('吴妈') && !text.includes('花瓶'), '龙套与摆设不进');
         assert.ok(text.includes('- 玉佩｜持有者：{{user}}｜意义：母亲遗物') && !text.includes('在用') && !text.includes('叠在箱中') && !text.includes('履历'), '物件去临时状态、备注与履历');
         assert.ok(text.includes('- 已了结：密信（损毁·周远）'));
-        assert.ok(text.includes('## 远景') && text.includes('- 三月初一：周远初诊') && text.includes('## 正典') && text.includes('「定亲」老爷临终前'), '远景正典照搬');
+        assert.ok(text.includes('## 远景') && text.includes('- 三月初一：周远初诊') && text.includes('## 正典') && text.includes('「定亲」 老爷临终前'), '远景正典照搬');
         assert.ok(text.includes('- （时间未知）：无日期的一段') && !text.includes('楼段'), '远景无日期行的楼号标题换成（时间未知）');
         assert.ok(text.includes('## 要点') && text.includes('「赠伞」') && !text.includes('「初诊」') && !text.includes('喝茶'), 'A 级始终附、已折进远景的不重复、B 不进：' + text);
         assert.ok(!/#\d+/.test(text), '全程不带楼号：' + text);
