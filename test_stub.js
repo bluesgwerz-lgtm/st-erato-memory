@@ -1231,6 +1231,27 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.ok(!s.includes('。；') && s.split('\n').length === 2, '不再出现「。；」、情绪不折行：' + s);
         assert.strictEqual(D.fmtEntry({ story_time: '', title: 't', grade: 'B', summary: 'x' }, false), '- （时间未知）「t」 x');
     });
+    t('v0.4.24：知情栏剔在场者（按 characters）、剔空不出栏；情绪栏英文「;」也当分隔', () => {
+        const e = { story_time: '11月18日', title: '车库事后', grade: 'A', summary: 'x', characters: ['林昭', '沈行知'], known_by: ['林昭', '沈行知', '周莹。'], emotion_shift: '沈行知：嫉妒→进攻; 林昭：防备→动摇' };
+        assert.deepStrictEqual(D.knownOutside(e), ['周莹']);
+        const s = D.fmtEntry(e, true);
+        assert.ok(s.includes('｜情绪：沈行知：嫉妒→进攻；林昭：防备→动摇｜知情：周莹') && !s.includes('知情：林昭'), s);
+        e.known_by = ['林昭', '沈行知'];
+        assert.ok(!D.fmtEntry(e, true).includes('知情'), '知情者全是在场者 → 不出这栏（读法：没写知情栏的只有在场者知情）');
+    });
+    t('v0.4.24：称呼栏填成此人本名/别称按空处理；只有名片字段（身份/性别/年龄/外貌）的人算 thin，注入与前史都降成一行', () => {
+        const d = D.getData();
+        const qian = { id: 'p_qian', name: '钱穆之', aliases: ['老钱'], tier: '配', state: '在场', first_idx: 1, last_idx: 1, f: { role: { v: '退休老干部', idx: 1 }, sex: { v: '男', idx: 1 }, addr: { v: '老钱', idx: 1 } }, views: {} };
+        const gao = { id: 'p_gao', name: '高建林', aliases: ['高局长'], tier: '配', state: '在场', first_idx: 1, last_idx: 1, f: { role: { v: '住建局副局长', idx: 1 }, sex: { v: '男', idx: 1 }, addr: { v: '高局长', idx: 1 }, look: { v: '开口先笑', idx: 1 } }, views: {} };
+        assert.strictEqual(D.pv(qian, 'addr'), ''); assert.strictEqual(D.pv(gao, 'addr'), ''); assert.strictEqual(D.pv(gao, 'look'), '开口先笑');
+        assert.ok(D.isThin(qian, D.PERSON_FIELDS) && D.isThin(gao, D.PERSON_FIELDS), '填反的称呼与一句外貌撑不起详细卡');
+        gao.f.stance = { v: '中立', idx: 1 };
+        assert.ok(!D.isThin(gao, D.PERSON_FIELDS), '有立场就不 thin');
+        d.people.push(qian, gao);
+        const pre = D.prehistoryText(d);
+        assert.ok(/其他已登场：[^\n]*钱穆之（老钱）·男·退休老干部/.test(pre) && /- 高建林（高局长）｜身份：住建局副局长｜性别：男｜外貌：开口先笑｜立场：中立/.test(pre) && !pre.includes('称呼林昭：老钱') && !pre.includes('高局长｜'), pre);
+        d.people.splice(d.people.indexOf(qian), 2);
+    });
     t('一行点名：身份与名字一字不差时省掉（「林昭的母亲·林昭的母亲」）；默认块首按有无远景拼', () => {
         const d = D.getData();
         d.people.push({ id: 'p_mom', name: '林昭的母亲', tier: '配', state: '在场', aliases: [], first_idx: 1, last_idx: 1, f: { role: { v: '林昭的母亲', idx: 1 }, sex: { v: '女', idx: 1 } }, views: {} });

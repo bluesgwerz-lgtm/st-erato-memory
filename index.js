@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.23';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.24';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -619,7 +619,7 @@
       "summary": "80–200字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。必须保留正式人名、原文称呼、地点、关键物件和具体动作；禁止『两人发生冲突』『关系升温』这类不带主语宾语的空话；未来只凭一句口语提法也要能认出这条。可保留1句决定走向的原台词。去掉感官修辞。",
       "characters": ["与本事件有关的人：在场有行动的，以及不在场但影响了走向的（打电话、发消息、被转述、被提醒的人）。只用正式名，不用代词，不用别称"],
       "emotion_shift": "『角色：A→B』格式，一人一句，无变化留空",
-      "known_by": ["知道这件事的角色。若是秘密/信息差，只列知情者；全员在场则留空数组"],
+      "known_by": ["在场者之外还知道这件事的角色（在场的人不用列）。只有在场者知道则留空数组"],
       "tags": ["3-6个检索词：人名/地点/物件/情绪/主题"],
       "intimacy": null 或 {"acts": "行为要点，事实性", "consent": "同意状态与主动方", "firsts": "第一次的事项，没有留空", "aftermath": "事后状态与余波"},
       "related_to": ["之前记忆里与本事件有因果关系的 id，没有留空数组"],
@@ -634,7 +634,7 @@
     "between": {"v": "两人关系的形态：陌生/同事/朋友/恋人/同居/订婚/已婚/分手…，以及 {{name1}} 明言的约定或界限（如『说好只做朋友』）", "floor": 楼层号}
   },
   "people": [
-    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人怎么称呼{{name1}}（王哥/您/直呼其名），只在原文明确出现这个称呼、且是第一次或换了叫法时写，否则不写这个键", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
+    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人叫{{name1}}时用的称呼（王哥/您/直呼其名；不是别人怎么叫此人），只在原文明确出现这个称呼、且是第一次或换了叫法时写，否则不写这个键", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
   "items": [
     {"name": "物件名", "tier": "关键 | 次要 | 摆设", "state": "待用 | 在用 | 已使用 | 已转手 | 遗失 | 损毁 | 封存", "holder": "现在在谁手里", "note": "现状一句", "meaning": "对剧情或人物的意义", "floor": 楼层号}
@@ -1621,7 +1621,10 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 拼接前把副模型交上来的一段压成一行、剥掉尾句号（v0.4.23，1009 真机样本：情绪栏两人之间有「；」「｜」和换行三种写法，
     // 亲密栏四段各自带句号拼出「帮穿裤子。；半强迫」）。只动分隔与尾标点，不改措辞
     const tidySeg = s => String(s || '').trim().replace(/[。．.；;]+$/, '');
-    const oneLine = s => String(s || '').split(/[\n｜|]/).map(tidySeg).filter(Boolean).join('；');
+    const oneLine = s => String(s || '').split(/[\n｜|;]/).map(tidySeg).filter(Boolean).join('；');   // 英文「;」也算分隔（v0.4.24，1009 样本「嫉妒→进攻; 林昭」）
+    // 知情栏只出在场者之外的人：副模型常把在场者也列进 known_by（1009 样本「知情：林昭、沈行知」两人就是在场者），
+    // 块首读法是「列的是当事人与在场者之外还知道的人」，照读会打架；按 characters 剔掉，旧数据不用重总结（v0.4.24）
+    const knownOutside = e => { const cast = new Set((e.characters || []).map(norm)); return (e.known_by || []).map(tidySeg).filter(n => n && !cast.has(norm(n))); };
     // 一行一条事件的「时间 · 地点「标题」」头；前史里 B 级只出这一截
     const entryHead = e => `- ${e.story_time || '（时间未知）'}「${e.title}」`;
 
@@ -1630,7 +1633,8 @@ C = 日常、闲聊、氛围、无后果的互动。
         let line = `${entryHead(e)}${withGrade ? `(${e.grade}) ` : ' '}${e.summary}`;
         const extras = [];
         if (e.emotion_shift) extras.push(`情绪：${oneLine(e.emotion_shift)}`);
-        if (e.known_by?.length) extras.push(`知情：${e.known_by.map(tidySeg).filter(Boolean).join('、')}`);
+        const kb = knownOutside(e);
+        if (kb.length) extras.push(`知情：${kb.join('、')}`);
         if (extras.length) line += '｜' + extras.join('｜');
         if (e.type === 'intimacy' && e.intimacy) {
             const parts = [e.intimacy.acts, e.intimacy.consent, e.intimacy.firsts, e.intimacy.aftermath].map(tidySeg).filter(Boolean);
@@ -1657,9 +1661,14 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     // 只有身份/性别、没有任何关系与看法的人：不值一张完整卡，注入与前史都并进「其他已登场」一行；死亡/下落不明是事实，不算 thin
     // fields = 参与判断的字段表（注入看全部 PERSON_FIELDS，前史不看会过时的 status/arc）
+    // 人物字段读值：称呼栏（addr）写的是此人叫 {{user}} 什么，副模型常填反成别人叫此人什么（1009 样本三处：钱穆之「老钱」、高建林「高局长」、
+    // 郑晚晴「行知」）；值等于此人本名或别称的按空处理，「行知」这种填成第三人名字的剔不掉，靠提示词改措辞（v0.4.24）
+    const pv = (p, k) => { const v = fv(p, k); if (k !== 'addr' || !v) return v; const n = norm(v); return n === norm(p.name) || (p.aliases || []).some(a => norm(a) === n) ? '' : v; };
+    // 只有身份/性别/年龄/外貌这类「名片字段」、没有任何关系/立场/知情/看法的人，一行点名即可（v0.4.24 名片集加 age/look：
+    // 1009 前史样本里高建林靠一句外貌、钱穆之靠一个填反的称呼撑起整条详细卡）
     const isThin = (p, fields) => !['死亡', '下落不明'].includes(p.state)
         && !Object.values(p.views || {}).some(v => v?.v)
-        && fields.every(k => ['role', 'sex'].includes(k) || !fv(p, k));
+        && fields.every(k => ['role', 'sex', 'age', 'look'].includes(k) || !pv(p, k));
 
     // 一行点名里的身份：和名字一字不差（「林昭的母亲·林昭的母亲」）就省掉（v0.4.23；注入与前史共用）
     const briefRole = p => { const r = fv(p, 'role'); return r && norm(r) !== norm(p.name) ? `·${r}` : ''; };
@@ -1669,7 +1678,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!full) return `${head}${fv(p, 'sex') ? `·${fv(p, 'sex')}` : ''}${briefRole(p)}${p.state && p.state !== '在场' ? `·${p.state}` : ''}`;
         const parts = [];
         if (p.state && p.state !== '在场') parts.push(`状态：${p.state}`);   // 在场是默认，不占字
-        parts.push(...PERSON_FIELDS.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
+        parts.push(...PERSON_FIELDS.filter(k => pv(p, k)).map(k => `${personLabel(k)}：${pv(p, k)}`));
         const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
         if (views.length) parts.push(`看法：${views.join('；')}`);
         return `- ${head}${parts.length ? '｜' + parts.join('｜') : ''}`;
@@ -1878,7 +1887,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 const head = `${p.name}${p.aliases?.length ? `（${p.aliases.join('/')}）` : ''}`;
                 const f = [];
                 if (['死亡', '下落不明'].includes(p.state)) f.push(p.state);
-                f.push(...KEEP.filter(k => fv(p, k)).map(k => `${personLabel(k)}：${fv(p, k)}`));
+                f.push(...KEEP.filter(k => pv(p, k)).map(k => `${personLabel(k)}：${pv(p, k)}`));
                 const views = Object.entries(p.views || {}).filter(([, v]) => v?.v).map(([to, v]) => `对${to}${v.trend ? `·${v.trend}` : ''}·${v.v}`);
                 if (views.length) f.push(`看法：${views.join('；')}`);
                 // 只有身份/性别、没有任何关系与看法的人（1008 真机样本里占一半），一行点名即可（判据与注入共用 isThin）；性别是身份类字段，和注入一样带上
@@ -4120,7 +4129,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
         vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
-        prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist, fmtEntry, KNOWS_RULE, defaultHeader,
+        prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist, fmtEntry, KNOWS_RULE, defaultHeader, knownOutside, pv, isThin, PERSON_FIELDS,
     };
 
     jQuery(() => {
