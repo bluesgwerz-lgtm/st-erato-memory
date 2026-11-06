@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.27';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.28';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -972,23 +972,28 @@ C = 日常、闲聊、氛围、无后果的互动。
         const addAliases = (ent, list) => { for (const a of list) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a)) && !isLead(norm(a)) && !isRelative(a)) ent.aliases.push(a); };
         // 找到或新建；若按别称命中且模型明确把档案里的旧名列为别称，则升级为真名（「陆母」→「王秀英」）；墓碑里的名字不建档；
         // 相对称谓（「我妈」）不当名字建档、不拿来匹配旧档案
+        // 先找活着的档案，再看墓碑（v0.4.28）：墓碑只管「删掉的人别被副模型建回来」。原来先查墓碑——用户删掉重复的「黑衣人」、
+        // 把这个名字留作「沈墨」的别称后，副模型再报「沈墨（别称 黑衣人）」或只报「黑衣人」，整条更新都被扔掉，留下那张卡什么也收不到。
+        // 现在：名字落在现存档案上（是名字或别称）就写进那张；删掉的名字没挂在任何现存档案上，照旧不建、不改名、不借别称写到别人身上；
+        // 删掉过的名字也不会被副模型新加成别称（只有用户自己挂上去的才算）
         const upsertPerson = (rawName, rawAliases, idx) => {
             const sp = splitName(rawName);
             const name = sp.name, aliases = [...rawAliases, ...sp.aliases].filter(a => !isRelative(a));
             const n = norm(name);
             if (!n || isLead(n) || isRelative(name)) return null;
-            if (isTomb(data, 'p', name) || aliases.some(a => isTomb(data, 'p', a))) return null;
             let ent = findPerson(data, name);
+            if (!ent && isTomb(data, 'p', name)) return null;
             if (!ent) {
                 for (const a of aliases) { ent = findPerson(data, a); if (ent) break; }
                 if (ent) { addAliases(ent, [ent.name]); ent.name = name; }   // 新名字带着旧档案的名字/别称来 → 改名
             }
             if (!ent) {
+                if (aliases.some(a => isTomb(data, 'p', a))) return null;
                 ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: dateOf(idx), last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                 data.people.push(ent);
             }
             if (!ent.views || typeof ent.views !== 'object') ent.views = {};
-            addAliases(ent, aliases);
+            addAliases(ent, aliases.filter(a => !isTomb(data, 'p', a)));
             touch(ent, idx);
             return ent;
         };
@@ -1217,8 +1222,10 @@ C = 日常、闲聊、氛围、无后果的互动。
             for (const raw of (e.characters || [])) {
                 const sp = splitName(raw), name = sp.name, aliases = sp.aliases.filter(a => !isRelative(a));
                 const n = norm(name);
-                if (!n || n === me || chars.has(n) || isRelative(name) || isTomb(data, 'p', name)) continue;
-                let ent = findPerson(data, name) || aliases.map(a => findPerson(data, a)).find(Boolean);
+                if (!n || n === me || chars.has(n) || isRelative(name)) continue;
+                let ent = findPerson(data, name);
+                if (!ent && isTomb(data, 'p', name)) continue;   // 先找现存档案再看墓碑，同 upsertPerson（v0.4.28）
+                if (!ent) ent = aliases.map(a => findPerson(data, a)).find(Boolean);
                 if (!ent) {
                     ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
                     data.people.push(ent);

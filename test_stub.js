@@ -1745,6 +1745,45 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         } finally { global.confirm = savedConfirm; ctx.chatMetadata.eratoMemory = savedData; }
     });
 
+    console.log('== 墓碑：先看现存档案（v0.4.28） ==');
+    {
+        const savedData = ctx.chatMetadata.eratoMemory;
+        const fresh = () => { delete ctx.chatMetadata.eratoMemory; return D.getData(); };
+        const by = new Map([[2, chat[2]], [5, chat[5]]]);
+        t('删掉重复的那张、把名字挂到留下那张的别称后：副 AI 报「沈墨（别称 黑衣人）」或只报「黑衣人」都写进沈墨；补人物也算他露面', () => {
+            const d = fresh();
+            d.people.push({ id: 'p_s', name: '沈墨', aliases: [], f: {}, views: {}, tier: '配', state: '', seen: 1, first_idx: 2, last_idx: 2 });
+            d.people.push({ id: 'p_h', name: '黑衣人', aliases: ['神秘人'], f: {}, views: {}, tier: '配', state: '', seen: 1, first_idx: 2, last_idx: 2 });
+            const shen = d.people[0], hei = d.people[1];
+            D.addTomb(d, 'p', hei); d.people = d.people.filter(p => p !== hei);   // 面板删掉重复的「黑衣人」（连别称「神秘人」一起进墓碑）
+            shen.aliases.push('黑衣人');                                          // 用户把这个名字挂到留下的沈墨上
+            D.mergeEntities(d, { cast: [{ name: '沈墨', aliases: ['黑衣人'], tier: '配', role: '走私船船主', seen: [2] }], people: [{ name: '沈墨', status: '在码头等人', floor: 2 }] }, { floors: [2] }, by, []);
+            assert.strictEqual(D.fv(shen, 'role'), '走私船船主', '点名表里名字是沈墨、别称撞墓碑：以前这条点名被整条扔掉');
+            assert.strictEqual(D.fv(shen, 'status'), '在码头等人');
+            D.mergeEntities(d, { cast: [{ name: '黑衣人', tier: '配', seen: [5] }], people: [{ name: '黑衣人', stance: '站在用户这边', floor: 5 }] }, { floors: [5] }, by, []);
+            assert.strictEqual(D.fv(shen, 'stance'), '站在用户这边', '只报挂上去的那个名字也落到沈墨');
+            assert.ok(d.people.length === 1 && shen.name === '沈墨', '不另建、不改名');
+            d.entries.push({ id: 'e_bf', status: 'ok', src: { idx: 5 }, characters: ['黑衣人', '神秘人'] });
+            const seen0 = shen.seen || 0;
+            assert.strictEqual(D.backfillPeople(), 0, '补人物不建档');
+            assert.strictEqual(shen.seen, seen0 + 1, '事件里的「黑衣人」算沈墨露面一次，「神秘人」没挂上去照旧跳过');
+        });
+        t('没挂到现存档案上的删掉的名字照旧不复活、不借别称写到别人身上；副 AI 给现存的人报一个删掉过的别称，更新照写、别称不加', () => {
+            const d = fresh();
+            d.people.push({ id: 'p_s', name: '沈墨', aliases: [], f: {}, views: {}, tier: '配', state: '', seen: 1, first_idx: 2, last_idx: 2 });
+            const shen = d.people[0];
+            D.addTomb(d, 'p', { name: '神秘人', aliases: [] });
+            D.addTomb(d, 'p', { name: '店员小李', aliases: [] });
+            D.mergeEntities(d, { cast: [{ name: '神秘人', aliases: ['沈墨'], seen: [5] }], people: [{ name: '神秘人', role: '杀手', floor: 5 }] }, { floors: [5] }, by, []);
+            assert.ok(!d.people.some(p => p.name === '神秘人') && shen.name === '沈墨' && !D.fv(shen, 'role'), '删掉的名字带着沈墨当别称来：不改名、不写进沈墨');
+            D.mergeEntities(d, { cast: [{ name: '沈墨', aliases: ['神秘人'], seen: [5] }], people: [{ name: '沈墨', look: '左眉有疤', floor: 5 }] }, { floors: [5] }, by, []);
+            assert.ok(D.fv(shen, 'look') === '左眉有疤' && !shen.aliases.includes('神秘人'), '更新照写，删掉过的名字不被加成别称：' + JSON.stringify(shen.aliases));
+            D.mergeEntities(d, { cast: [{ name: '店员小李', tier: '龙套', seen: [5] }, { name: '新人甲', aliases: ['店员小李'], seen: [5] }] }, { floors: [5] }, by, []);
+            assert.ok(!d.people.some(p => p.name === '店员小李' || p.name === '新人甲'), '删掉的龙套不复活；别称是删掉过的名字的新人也不建（同旧规则）');
+        });
+        ctx.chatMetadata.eratoMemory = savedData;
+    }
+
     console.log('== 版本号 ==');
     t('index.js 的 VERSION 与 manifest.json 一致（面板标题显示的就是它，改版本两处要同步）', () => {
         const m = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));
