@@ -280,7 +280,7 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         const wins = D.planWindows(chat, data, [2, 5]);
         const floors = wins[0].floors.map(i => ({ idx: i, userText: 'U', content: 'C正文' + i, recap: { storyTime: '3月1日', narrative: 'N' } }));
         const msgs = D.buildMessages({ floors, recent: [], locked: [], data });
-        assert.ok(!/\{\{(name1|name2|roster|relation|context|recent|locked|floor_range|floor_count|material|min_events|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
+        assert.ok(!/\{\{(name1|name2|card_name|roster|relation|context|recent|locked|floor_range|floor_count|material|min_events|max_events|directive)\}\}/.test(msgs[1].content), '占位符残留');
         const roster = D.rosterText({ people: [{ name: '杨晚星', aliases: ['星星', '晚星妹妹'], tier: '配', f: { sex: { v: '女' }, role: { v: '妹妹' } } }], items: [] });
         assert.strictEqual(roster, '人物：\n- 杨晚星 [配·女] 妹妹；别称：星星/晚星妹妹', '档案行名字单独在行首、别称在行尾：' + roster);
         assert.deepStrictEqual(D.splitName('杨晚星（星星🌟/晚星妹妹、星星姐）'), { name: '杨晚星', aliases: ['星星🌟', '晚星妹妹', '星星姐'] });
@@ -1560,6 +1560,128 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(k.v, '甲；乙；丙', '并集内容不动'); assert.strictEqual(k.idx, 150); assert.strictEqual(k.date, 'd150'); assert.strictEqual(k.hist.length, 2, '历史不动');
         assert.strictEqual(D.repairOrder(d), 0, '幂等');
     });
+
+    console.log('== {{char}} 故事里的名字：卡名不是人名（v0.4.26） ==');
+    {
+        // 换一份干净的记忆、换卡名来测，最后换回（后面的测试还用原来那份）
+        const savedData = ctx.chatMetadata.eratoMemory, savedName2 = ctx.name2;
+        const fresh = () => { delete ctx.chatMetadata.eratoMemory; return D.getData(); };
+        const by = new Map([[2, chat[2]], [5, chat[5]], [7, chat[7]]]);
+        t('名字拆分：括号与 / 、 当分隔，间隔号与空格不拆；去占位词、相对称谓、{{user}} 的名字、重复', () => {
+            assert.deepStrictEqual(D.splitNames('沃斯·奥尔德伦/沃斯'), ['沃斯·奥尔德伦', '沃斯']);
+            assert.deepStrictEqual(D.splitNames('赵兖（阿兖、小兖）'), ['赵兖', '阿兖', '小兖']);
+            assert.deepStrictEqual(D.splitNames('Sub Rosa'), ['Sub Rosa']);
+            assert.deepStrictEqual(D.splitNames('（未知）/我妈/用户/沃斯/沃斯'), ['沃斯']);
+            assert.deepStrictEqual(D.splitNames(undefined), []);
+        });
+        t('卡名就是人名（默认路径）：没有故事名时一切按卡名，模板对手角色与规则里的卡名都是它', () => {
+            ctx.name2 = 'Char';
+            const d = fresh();
+            assert.strictEqual(D.charDisplay(d), 'Char'); assert.deepStrictEqual([...D.charNormSet(d)], ['char']);
+            const msgs = D.buildMessages({ floors: [{ idx: 2, userText: 'U', content: 'C', recap: {} }], recent: [], locked: [], data: d });
+            assert.ok(msgs[1].content.includes('对手角色：Char') && msgs[1].content.includes('"Char": {"name"') && msgs[1].content.includes('角色卡名「Char」不一定是此人在故事里的名字'));
+            assert.ok(!/\{\{card_name\}\}/.test(msgs[1].content));
+        });
+        t('标题卡（卡名 Sub Rosa）：副 AI 没报 name 时他照旧被当配角建档；报了 name 当窗就认作主角，点名表/people/事件里的他都不再建档、旧卡不再更新', () => {
+            ctx.name2 = 'Sub Rosa';
+            const d = fresh();
+            // 第一窗：模型其实认出来了、把住处写进 Sub Rosa 名下，但没报 name（v0.4.25 模板没有这一栏）→ 沃斯·奥尔德伦 按原文名字进点名表（真机图 3/4 的样子）
+            D.mergeEntities(d, {
+                cast: [{ name: '沃斯·奥尔德伦', aliases: ['沃斯'], tier: '主', role: '法师', sex: '男', seen: [2] }],
+                people: [{ name: '沃斯·奥尔德伦', role: '法师、隐居者', rel_user: '师徒', knows: '月鸦想当驯兽师', look: '银发', views: [{ to: '用户', v: '嘴硬心软地照顾', trend: '亲密' }, { to: '艾拉', v: '提防' }], floor: 2 }],
+                principal: { 'Sub Rosa': { home: '银林道石造宅邸', floor: 2 } },
+            }, { floors: [2] }, by, []);
+            const vos = d.people.find(p => p.name === '沃斯·奥尔德伦');
+            assert.ok(vos && D.fv(d.principal.char, 'home') === '银林道石造宅邸', '旧行为：一个人劈成配角档 + 主角现状两半');
+            assert.strictEqual(D.charDisplay(d), 'Sub Rosa');
+            // 第二窗：报了 name → 记名字（全名 + 简称）；同窗点名表里的全名、简称、people、事件人物都不再建档；他在 people 里的「与用户」照旧并进主角关系行
+            D.mergeEntities(d, {
+                cast: [{ name: '沃斯·奥尔德伦', aliases: ['沃斯'], tier: '主', seen: [5] }, { name: '沃斯', tier: '主', seen: [5] }, { name: '艾拉', tier: '配', role: '学徒', seen: [5] }],
+                people: [{ name: '沃斯·奥尔德伦', rel_user: '恋人', role: '不该写进旧卡', floor: 5 }, { name: '艾拉', role: '学徒', floor: 5 }],
+                principal: { 'Sub Rosa': { name: '沃斯·奥尔德伦/沃斯', knows: '月鸦会占星', floor: 5 } },
+            }, { floors: [5] }, by, [{ src: { idx: 5 }, characters: ['沃斯·奥尔德伦', '艾拉'], grade: 'A' }]);
+            assert.deepStrictEqual(d.charName.names, ['沃斯·奥尔德伦', '沃斯']); assert.strictEqual(d.charName.manual, false);
+            assert.strictEqual(D.charDisplay(d), '沃斯·奥尔德伦');
+            assert.ok(!d.people.some(p => p.name === '沃斯'), '简称也认作主角，不另建档');
+            assert.strictEqual(D.fv(vos, 'role'), '法师、隐居者', '旧卡不再更新'); assert.strictEqual(vos.seen, 1, '旧卡露面段数不再累加');
+            assert.ok(d.people.some(p => p.name === '艾拉'), '别的人照常建档');
+            assert.strictEqual(D.fv(d.principal.char, 'knows'), '月鸦会占星');
+            assert.strictEqual(d.relation.v, '恋人');
+            // 第三窗：名字记下之后，模板里的主角键就是故事名，副 AI 按它报也认
+            D.mergeEntities(d, { principal: { '沃斯·奥尔德伦': { body: '左手旧伤', floor: 7 } } }, { floors: [7] }, by, []);
+            assert.strictEqual(D.fv(d.principal.char, 'body'), '左手旧伤');
+        });
+        t('他本人的旧配角档：注入块、档案名单、前史、召回实体都不出；面板标「主角本人·不注入」、主角卡提示并进来；模板与标签用故事名', () => {
+            const d = D.getData();
+            const vos = d.people.find(p => p.name === '沃斯·奥尔德伦');
+            assert.ok(!D.rosterText(d).includes('沃斯·奥尔德伦') && D.rosterText(d).includes('艾拉'));
+            const b = D.buildBlock({ dry: true });
+            assert.ok(!b.text.includes('沃斯·奥尔德伦（沃斯）'), '注入块不出他的配角卡：' + b.text.slice(0, 500));
+            assert.ok(/- 沃斯·奥尔德伦：住处 银林道石造宅邸/.test(b.text), '主角现状用故事名：' + b.text.slice(0, 500));
+            const pre = D.prehistoryText(d);
+            assert.ok(!pre.includes('沃斯·奥尔德伦（沃斯）') && pre.includes('- 沃斯·奥尔德伦：'), pre.slice(0, 500));
+            assert.ok(!D.mentionedEntities(d, '沃斯今天去了银林道').some(x => x.name === '沃斯·奥尔德伦'));
+            const html = D.principalHtml(d);
+            assert.ok(html.includes('👤 沃斯·奥尔德伦') && html.includes('卡名 Sub Rosa') && html.includes(`data-pact="absorb" data-pid="${vos.id}"`), html.slice(0, 700));
+            assert.ok(html.includes('沃斯·奥尔德伦 对 用户 的态度'));
+            assert.ok(D.entHtml('p', vos, 'recent').includes('主角本人·不注入') && !D.entHtml('p', d.people.find(p => p.name === '艾拉'), 'recent').includes('主角本人'));
+            assert.strictEqual(D.personLabel('rel_char'), '与沃斯·奥尔德伦');
+            const msgs = D.buildMessages({ floors: [{ idx: 7, userText: 'U', content: 'C', recap: {} }], recent: [], locked: [], data: d });
+            assert.ok(msgs[1].content.includes('对手角色：沃斯·奥尔德伦') && msgs[1].content.includes('"沃斯·奥尔德伦": {"name"') && msgs[1].content.includes('角色卡名「Sub Rosa」'), '模板：对手角色与主角键用故事名，规则里写明卡名');
+            assert.ok(!msgs[1].content.includes('- 沃斯·奥尔德伦 ['), '已有档案里不列他');
+        });
+        t('并进主角卡：主角卡空着的身份搬过去、知情取并集、对用户的看法与关系填进空着的态度行与两人关系；外貌与对旁人的看法丢掉；删档不进墓碑；已有值不覆盖', () => {
+            const d = D.getData();
+            const vos = d.people.find(p => p.name === '沃斯·奥尔德伦');
+            d.relation = { v: '', idx: null, date: '' };   // 态度行空着才填
+            D.absorbCharCard(d, vos);
+            assert.ok(!d.people.includes(vos) && !D.isTomb(d, 'p', '沃斯·奥尔德伦'), '删档、不进墓碑');
+            assert.strictEqual(D.fv(d.principal.char, 'role'), '法师、隐居者');
+            assert.strictEqual(D.fv(d.principal.char, 'knows'), '月鸦会占星；月鸦想当驯兽师');
+            assert.strictEqual(d.relation.v, '嘴硬心软地照顾'); assert.strictEqual(D.fv(d.principal.both, 'bond'), '师徒');
+            assert.ok(!D.charCardHints(d).includes('absorb'), '并完提示消失');
+            d.people.push({ id: 'p_x', name: '沃斯', aliases: [], f: { role: { v: '别的身份', idx: 7, date: 'd7' }, rel_user: { v: '陌生人', idx: 7 } }, views: { '用户': { v: '冷淡', idx: 7 } } });
+            assert.ok(D.charCardHints(d).includes('data-pid="p_x"'), '简称命名的旧卡也认得出');
+            D.absorbCharCard(d, d.people.find(p => p.id === 'p_x'));
+            assert.strictEqual(D.fv(d.principal.char, 'role'), '法师、隐居者'); assert.strictEqual(d.relation.v, '嘴硬心软地照顾'); assert.strictEqual(D.fv(d.principal.both, 'bond'), '师徒');
+        });
+        t('手填名字上锁、副 AI 不再改，解锁后新名字追加在后；卡名就是人名时报小名不换显示名；只报卡名不留记录', () => {
+            ctx.name2 = '赵兖';
+            let d = fresh();
+            assert.strictEqual(D.learnCharNames(d, '赵兖'), false); assert.deepStrictEqual(d.charName.names, []);
+            assert.strictEqual(D.learnCharNames(d, '赵兖/阿兖'), true); assert.deepStrictEqual(d.charName.names, ['赵兖', '阿兖']); assert.strictEqual(D.charDisplay(d), '赵兖');
+            ctx.name2 = '镜花水月';
+            d = fresh();
+            d.charName = { names: ['赵兖'], manual: true, noHint: false };
+            assert.strictEqual(D.learnCharNames(d, '赵厌'), false); assert.deepStrictEqual(d.charName.names, ['赵兖']);
+            D.principalAction('unlock', 'char', 'n:');
+            assert.strictEqual(d.charName.manual, false);
+            assert.strictEqual(D.learnCharNames(d, '赵厌'), true); assert.deepStrictEqual(d.charName.names, ['赵兖', '赵厌'], '新名字追加在后，显示名不变');
+            assert.ok(D.principalHtml(d).includes('（赵厌 / 卡名 镜花水月）'));
+            d.charName = { names: [], manual: true, noHint: false };   // 面板里清空名字 = 锁在卡名上：旁白/群像卡被认错了人，清掉后不会下一段又被认回来
+            assert.strictEqual(D.learnCharNames(d, '林夏'), false); assert.strictEqual(D.charDisplay(d), '镜花水月');
+        });
+        t('提示：总结过、还没有名字、卡名从没在正文出现过才提醒填名字；卡名在正文出现过、点过「不用」、有了名字都不提示；补人物不给故事名建档', () => {
+            ctx.name2 = 'Sub Rosa';
+            const d = fresh();
+            assert.ok(!D.charCardHints(d).includes('没在正文里出现过'), '还没总结过不提示');
+            d.windows.push({ id: 'w_h', floors: [2], dates: ['d2'], hashes: [''], status: 'ok', attempts: 0 });
+            const h = D.charCardHints(d);
+            assert.ok(h.includes('卡名「Sub Rosa」没在正文里出现过') && h.includes('data-pact="name"') && h.includes('data-pact="nohint"'), h);
+            ctx.name2 = '陆衍';   // 桩聊天的正文里写着陆衍
+            assert.ok(!D.charCardHints(d).includes('没在正文里出现过'), '卡名在正文里出现过就不提示');
+            ctx.name2 = 'Sub Rosa';
+            D.principalAction('nohint', 'char');
+            assert.ok(d.charName.noHint && !D.charCardHints(d).includes('没在正文里出现过'), '点过「不用」');
+            d.charName = { names: [], manual: true, noHint: false };
+            assert.ok(!D.charCardHints(d).includes('没在正文里出现过'), '清空名字锁在卡名上的也不提示');
+            d.charName = { names: ['沃斯·奥尔德伦'], manual: true, noHint: false };
+            assert.ok(!D.charCardHints(d).includes('没在正文里出现过'), '有名字了');
+            d.entries.push({ id: 'e_b', status: 'ok', src: { idx: 2 }, characters: ['沃斯·奥尔德伦', '新人甲'] });
+            assert.strictEqual(D.backfillPeople(), 1); assert.ok(!d.people.some(p => p.name === '沃斯·奥尔德伦') && d.people.some(p => p.name === '新人甲'));
+        });
+        ctx.chatMetadata.eratoMemory = savedData; ctx.name2 = savedName2;
+    }
 
     console.log('== 版本号 ==');
     t('index.js 的 VERSION 与 manifest.json 一致（面板标题显示的就是它，改版本两处要同步）', () => {

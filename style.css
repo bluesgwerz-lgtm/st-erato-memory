@@ -241,6 +241,9 @@
 .em-oline .em-ent-body { margin-top: 4px; }
 .em-lost { background: rgba(224,82,82,.35); }
 .em-clash { background: rgba(240,160,40,.4); }
+.em-charcard { background: rgba(230,160,60,.25); }
+.em-pr-hint { opacity: .9; margin: 4px 0 2px; line-height: 1.5; }
+.em-pr-hint .em-link { margin-left: 4px; }
 .em-canon-view { cursor: pointer; }
 .em-canon textarea { width: 100%; box-sizing: border-box; margin-top: 4px; }
 .em-ver { font-weight: normal; font-size: .75em; opacity: .55; margin-left: 2px; }

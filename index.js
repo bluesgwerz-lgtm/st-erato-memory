@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.25';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.26';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -233,6 +233,9 @@
             items: [],        // 物件
             relation: { v: '', idx: null, date: '' },   // {{char}} 对 {{user}} 的关系现状（态度）
             principal: { user: { f: {} }, char: { f: {} }, both: { f: {} } },   // 主角现状：长期变化的现值，字段见 PRINCIPAL_FIELDS
+            // {{char}} 在故事里的名字（v0.4.26）：角色卡名不一定是人名（「Sub Rosa」「镜花水月」，人设全在世界书里）。names[0] 用来显示，其余也认作主角；
+            // 空 = 用卡名。副 AI 在主角现状里报 name 自动记；面板改过即 manual（副 AI 不再改；清空也算 = 锁在卡名上）；noHint = 用户点过「这张卡没有单一主角」，不再提示填名字
+            charName: { names: [], manual: false, noHint: false },
             archives: [],
             canon: { text: '', builtFrom: [], builtAt: 0 },   // 正典压缩段：S 超过 canonMax 条时由副 API 压成一段，之后新增的 S 逐条附在段后
             outline: { lines: [], pending: [], at: 0 },      // 远景层：被预算裁掉的条目按故事日折成一行；level 2 = 若干日行再折成的时期行
@@ -261,6 +264,7 @@
         if (!d.relation || typeof d.relation !== 'object') d.relation = def.relation;
         if (!d.principal || typeof d.principal !== 'object') d.principal = def.principal;
         for (const k of Object.keys(PRINCIPAL_FIELDS)) if (!d.principal[k]?.f || typeof d.principal[k].f !== 'object') d.principal[k] = { f: {} };
+        if (!d.charName || typeof d.charName !== 'object' || !Array.isArray(d.charName.names)) d.charName = def.charName;
         for (const k of ['canon', 'outline', 'tombstones', 'vec']) if (!d[k] || typeof d[k] !== 'object') d[k] = def[k];
         if (!Array.isArray(d.outline.lines)) d.outline.lines = [];
         if (!Array.isArray(d.outline.pending)) d.outline.pending = [];
@@ -627,7 +631,8 @@
         '你是成人向互动小说的档案员。你的工作是把一段已发生的剧情整理成若干条结构化记忆，并更新人物与物件档案，供后续写作参考。\n' +
         '只输出 JSON，不输出任何其他文字。用中性、克制、事实性的语言，不渲染不评价，性内容按事实记录不省略。';
 
-    // 可在设置「提示词」里改；占位符：{{name1}} {{name2}} {{roster}} {{relation}} {{context}} {{recent}} {{locked}} {{floor_range}} {{floor_count}} {{material}} {{min_events}} {{max_events}} {{directive}}
+    // 可在设置「提示词」里改；占位符：{{name1}} {{name2}} {{card_name}} {{roster}} {{relation}} {{context}} {{recent}} {{locked}} {{floor_range}} {{floor_count}} {{material}} {{min_events}} {{max_events}} {{directive}}
+    // {{name2}} = {{char}} 在故事里的名字（没记到就是卡名），{{card_name}} = 角色卡名（v0.4.26）
     const DEFAULT_USER_TEMPLATE =
 `## 已知主角
 用户角色：{{name1}}；对手角色：{{name2}}。其余出场者按原文名字记录。
@@ -677,7 +682,7 @@
   "relation": "{{name2}} 此刻对 {{name1}} 的态度与关系，一句话 ≤40 字，写现状不写过程；本段没有变化则留空字符串",
   "principal": {
     "{{name1}}": {"role": "职业/身份", "home": "住处", "body": "长期身体变化", "family": "婚姻家庭状况", "floor": 楼层号},
-    "{{name2}}": {"role": "职业/身份", "home": "住处", "body": "长期身体变化", "family": "婚姻家庭状况", "knows": "已经知道了 {{name1}} 的哪些事/秘密，一条一句、『；』分隔", "floor": 楼层号},
+    "{{name2}}": {"name": "此人在原文里用的名字（全名与常用简称，用 / 分隔）", "role": "职业/身份", "home": "住处", "body": "长期身体变化", "family": "婚姻家庭状况", "knows": "已经知道了 {{name1}} 的哪些事/秘密，一条一句、『；』分隔", "floor": 楼层号},
     "between": {"v": "两人关系的形态：陌生/同事/朋友/恋人/同居/订婚/已婚/分手…，以及 {{name1}} 明言的约定或界限（如『说好只做朋友』）", "floor": 楼层号}
   },
   "people": [
@@ -700,7 +705,7 @@ JSON 结束后另起一行输出 ${END_MARK} 作为结束标记。
 - cast 是点名表：本段每一个有名字或固定称呼的人都要在，包括只被提到、没到场的。漏一个人比多写十个龙套更糟。
 - tier 按对剧情的影响判，不按是否在场：不在场但影响了事件走向的人（打电话提醒、发消息、被反复提起的亲属）算主或配；在场但只提供服务、没有自己意图的人（店员、司机、随从）算龙套。
 - people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键；不知道的不写『未知』『不详』这类占位词，档案里只放原文有依据的话。没变化的人不必出现在 people 里，但必须出现在 cast 里。
-- principal 是主角现状表，只记『之后所有场景都会沿用』的改变：换了工作或身份、搬了家、身体留下长期变化（怀孕、伤疤、残疾、重病）、结婚离婚订婚分手、知道了某个秘密。当天在哪、穿什么、心情、临时受伤不算。写现值不写过程（『副总监』不是『升职了』）。本段没有这类改变就不写这个键；{{name2}} 不是一个具体人物就不写 {{name2}} 那一项。knows 只写本段新知道的，不用重复上次记录里已有的。
+- principal 是主角现状表，只记『之后所有场景都会沿用』的改变：换了工作或身份、搬了家、身体留下长期变化（怀孕、伤疤、残疾、重病）、结婚离婚订婚分手、知道了某个秘密。当天在哪、穿什么、心情、临时受伤不算。写现值不写过程（『副总监』不是『升职了』）。本段没有这类改变就不写这个键。角色卡名「{{card_name}}」不一定是此人在故事里的名字：原文里此人用的不是 {{name2}} 这个名字（或者有了新名字）时，{{name2}} 那一项每段都写 name，没有别的改变也写；{{name2}} 不是一个具体人物就不写 {{name2}} 那一项。knows 只写本段新知道的，不用重复上次记录里已有的。
 - 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
 - 档案里已标了性别的人以档案为准；若本段原文明确相反，照原文写 sex，可能是同名的另一个人。
 - views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
@@ -732,8 +737,20 @@ C = 日常、闲聊、氛围、无后果的互动。
     };
 
     const fv = (ent, k) => ent?.f?.[k]?.v || '';
-    const personLabel = k => PERSON_LABEL[k].replace('{{user}}', getCtx().name1 || '{{user}}').replace('{{char}}', getCtx().name2 || '{{char}}');
-    const principalName = key => { const ctx = getCtx(); return key === 'user' ? (ctx.name1 || '{{user}}') : (ctx.name2 || '{{char}}'); };
+    // {{char}} 的名字（v0.4.26）：角色卡名不一定是人名——「Sub Rosa」「镜花水月」这类标题卡，描述是空的、人设全在世界书里，正文里的人叫沃斯·奥尔德伦 / 赵兖。
+    // 只认卡名时，副 AI 照「有正式名用正式名」把他点名进来，插件认不出是主角，另建一张配角档（一个人劈成主角卡 + 配角卡两半，两张都注入）。
+    // data.charName.names = 故事里的名字：第一个用来显示、喂副 AI、注入；全部连同卡名都认作主角。空 = 卡名，卡名就是人名的卡一切照旧。
+    // 认 AI 楼（isAiFloor）仍看卡名：消息署名就是卡名。直接读元数据、不走 getData（personLabel 每个字段都要调）
+    const cardName = () => getCtx().name2 || '';
+    const charNames = data => { const n = (data || getCtx().chatMetadata?.[META_KEY])?.charName?.names; return Array.isArray(n) ? n.filter(Boolean) : []; };
+    const charDisplay = data => charNames(data)[0] || cardName() || '{{char}}';
+    const charNormSet = data => new Set([cardName(), ...charNames(data)].map(norm).filter(Boolean));
+    // 人物志里的 {{char}} 本人：认出名字之前（或 v0.4.26 前的老聊天）副 AI 按原文名字给他建的配角档。名字落在主角名单里、或别称就是显示名才算
+    // （不拿别称对小名：「赵总」这种称呼可能也是别人的别称）。这种卡不注入、不喂副 AI 档案、不当召回实体；面板标出、主角卡提示「并进主角卡」，不自动删（认错了删的就是真配角）
+    const isCharCard = (p, set, disp) => set.has(norm(p.name)) || (!!disp && (p.aliases || []).some(a => norm(a) === disp));
+    const charCardFilter = data => { const set = charNormSet(data), disp = norm(charNames(data)[0] || ''); return p => !isCharCard(p, set, disp); };
+    const personLabel = k => PERSON_LABEL[k].replace('{{user}}', getCtx().name1 || '{{user}}').replace('{{char}}', charDisplay());
+    const principalName = (key, data) => key === 'user' ? (getCtx().name1 || '{{user}}') : charDisplay(data);
 
     // 主角现状的行：两人关系（形态 + {{char}} 的态度）一行，user / char 各一行只列有值的键，每值带来源楼号；全空返回 []
     // 喂回副模型（「上次记录」）与注入块共用，withFloor=false 时不带楼号
@@ -742,18 +759,18 @@ C = 日常、闲聊、氛围、无后果的互动。
         const tag = v => withFloor && v?.idx != null ? `(#${v.idx})` : '';
         const lines = [];
         const bond = pr.both?.f?.bond, rel = data.relation;
-        const pair = [bond?.v ? `${bond.v}${tag(bond)}` : '', rel?.v ? `${principalName('char')} 对 ${principalName('user')}：${rel.v}${tag(rel)}` : ''].filter(Boolean);
+        const pair = [bond?.v ? `${bond.v}${tag(bond)}` : '', rel?.v ? `${principalName('char', data)} 对 ${principalName('user')}：${rel.v}${tag(rel)}` : ''].filter(Boolean);
         if (pair.length) lines.push(`- 两人关系：${pair.join('｜')}`);
         for (const key of ['user', 'char']) {
             const parts = PRINCIPAL_FIELDS[key].filter(k => fv(pr[key], k)).map(k => `${PRINCIPAL_LABEL[k]} ${fv(pr[key], k)}${tag(pr[key].f[k])}`);
-            if (parts.length) lines.push(`- ${principalName(key)}：${parts.join('·')}`);
+            if (parts.length) lines.push(`- ${principalName(key, data)}：${parts.join('·')}`);
         }
         return lines;
     }
 
-    // 人物一行一个、名字单独在行首（别称挪到行尾）：名字与别称粘在一起时副模型会把整段抄成 name（见 splitName）
+    // 人物一行一个、名字单独在行首（别称挪到行尾）：名字与别称粘在一起时副模型会把整段抄成 name（见 splitName）；{{char}} 本人的旧配角档不列（他已是「对手角色」）
     function rosterText(data) {
-        const p = data.people.map(x => {
+        const p = data.people.filter(charCardFilter(data)).map(x => {
             const tag = [x.tier, fv(x, 'sex')].filter(Boolean).join('·');
             return `- ${x.name}${tag ? ` [${tag}]` : ''}${fv(x, 'role') ? ` ${fv(x, 'role')}` : ''}${x.aliases?.length ? `；别称：${x.aliases.join('/')}` : ''}`;
         });
@@ -789,7 +806,8 @@ C = 日常、闲聊、氛围、无后果的互动。
         const fmtRecent = e => `[${e.id}] ${e.story_time || '（时间未知）'} | ${e.title} | ${e.summary}`;
         const vars = {
             name1: ctx.name1 || '{{user}}',
-            name2: ctx.name2 || '{{char}}',
+            name2: charDisplay(input.data),
+            card_name: cardName() || '{{char}}',
             roster: input.data ? rosterText(input.data) : '（无）',
             relation: (input.data && principalLines(input.data).join('\n')) || '（尚无记录）',
             context: (input.data && contextText(input.data, floors[0]?.idx ?? Infinity)) || '（无）',
@@ -863,6 +881,51 @@ C = 日常、闲聊、氛围、无后果的互动。
     };
     const findItem = (data, name) => { const n = norm(name); return n ? data.items.find(x => norm(x.name) === n) || null : null; };
 
+    // 一串名字拆成单个（「沃斯·奥尔德伦/沃斯」「赵兖（阿兖、小兖）」）：括号也当分隔；去占位词、相对称谓、{{user}} 的名字、过长的（那是句子不是名字）、重复的。
+    // 间隔号「·」与空格不拆（「沃斯·奥尔德伦」「Sub Rosa」是一个名字）
+    const NAMES_MAX = 6;
+    function splitNames(raw) {
+        const me = norm(getCtx().name1);
+        const out = [];
+        for (const s0 of String(raw || '').replace(/[（）()]/g, '/').split(/[\/／、,，;；|｜]/)) {
+            const s = s0.trim();
+            if (!s || s.length > 24 || PLACEHOLDER_RX.test(s) || isRelative(s) || norm(s) === me || out.some(x => norm(x) === norm(s))) continue;
+            out.push(s);
+        }
+        return out.slice(0, NAMES_MAX);
+    }
+    // 副 AI 在主角现状 {{char}} 那一项报的 name：手填过（manual）不动；新名字追加在后，第一个仍是显示名；
+    // 报的名字里含卡名 = 卡名本身就是人名 → 卡名排第一（「赵兖/阿兖」不会把显示名换成小名）。返回是否有改动
+    function learnCharNames(data, raw) {
+        if (!data.charName || typeof data.charName !== 'object' || !Array.isArray(data.charName.names)) data.charName = { names: [], manual: false, noHint: false };
+        if (data.charName.manual) return false;
+        const got = splitNames(raw);
+        const card = cardName(), cur = charNames(data);
+        const have = new Set([card, ...cur].map(norm));
+        const add = got.filter(s => !have.has(norm(s)));
+        if (!add.length) return false;
+        const base = cur.length ? cur : (card && got.some(s => norm(s) === norm(card)) ? [card] : []);
+        data.charName.names = [...base, ...add].slice(0, NAMES_MAX);
+        return true;
+    }
+    // 把人物志里的 {{char}} 本人并进主角卡（面板点了才做）：主角卡白名单里有、主角卡还空着的项（身份）搬过去，知情取并集（主角卡手改锁定的不动）；
+    // 此人对 {{user}} 的看法填进空着的态度行、与 {{user}} 的关系填进空着的两人关系；外貌/现状/阶段/对旁人的看法这类主角卡不记的项丢掉；
+    // 然后删档，不进墓碑（名字已认作主角，副 AI 再报也不会建档；用户清掉名字后他还能照常回来）
+    function absorbCharCard(data, p) {
+        const ch = data.principal.char.f;
+        for (const k of PRINCIPAL_FIELDS.char) {
+            const src = p.f?.[k]; if (!src?.v) continue;
+            if (!ch[k]?.v) { ch[k] = { ...src, hist: [...(src.hist || [])] }; continue; }
+            if (k === 'knows' && !ch[k].manual) ch[k] = { ...ch[k], v: mergeKnows(ch[k].v, src.v) };
+        }
+        const me = norm(getCtx().name1);
+        const view = Object.entries(p.views || {}).find(([to, v]) => v?.v && norm(to) === me)?.[1];
+        if (view && !data.relation?.v && !data.relation?.manual) data.relation = { v: view.v, idx: view.idx ?? null, date: view.date || '', hist: [...(view.hist || [])].map(({ trend, ...h }) => h) };
+        const ru = p.f?.rel_user;
+        if (ru?.v && !data.principal.both.f.bond?.v) data.principal.both.f.bond = { ...ru, hist: [...(ru.hist || [])] };
+        data.people = data.people.filter(x => x !== p);
+    }
+
     // 人物志/物件/关系现状合并：同实体同字段，新的非空值覆盖旧值并更新来源楼层号；主角不建档，{{char}} 只更新关系行
     // 顺序：cast 点名表（建档 + 档位 + 别称）→ people 字段更新（含 arc / views）→ items → 事件 characters 反哺（漏点名的也建档）
     function mergeEntities(data, obj, w, byIdx, made = []) {
@@ -897,8 +960,10 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (cur === s) delete ent.sexClash;
             setF(ent, 'sex', s, idx);
         };
-        const me = norm(ctx.name1), them = norm(ctx.name2);
-        const isLead = n => n === me || n === them;
+        // 主角名单：{{user}} 的名字 + {{char}} 的卡名与故事里的名字；本窗主角现状报了新名字会在处理点名表之前刷新（见下）
+        const me = norm(ctx.name1);
+        let chars = charNormSet(data);
+        const isLead = n => n === me || chars.has(n);
         const touch = (ent, idx) => { ent.last_idx = Math.max(ent.last_idx || 0, idx); if (ent.first_idx == null || idx < ent.first_idx) { ent.first_idx = idx; ent.first_date = dateOf(idx); } ent.updated_at = Date.now(); if (ent.lost) delete ent.lost; };
         const addAliases = (ent, list) => { for (const a of list) if (norm(a) !== norm(ent.name) && !ent.aliases.some(x => norm(x) === norm(a)) && !isLead(norm(a)) && !isRelative(a)) ent.aliases.push(a); };
         // 找到或新建；若按别称命中且模型明确把档案里的旧名列为别称，则升级为真名（「陆母」→「王秀英」）；墓碑里的名字不建档；
@@ -940,7 +1005,10 @@ C = 日常、闲聊、氛围、无后果的互动。
             const pick = names => { for (const k of Object.keys(pr)) if (names.includes(norm(k))) return pr[k]; return null; };
             const put = (holder, src, keys) => { if (!src || typeof src !== 'object') return; const idx = floorOf(src.floor); for (const k of keys) setF(holder, k, src[k], idx); };
             put(data.principal.user, pick([me, 'user', 'name1', '{{user}}', '{{name1}}']), PRINCIPAL_FIELDS.user);
-            put(data.principal.char, pick([them, 'char', 'name2', '{{char}}', '{{name2}}']), PRINCIPAL_FIELDS.char);
+            // {{char}} 那一项带 name（故事里的名字）就记下，并在点名表之前刷新主角名单：本窗点名表里的他不会再被当配角建档（v0.4.26）
+            const cp = pick([...chars, 'char', 'name2', '{{char}}', '{{name2}}']);
+            if (cp && typeof cp === 'object' && learnCharNames(data, cp.name)) chars = charNormSet(data);
+            put(data.principal.char, cp, PRINCIPAL_FIELDS.char);
             const b = pr.between;
             if (b) setF(data.principal.both, 'bond', typeof b === 'object' ? (b.v ?? b.text ?? b.state) : b, floorOf(typeof b === 'object' ? b.floor : undefined));
         }
@@ -963,7 +1031,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const name = String(p?.name || '').trim();
             if (!name) continue;
             const n = norm(splitName(name).name);
-            if (n === them) {
+            if (chars.has(n)) {
                 const r = String(p.rel_user || '').trim();
                 if (!rel && r) setRelation(r, floorOf(p.floor));
                 continue;
@@ -1136,7 +1204,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     function backfillPeople() {
         const data = getData(); if (!data) return 0;
         const ctx = getCtx();
-        const me = norm(ctx.name1), them = norm(ctx.name2);
+        const me = norm(ctx.name1), chars = charNormSet(data);
         const chat = ctx.chat || [];
         const before = data.people.length;
         for (const e of data.entries) {
@@ -1145,7 +1213,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             for (const raw of (e.characters || [])) {
                 const sp = splitName(raw), name = sp.name, aliases = sp.aliases.filter(a => !isRelative(a));
                 const n = norm(name);
-                if (!n || n === me || n === them || isRelative(name) || isTomb(data, 'p', name)) continue;
+                if (!n || n === me || chars.has(n) || isRelative(name) || isTomb(data, 'p', name)) continue;
                 let ent = findPerson(data, name) || aliases.map(a => findPerson(data, a)).find(Boolean);
                 if (!ent) {
                     ent = { id: uid('p'), name, aliases: [], f: {}, views: {}, tier: '', state: '', seen: 0, first_idx: idx, first_date: chat[idx]?.send_date || '', last_idx: idx, created_at: Date.now(), updated_at: Date.now() };
@@ -1754,7 +1822,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         let used = 0;
         const pr = principalLines(data);
         if (pr.length) lines.push('', '## 主角现状（剧情中已发生、列出的项比人设卡更新；没列的仍按卡）', ...pr);
-        const people = data.people.filter(p => !isExtra(p) && !p.lost);
+        const people = data.people.filter(p => !isExtra(p) && !p.lost).filter(charCardFilter(data));   // {{char}} 本人的旧配角档不出卡（主角现状里已经有他）
         if (people.length) {
             const text = recentText(chat, Math.max(1, Number(settings.npcScanDepth) || 6));
             const active = people.filter(p => mentioned(p, text) && !isThin(p, PERSON_FIELDS)).sort((a, b) => (b.last_idx || 0) - (a.last_idx || 0));
@@ -1927,7 +1995,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         ];
         const pr = principalLines(data, false);
         if (pr.length) parts.push('', '## 主角（截至前史结束时）', ...pr);
-        const people = data.people.filter(p => !isExtra(p) && !p.lost);
+        const people = data.people.filter(p => !isExtra(p) && !p.lost).filter(charCardFilter(data));
         if (people.length) {
             const KEEP = PERSON_FIELDS.filter(k => !['status', 'arc'].includes(k));
             const full = [], brief = [];
@@ -2262,7 +2330,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         return t;
     }
 
-    // 实体：配角的名字与别称、物件名（≥2 字；主角不进人物志，天然不算）。别称一并展开：用户说「埃琳娜」，人物栏写 Elena 的条目也算；
+    // 实体：配角的名字与别称、物件名（≥2 字；主角不进人物志，天然不算；{{char}} 本人的旧配角档同样不算）。别称一并展开：用户说「埃琳娜」，人物栏写 Elena 的条目也算；
     // 带间隔号的名字拆段（「卡米拉·奥尔西尼」→ 卡米拉 / 奥尔西尼：用户常只叫名或只叫姓）。
     // 物件不补「核心名词」（试过：「裸粉色发圈」补「发圈」、几把手机都补「手机」，场景里随口一提就把一串旧条目全拉进来，真实聊天回放噪声翻了十倍）
     const entTokens = ent => {
@@ -2274,7 +2342,8 @@ C = 日常、闲聊、氛围、无后果的互动。
         const t = norm(text);
         if (!t) return [];
         const out = [];
-        for (const p of data.people) { if (p.lost) continue; const toks = entTokens(p); if (toks.some(x => t.includes(x))) out.push({ kind: 'p', name: p.name, toks }); }
+        const notChar = charCardFilter(data);
+        for (const p of data.people) { if (p.lost || !notChar(p)) continue; const toks = entTokens(p); if (toks.some(x => t.includes(x))) out.push({ kind: 'p', name: p.name, toks }); }
         for (const it of data.items) { if (it.lost || isProp(it)) continue; const toks = entTokens(it); if (toks.some(x => t.includes(x))) out.push({ kind: 'i', name: it.name, toks }); }
         return out;
     }
@@ -3304,7 +3373,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             <div class="em-sec">提示词</div>
             <label>记忆导演指令（附加到每次摘要，可空）<textarea id="em_directive" class="text_pole" rows="2" placeholder="例：重点记录承诺与信息差"></textarea></label>
             <label>系统提示词（留空用默认）<textarea id="em_sys_prompt" class="text_pole" rows="3"></textarea></label>
-            <label>摘要模板（留空用默认；必须含 {{material}}，其余占位符：{{name1}} {{name2}} {{roster}} {{relation}} {{context}} {{recent}} {{locked}} {{floor_range}} {{floor_count}} {{min_events}} {{max_events}} {{directive}}）<textarea id="em_tpl" class="text_pole" rows="8"></textarea></label>
+            <label>摘要模板（留空用默认；必须含 {{material}}，其余占位符：{{name1}} {{name2}}（{{char}} 在故事里的名字，没记到就是卡名） {{card_name}}（角色卡名） {{roster}} {{relation}} {{context}} {{recent}} {{locked}} {{floor_range}} {{floor_count}} {{min_events}} {{max_events}} {{directive}}）<textarea id="em_tpl" class="text_pole" rows="8"></textarea></label>
             <label>注入块块首说明（每行一条，留空用默认；告诉主模型远景/正典/往事/知情栏各是什么）<textarea id="em_header" class="text_pole" rows="3"></textarea></label>
             <div class="em-row">
                 <div class="menu_button" id="em_tpl_fill">把默认模板填进来改</div>
@@ -3791,7 +3860,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             expanded.has(id) ? expanded.delete(id) : expanded.add(id);
             renderPanel();
         });
-        $('#em_rel_box').on('click', '[data-pact]', function (ev) { ev.stopPropagation(); principalAction($(this).data('pact'), $(this).closest('.em-pr-card').data('key')); });
+        $('#em_rel_box').on('click', '[data-pact]', function (ev) { ev.stopPropagation(); principalAction($(this).data('pact'), $(this).closest('.em-pr-card').data('key'), $(this).data('pid')); });
         $('#em_rel_box').on('click', '.em-pr-card .em-unlock', function (ev) { ev.stopPropagation(); principalAction('unlock', $(this).closest('.em-pr-card').data('key'), String($(this).data('lk') || '').replace(/^f:/, '')); $(this).remove(); });
         $('#em_outline').on('click', '.em-oline-head', function () {
             const id = $(this).closest('.em-oline').data('id');
@@ -3999,7 +4068,9 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (kind === 'p' && HEAT_LABEL[heat]) badges.push(`<span class="em-tier em-heat-${heat}">${HEAT_LABEL[heat]}</span>`);
         if (x.lost) badges.push('<span class="em-tier em-lost" title="首见楼与所有来源楼都已被删：不注入；再次被提到或手动保存即恢复">来源全失</span>');
         if (kind === 'p' && x.sexClash?.v) badges.push(`<span class="em-tier em-clash" title="副 AI 在 #${x.sexClash.idx} 报此人为「${esc(x.sexClash.v)}」，档案是「${esc(fv(x, 'sex'))}」：可能是同名的另一个人，那一段的更新没有并进来。保存本卡即清除；若真是两个人，改名字或别称区分">⚠性别冲突</span>`);
-        const dim = kind === 'p' ? x.tier === '龙套' || x.lost : (isProp(x) || isSettled(x) || x.lost);
+        const charCard = kind === 'p' && !charCardFilter()(x);
+        if (charCard) badges.push(`<span class="em-tier em-charcard" title="名字就是 ${esc(charDisplay())}（{{char}}）：这是主角本人的旧配角档，注入时不出这张卡、也不再更新。主角卡上点「并进主角卡」可以把身份、知情搬过去后删掉它">主角本人·不注入</span>`);
+        const dim = kind === 'p' ? x.tier === '龙套' || x.lost || charCard : (isProp(x) || isSettled(x) || x.lost);
         const sel = (cls, list, cur, none, extra) => `<select class="${cls}"><option value="">${none}</option>${list.map(t => `<option value="${t}" ${cur === t ? 'selected' : ''}>${t}${extra?.(t) || ''}</option>`).join('')}</select>`;
         return `
         <div class="em-ent${dim ? ' em-ent-extra' : ''}" data-id="${x.id}">
@@ -4059,19 +4130,62 @@ C = 日常、闲聊、氛围、无后果的互动。
                 return `<div class="em-ent-row"><span class="em-ent-k">${PRINCIPAL_LABEL[k]}</span><span class="em-ent-v">${esc(f.v)}${valMark(f, `f:${k}`)}</span><span class="em-floor em-jump" data-idx="${f.idx}" title="点击跳到该楼">#${f.idx}</span></div>`;
             }).join('');
             const last = Math.max(-1, ...keys.map(k => x.f[k]?.idx ?? -1));
+            // {{char}} 卡（v0.4.26）：卡头名字后列其余名字与卡名；编辑态多一栏「名字」；卡头下两种提示（见 charCardHints）
+            let note = '', nameRow = '', hints = '';
+            if (key === 'char') {
+                const cardNm = cardName(), names = charNames(data), cn = data.charName || {};
+                const others = [...names.slice(1), ...(names.length && cardNm && !names.some(n => norm(n) === norm(cardNm)) ? [`卡名 ${cardNm}`] : [])];
+                if (others.length) note = `<span class="em-ent-alias">（${esc(others.join(' / '))}）</span>`;
+                if (open) nameRow = `<label>名字（故事里怎么称呼；多个用 / 分隔，第一个用来显示，其余也认作主角；留空 = 用卡名「${esc(cardNm)}」）${valMark(cn.manual ? { manual: true } : null, 'n:')}<input class="text_pole em-pr-name" value="${esc(names.join(' / '))}" placeholder="${esc(cardNm)}"></label>`;
+                hints = charCardHints(data);
+            }
             return `
         <div class="em-ent em-pr-card" data-key="${key}">
-            <div class="em-ent-head"><span class="em-ent-name">👤 ${esc(principalName(key))}<span class="em-tier em-tier-a">主角</span></span><span class="em-floor">${last >= 0 ? `最近变化 #${last}` : '无长期变化记录'}</span></div>
-            ${open ? `<div class="em-ent-body">${rows}<div class="em-actions"><div class="menu_button" data-pact="save">保存</div><div class="menu_button" data-pact="cancel">取消</div></div></div>`
+            <div class="em-ent-head"><span class="em-ent-name">👤 ${esc(principalName(key, data))}${note}<span class="em-tier em-tier-a">主角</span></span><span class="em-floor">${last >= 0 ? `最近变化 #${last}` : '无长期变化记录'}</span></div>
+            ${hints}
+            ${open ? `<div class="em-ent-body">${nameRow}${rows}<div class="em-actions"><div class="menu_button" data-pact="save">保存</div><div class="menu_button" data-pact="cancel">取消</div></div></div>`
                 : (rows ? `<div class="em-ent-rows">${rows}</div>` : '')}
         </div>`;
         };
         return `
         <div class="em-rel">
             ${line('em_bond', '两人关系（形态：同事 / 恋人 / 同居 / 已婚…，含明言的约定）', bond, '（尚无记录，总结后由副 AI 填写，也可手改）')}
-            ${line('em_rel', `${esc(principalName('char'))} 对 ${esc(principalName('user'))} 的态度`, rel, '（尚无记录，总结后由副 AI 填写，也可手改）')}
+            ${line('em_rel', `${esc(principalName('char', data))} 对 ${esc(principalName('user'))} 的态度`, rel, '（尚无记录，总结后由副 AI 填写，也可手改）')}
         </div>
         <div class="em-ents em-pr">${card('user')}${card('char')}</div>`;
+    }
+
+    // {{char}} 卡头下的提示：①人物志里还有他本人的旧配角档（老聊天、或副 AI 认出名字之前建的）→「并进主角卡」；
+    // ②还没有故事里的名字、已经总结过、卡名却从没在正文里出现过 → 提醒填名字（副 AI 用默认模板总结时也会自己报）；旁白/群像卡点「不用」就不再提示
+    function charCardHints(data) {
+        const notChar = charCardFilter(data);
+        const out = data.people.filter(p => !notChar(p)).map(p =>
+            `<div class="em-hint em-pr-hint">人物志里还有一张「${esc(p.name)}」的配角卡，是主角本人（副 AI 认出名字之前建的），注入时已经不出这张卡。<span class="em-link" data-pact="absorb" data-pid="${esc(p.id)}">并进主角卡</span></div>`);
+        const cardNm = cardName();
+        if (cardNm && !charNames(data).length && !data.charName?.manual && !data.charName?.noHint && data.windows.some(w => w.status === 'ok') && !cardNameSeen())
+            out.push(`<div class="em-hint em-pr-hint">卡名「${esc(cardNm)}」没在正文里出现过：角色在故事里另有名字的话，<span class="em-link" data-pact="name">点这里填上</span>（副 AI 总结时也会自己认）。<span class="em-link" data-pact="nohint">不用，这张卡没有单一主角</span></div>`);
+        return out.join('');
+    }
+    // 卡名在 AI 楼正文里出现过没有（跳过开场白：标题卡的开场白常是目录页、带着标题）；按聊天 + 楼数缓存，面板每次重画不重扫
+    const cardSeenMemo = { key: '', v: true };
+    function cardNameSeen() {
+        const ctx = getCtx(), chat = ctx.chat || [], card = norm(cardName());
+        const key = `${ctx.chatId}|${chat.length}|${card}`;
+        if (cardSeenMemo.key === key) return cardSeenMemo.v;
+        let v = !card;
+        for (let i = 1; !v && i < chat.length; i++) if (isAiFloor(chat[i], ctx) && norm(extractContent(chat[i].mes).text).includes(card)) v = true;
+        cardSeenMemo.key = key; cardSeenMemo.v = v;
+        return v;
+    }
+    const absorbText = (data, p) => `把人物志里的「${p.name}」并进 ${charDisplay(data)} 的主角卡？\n身份、知情会搬过去（主角卡上已有的不覆盖），此人对 ${getCtx().name1 || '{{user}}'} 的看法和关系填进空着的态度行、两人关系行；外貌、现状、阶段这类主角卡不记的项丢掉，然后删掉这张人物卡。`;
+    // 面板改了名字之后：人物志里有他本人的旧配角档就逐张问一句要不要并进来
+    async function offerAbsorb(data) {
+        for (const p of data.people.filter(x => !charCardFilter(data)(x))) {
+            if (!await confirmBox(absorbText(data, p))) continue;
+            absorbCharCard(data, p);
+            saveData(); applyInjection(); renderPanel(); refreshStatus();
+            toast('success', `「${p.name}」已并进主角卡`);
+        }
     }
 
     // 保存提示按实际结果说：没锁任何字段就不说「已锁定」
@@ -4082,7 +4196,18 @@ C = 日常、闲聊、氛围、无后果的互动。
         const x = data.principal[key]; if (!x) return;
         const id = `pr_${key}`;
         if (act === 'save') {
-            let locked = 0;
+            let locked = 0, renamed = false;
+            // {{char}} 的名字：和原来不同才算手改（上锁，副 AI 不再改）
+            const nameInp = key === 'char' ? $('#em_rel_box .em-pr-card[data-key="char"] .em-pr-name') : null;
+            if (nameInp?.length) {
+                const names = splitNames(nameInp.val());
+                // 清空也算手改：锁在卡名上（旁白/群像卡被副 AI 认错了人时，清掉不会下一段又被认回来）；点名字旁的 🔒 才恢复自动认
+                if (names.join('/') !== charNames(data).join('/')) {
+                    data.charName = { names, manual: true, noHint: !!data.charName?.noHint };
+                    renamed = names.length > 0;
+                    locked++;
+                }
+            }
             $(`#em_rel_box .em-pr-card[data-key="${key}"] .em-pr-f`).each(function () {
                 const k = $(this).data('k');
                 const v = this.value.trim();
@@ -4091,12 +4216,27 @@ C = 日常、闲聊、氛围、无后果的互动。
             });
             saveData(); applyInjection(); expanded.delete(id); renderPanel();
             toast('success', lockedNote(locked));
+            if (renamed) offerAbsorb(data);
         } else if (act === 'unlock') {
-            // 点值旁的 🔒：只解这一个字段
-            if (x.f[key2]) delete x.f[key2].manual;
+            // 点值旁的 🔒：只解这一个字段（n: = {{char}} 的名字，解锁后副 AI 报的新名字照常追加）
+            if (key2 === 'n:') { if (data.charName) data.charName.manual = false; }
+            else if (x.f[key2]) delete x.f[key2].manual;
             saveData(); toast('info', '已解锁，副 AI 之后可以再改这一项');
         } else if (act === 'cancel') {
             expanded.delete(id); renderPanel();
+        } else if (act === 'name') {
+            expanded.add('pr_char'); renderPanel();
+        } else if (act === 'nohint') {
+            data.charName = { ...(data.charName || { names: [], manual: false }), noHint: true };
+            saveData(); renderPanel();
+        } else if (act === 'absorb') {
+            const p = data.people.find(v => v.id === key2); if (!p) return;
+            confirmBox(absorbText(data, p)).then(ok => {
+                if (!ok || !data.people.includes(p)) return;
+                absorbCharCard(data, p);
+                saveData(); applyInjection(); renderPanel(); refreshStatus();
+                toast('success', `「${p.name}」已并进主角卡`);
+            });
         }
     }
 
@@ -4624,7 +4764,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     ? (await confirmBox(`当前已有 ${data.entries.length} 条记忆、${data.people.length} 个人物。确定=替换，取消=合并（按 id / 名字去重）`) ? 'replace' : 'merge')
                     : 'replace';
                 if (mode === 'replace') {
-                    for (const k of ['entries', 'windows', 'people', 'items', 'relation', 'principal', 'skip', 'archives', 'hidden', 'outline', 'canon', 'recaps', 'tombstones']) data[k] = src[k];
+                    for (const k of ['entries', 'windows', 'people', 'items', 'relation', 'principal', 'charName', 'skip', 'archives', 'hidden', 'outline', 'canon', 'recaps', 'tombstones']) data[k] = src[k];
                     data.vec = { ...defaultData().vec, v: data.vec?.v, fp: data.vec?.fp || '', gen: data.vec?.gen || 0, stale: data.vec?.stale || [] };   // 向量库是服务端索引：对账表清空，下次对账按集合实况补齐/删多余
                 } else {
                     const eIds = new Set(data.entries.map(e => e.id)), wIds = new Set(data.windows.map(w => w.id));
@@ -4634,6 +4774,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     for (const it of src.items) if (!findItem(data, it.name)) data.items.push(it);
                     if (!data.relation?.v && src.relation?.v) data.relation = src.relation;
                     for (const key of Object.keys(PRINCIPAL_FIELDS)) for (const k of PRINCIPAL_FIELDS[key]) if (!fv(data.principal[key], k) && src.principal?.[key]?.f?.[k]?.v) data.principal[key].f[k] = src.principal[key].f[k];
+                    if (!charNames(data).length && charNames(src).length) data.charName = src.charName;
                     Object.assign(data.skip, src.skip || {});
                     const oIds = new Set(data.outline.lines.map(l => l.id));
                     for (const l of (src.outline?.lines || [])) if (!oIds.has(l.id)) data.outline.lines.push(l);
@@ -4723,6 +4864,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         VEC_RETRY, ADMIT_Z, GATE_Z, VEC_BATCH,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
         prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist, fmtEntry, KNOWS_RULE, defaultHeader, knownOutside, pv, isThin, PERSON_FIELDS,
+        cardName, charNames, charDisplay, charNormSet, isCharCard, charCardFilter, splitNames, learnCharNames, absorbCharCard, charCardHints, cardNameSeen, principalAction, personLabel,
     };
 
     jQuery(() => {
