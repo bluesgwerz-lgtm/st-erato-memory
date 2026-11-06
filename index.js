@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.26';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.27';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -248,6 +248,7 @@
             skip: {},
             hidden: {},   // 本插件隐藏过的楼层 send_date → true；只恢复自己藏的
             customRx: false,   // 本聊天是否启用设置里的自定义正文提取/剥除正则（按聊天记：测别家预设的聊天勾上，Erato 聊天不受影响）
+            paused: false,     // 本聊天暂停记忆（v0.4.27）：不自动总结、不注入、不召回、不整理、不藏楼；已有记忆原样留着，面板照常看和改。按聊天记，清空记忆也不解除
             stats: { lastIngestAt: 0, lastError: '', failStreak: 0 },
             rawLog: [],   // 最近几次副 API 原始回复 { at, win, model, finish, text }，诊断用
         };
@@ -312,6 +313,8 @@
     }
 
     const saveData = () => getCtx().saveMetadataDebounced();
+    const chatPaused = () => !!getData()?.paused;
+    const PAUSED_TIP = '本聊天的记忆已暂停，先点面板顶上的「恢复」';
 
     const sortEntries = data => data.entries.sort((a, b) => (a.src?.idx ?? 0) - (b.src?.idx ?? 0) || (a.ord ?? 0) - (b.ord ?? 0) || (a.created_at ?? 0) - (b.created_at ?? 0));
     const sortWindows = data => data.windows.sort((a, b) => (a.floors[0] ?? 0) - (b.floors[0] ?? 0));
@@ -668,7 +671,7 @@
       "story_time": "沿用该楼作者摘要的『日期 · 时段 · 场景』原文；没有则从正文推断；推断不出就不写这个键，禁止编造",
       "type": "plot | emotion | intimacy | relationship | setting 之一。setting=新角色登场/世界观揭示/规则确立",
       "title": "≤8字，意象或事件名，不用『之后』『开始』这类空词",
-      "summary": "80–200字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。必须保留正式人名、原文称呼、地点、关键物件和具体动作；禁止『两人发生冲突』『关系升温』这类不带主语宾语的空话；未来只凭一句口语提法也要能认出这条。可保留1句决定走向的原台词。去掉感官修辞。",
+      "summary": "80–200字。以事件为单位写起因→经过→结果，写『为什么』而不只是『做了什么』。必须保留正式人名、原文称呼、地点、关键物件和具体动作；禁止『两人发生冲突』『关系升温』这类不带主语宾语的空话；未来只凭一句口语提法也要能认出这条。可保留1句决定走向的原台词。去掉感官修辞。原文的『今天』『昨晚』『明天』按本楼日期换成具体的日子（周二说的『明天』写『周三』），推不出日期就写『当天』『前一晚』『次日』。",
       "characters": ["与本事件有关的人：在场有行动的，以及不在场但影响了走向的（打电话、发消息、被转述、被提醒的人）。只用正式名，不用代词，不用别称"],
       "emotion_shift": "『角色：A→B』格式，一人一句，无变化留空",
       "known_by": ["在场者之外还知道这件事的角色（在场的人不用列）。只有在场者知道则留空数组"],
@@ -686,7 +689,7 @@
     "between": {"v": "两人关系的形态：陌生/同事/朋友/恋人/同居/订婚/已婚/分手…，以及 {{name1}} 明言的约定或界限（如『说好只做朋友』）", "floor": 楼层号}
   },
   "people": [
-    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人叫{{name1}}时用的称呼（王哥/您/直呼其名；不是别人怎么叫此人），只在原文明确出现这个称呼、且是第一次或换了叫法时写，否则不写这个键", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "外貌一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
+    {"name": "与 cast 一致（不含 {{name1}} 与 {{name2}}）", "role": "身份/职业", "age": "原文明示的数字或大致段（二十出头/中年/比{{name1}}大几岁），没有依据不写，不从外貌推", "addr": "此人叫{{name1}}时用的称呼（王哥/您/直呼其名；不是别人怎么叫此人），只在原文明确出现这个称呼、且是第一次或换了叫法时写，否则不写这个键", "rel_user": "与{{name1}}的关系", "rel_char": "与{{name2}}的关系", "look": "此人一直如此的样子：五官、发型发色、身材、疤痕胎记纹身；衣着、表情、当场的伤不写（伤写进 status）。档案里已列外貌的，仍成立的照抄、再补本段新看到的，写成完整一句", "stance": "当前立场", "state": "在场 | 离场 | 死亡 | 下落不明", "status": "现状一句：在做什么/处境如何", "knows": "知情范围：知道哪些秘密", "arc": "≤15字，此人此刻处在什么阶段", "views": [{"to": "对象名（任何人，含主角）", "v": "一句态度", "trend": "破裂 | 厌恶 | 反感 | 陌生 | 投缘 | 亲密 | 交融"}], "floor": 该信息来自哪一楼的楼层号}
   ],
   "items": [
     {"name": "物件名", "tier": "关键 | 次要 | 摆设", "state": "待用 | 在用 | 已使用 | 已转手 | 遗失 | 损毁 | 封存", "holder": "现在在谁手里", "note": "现状一句", "meaning": "对剧情或人物的意义", "floor": 楼层号}
@@ -706,7 +709,7 @@ JSON 结束后另起一行输出 ${END_MARK} 作为结束标记。
 - tier 按对剧情的影响判，不按是否在场：不在场但影响了事件走向的人（打电话提醒、发消息、被反复提起的亲属）算主或配；在场但只提供服务、没有自己意图的人（店员、司机、随从）算龙套。
 - people 是更新表：只写本段有新信息的人，字段有则填、没有就不写这个键；不知道的不写『未知』『不详』这类占位词，档案里只放原文有依据的话。没变化的人不必出现在 people 里，但必须出现在 cast 里。
 - principal 是主角现状表，只记『之后所有场景都会沿用』的改变：换了工作或身份、搬了家、身体留下长期变化（怀孕、伤疤、残疾、重病）、结婚离婚订婚分手、知道了某个秘密。当天在哪、穿什么、心情、临时受伤不算。写现值不写过程（『副总监』不是『升职了』）。本段没有这类改变就不写这个键。角色卡名「{{card_name}}」不一定是此人在故事里的名字：原文里此人用的不是 {{name2}} 这个名字（或者有了新名字）时，{{name2}} 那一项每段都写 name，没有别的改变也写；{{name2}} 不是一个具体人物就不写 {{name2}} 那一项。knows 只写本段新知道的，不用重复上次记录里已有的。
-- 已有档案里的人，名字要与档案一模一样；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
+- 已有档案里的人和物件，name 都要与档案一模一样（档案里是「银色怀表」，就不要另写一件「怀表」「旧怀表」）；同一个人在原文里的新称呼放进 aliases。若原文给出了档案里某人的真名，name 写真名、aliases 里带上档案里的旧写法。
 - 档案里已标了性别的人以档案为准；若本段原文明确相反，照原文写 sex，可能是同名的另一个人。
 - views 写此人对他人的看法，对象可以是主角也可以是其他人；只写本段有依据的，没有就不写这个键。
 - people 的 state 是生命周期：在场=还在故事里活动；离场=剧情明确离开（出国、断交、调走、被赶走）；死亡；下落不明=失联、不知去向。没变化不写这个键。
@@ -769,10 +772,11 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
 
     // 人物一行一个、名字单独在行首（别称挪到行尾）：名字与别称粘在一起时副模型会把整段抄成 name（见 splitName）；{{char}} 本人的旧配角档不列（他已是「对手角色」）
+    // 有外貌的带上外貌（v0.4.27）：副模型看不到旧值就只写本段看到的，整条覆盖掉旧特征（331 楼样本「嘴角有小痣」被换掉）；模板要它照抄仍成立的再补新的
     function rosterText(data) {
         const p = data.people.filter(charCardFilter(data)).map(x => {
             const tag = [x.tier, fv(x, 'sex')].filter(Boolean).join('·');
-            return `- ${x.name}${tag ? ` [${tag}]` : ''}${fv(x, 'role') ? ` ${fv(x, 'role')}` : ''}${x.aliases?.length ? `；别称：${x.aliases.join('/')}` : ''}`;
+            return `- ${x.name}${tag ? ` [${tag}]` : ''}${fv(x, 'role') ? ` ${fv(x, 'role')}` : ''}${x.aliases?.length ? `；别称：${x.aliases.join('/')}` : ''}${fv(x, 'look') ? `；外貌：${fv(x, 'look')}` : ''}`;
         });
         const i = data.items.map(x => `${x.name}${x.tier ? `[${x.tier}]` : ''}${x.state ? `(${x.state})` : ''}`);
         return [p.length ? `人物：\n${p.join('\n')}` : '', i.length ? `物件：${i.join('、')}` : ''].filter(Boolean).join('\n') || '（无）';
@@ -1492,6 +1496,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     // manual = 全部未总结楼层（含最新楼）跑到底；retry = 只重跑旧窗口；后两者带进度与提示，可停
     async function ingest(source = 'auto') {
         if (!settings.enabled) return;
+        if (chatPaused()) { if (source === 'manual' || source === 'retry') toast('info', PAUSED_TIP); return; }
         if (run.busy) { run.again = true; return; }
         const ctx = getCtx();
         const chatId = ctx.chatId;
@@ -1565,6 +1570,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!data) return toast('warning', '当前没有打开聊天');
         if (run.busy) { stopRun(); toast('info', '正在停止…'); return; }
         if (!settings.enabled) return toast('warning', '插件已禁用，请先在设置里启用');
+        if (data.paused) return toast('info', PAUSED_TIP);
         if (!apiConfigured()) { togglePanel(true, 'cfg'); return toast('warning', '请先填写副 API 地址与密钥'); }
         if (isGenerating()) return toast('warning', '正在生成回复，等这一楼写完再总结');
         reconcile();
@@ -1668,7 +1674,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     // 从末尾数 keepVisible 条可见消息保留，之前的楼层：AI 楼已总结成功 → 藏；其前一条用户楼跟着藏。
     // 用户手动取消过隐藏的（data.hidden 里有但当前可见）不再自动藏，直到「取消隐藏」清表。
     function hideSummarized() {
-        if (!settings.enabled || !settings.hideSummarized) return 0;
+        if (!settings.enabled || !settings.hideSummarized || chatPaused()) return 0;
         const ctx = getCtx();
         const data = getData();
         const chat = ctx.chat || [];
@@ -2040,7 +2046,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     function applyInjection() {
         const ctx = getCtx();
         const depth = Number(settings.injectDepth) || 6;
-        if (!settings.enabled || !ctx.chatId) {
+        if (!settings.enabled || !ctx.chatId || chatPaused()) {
             ctx.setExtensionPrompt(PROMPT_KEY, '', IN_CHAT, depth, false, ROLE_SYSTEM);
             lastInject = { text: '', count: 0, chars: 0, dropped: 0, droppedIds: [], fallback: 0, outline: 0, recalled: 0, raw: 0 };
             return;
@@ -2110,7 +2116,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     };
 
     async function govern(force = false) {
-        if (gov.busy || run.busy || !settings.enabled || !apiConfigured()) return false;
+        if (gov.busy || run.busy || !settings.enabled || !apiConfigured() || chatPaused()) return false;
         const data = getData(); if (!data) return false;
         const chatId = getCtx().chatId;
         const alive = () => getData() === data && getCtx().chatId === chatId;
@@ -2376,7 +2382,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     }
 
     const rc = { key: '', promise: null, result: null, at: 0, error: '', note: '' };
-    const recallEnabled = () => !!(settings.enabled && (settings.recall.keyword || settings.recall.vector));
+    const recallEnabled = () => !!(settings.enabled && (settings.recall.keyword || settings.recall.vector) && !chatPaused());
     const recallSig = () => [settings.recall.keyword ? 'k' : '', settings.recall.raw ? 'r' : '', Number(settings.recall.topK) || 8,
         settings.recall.vector ? `v:${vecBase()}:${vecModel()}:${settings.recall.route || 'auto'}:${manualThreshold()}` : '',
         settings.recall.rerank ? `rr:${rerankModel()}` : ''].join('|');
@@ -3103,16 +3109,19 @@ C = 日常、闲聊、氛围、无后果的互动。
     function refreshStatus() {
         const c = counts();
         const bad = c.failed + c.refused;
+        const paused = chatPaused();
         const N = Math.max(0, Number(settings.autoInterval) || 0);
         const injectLine = `本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（预算裁掉 ${lastInject.dropped}）` : ''}${lastInject.outline ? ` · 远景 ${lastInject.outline} 行` : ''}${lastInject.fallback ? ` · 保底 ${lastInject.fallback}` : ''}${lastInject.recalled || lastInject.raw ? ` · 召回 ${lastInject.recalled}${lastInject.raw ? `+原文 ${lastInject.raw}` : ''}` : ''}${rc.error ? ` · ${rc.error}` : ''}${rc.note && settings.recall.vector ? ` · ${rc.note}` : ''}`;
-        const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}，不含最新两楼），单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼`;
-        $('.em-status').text(`已总结 ${c.done} 楼 / ${c.events} 条 · 待总结 ${c.todo} 楼 · 失败 ${bad} 段 · 人物 ${c.people} · 物件 ${c.items} · 已隐藏 ${c.hidden} · ${injectLine}`);
+        const autoLine = paused ? '本聊天的记忆已暂停：不自动总结，「总结到当前」也先不跑' : N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}，不含最新两楼），单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼`;
+        $('.em-status').text(`${paused ? '本聊天已暂停 · ' : ''}已总结 ${c.done} 楼 / ${c.events} 条 · 待总结 ${c.todo} 楼 · 失败 ${bad} 段 · 人物 ${c.people} · 物件 ${c.items} · 已隐藏 ${c.hidden} · ${injectLine}`);
 
         $('#em_n_ok').text(c.done); $('#em_n_todo').text(c.todo); $('#em_n_hidden').text(c.hidden); $('#em_n_bad').text(bad);
         $('#em_x_on').prop('checked', customRxOn());
         $('#em_tile_bad').toggle(bad > 0);
         $('#em_inject_line').text(injectLine);
         $('#em_auto_line').text(autoLine);
+        $('#em_paused').toggle(paused);
+        $('#em_pause_item').text(paused ? '恢复本聊天的记忆' : '暂停本聊天的记忆（不总结、不注入，已有的留着）');
 
         const main = $('#em_main');
         if (run.busy && run.manual) main.text(`停止（${run.done}/${run.total}）`).addClass('em-stop');
@@ -3123,16 +3132,16 @@ C = 日常、闲聊、氛围、无后果的互动。
             prog.find('.em-prog-txt').text(`正在总结 ${run.done}/${run.total} 楼`);
         } else prog.hide();
 
-        const suffix = run.busy ? ' · 处理中' : bad ? ` · ${bad} 段失败` : '';
+        const suffix = paused ? ' · 本聊天已暂停' : run.busy ? ' · 处理中' : bad ? ` · ${bad} 段失败` : '';
         $('#em_wand_txt').text(`记忆面板${suffix}`);
-        $('#em_wand_sum_txt').text(run.busy ? `总结到当前 · ${run.done}/${run.total || '?'}` : c.todo ? `总结到当前 · 尚有 ${c.todo} 楼` : '总结到当前 · 已全部总结');
+        $('#em_wand_sum_txt').text(paused ? '总结到当前 · 本聊天已暂停' : run.busy ? `总结到当前 · ${run.done}/${run.total || '?'}` : c.todo ? `总结到当前 · 尚有 ${c.todo} 楼` : '总结到当前 · 已全部总结');
         $('#em_wand, #em_wand_sum').toggle(!!settings.enabled);
 
         const ball = $('#em_ball');
         if (ball.length) {
-            ball.toggleClass('em-busy', run.busy).toggleClass('em-warn', !run.busy && bad > 0).toggleClass('em-has-badge', c.todo > 0 || bad > 0);
-            $('#em_ball_badge').text(bad && !run.busy ? bad : c.todo);
-            ball.attr('title', `Erato Memory：待总结 ${c.todo}${bad ? `，失败 ${bad}` : ''}`);
+            ball.toggleClass('em-busy', run.busy).toggleClass('em-warn', !run.busy && bad > 0).toggleClass('em-paused-ball', paused).toggleClass('em-has-badge', paused || c.todo > 0 || bad > 0);
+            $('#em_ball_badge').text(paused ? '⏸' : bad && !run.busy ? bad : c.todo);
+            ball.attr('title', paused ? 'Erato Memory：本聊天的记忆已暂停' : `Erato Memory：待总结 ${c.todo}${bad ? `，失败 ${bad}` : ''}`);
         }
         updateBallVisibility();
     }
@@ -3671,6 +3680,10 @@ C = 日常、闲聊、氛围、无后果的互动。
                 <div id="em_close" class="em-close fa-solid fa-xmark interactable" tabindex="0"></div>
             </div>
             <div id="em_view_mem" class="em-view">
+                <div id="em_paused" class="em-paused" style="display:none">
+                    <span>⏸ 本聊天的记忆已暂停：不自动总结、不注入、不召回。已有记忆都在，照常能看能改。</span>
+                    <div class="menu_button" id="em_resume">恢复</div>
+                </div>
                 <div class="em-stats">
                     <div class="em-tile"><div class="em-num" id="em_n_ok">0</div><div class="em-lbl">已总结楼层</div></div>
                     <div class="em-tile"><div class="em-num" id="em_n_todo">0</div><div class="em-lbl">待总结楼层</div></div>
@@ -3696,6 +3709,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     <div class="em-menu-item" data-act="import">导入 JSON</div>
                     <div class="em-menu-item" data-act="prehistory">导出前史文本 (.txt)（贴进新聊天的世界书用）</div>
                     <div class="em-menu-item" data-act="cfg">设置</div>
+                    <div class="em-menu-item" data-act="pause" id="em_pause_item">暂停本聊天的记忆（不总结、不注入，已有的留着）</div>
                     <div class="em-menu-item em-danger" data-act="clear">清空本聊天的记忆</div>
                     <input type="file" id="em_import_file" accept="application/json" hidden>
                 </div>
@@ -3790,6 +3804,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         bindSettingsForm();
 
         $('#em_main').on('click', () => summarizeAll());
+        $('#em_resume').on('click', () => panelAction('pause'));
         $('#em_hide_q').prop('checked', settings.hideSummarized).on('change', function () { setHideSummarized(this.checked); });
         $('#em_keep_q').val(settings.keepVisible).on('change', function () {
             settings.keepVisible = clamp(Number(this.value) || 6, 2, 40); this.value = settings.keepVisible; saveSettings();
@@ -4377,7 +4392,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             const hasFilter = filter.grade || filter.type || filter.status || filter.q;
             list.html(`<div class="em-empty">${hasFilter ? '没有符合筛选的条目'
                 : todo ? `本聊天有 ${todo} 楼尚未总结，点上方「总结到当前」开始`
-                    : data.entries.length ? '没有条目' : `还没有记忆。${N ? `攒够 ${N} 楼后会自动总结，` : ''}点上方「总结到当前」可立刻总结`}</div>`);
+                    : data.entries.length ? '没有条目' : data.paused ? '还没有记忆（本聊天已暂停）' : `还没有记忆。${N ? `攒够 ${N} 楼后会自动总结，` : ''}点上方「总结到当前」可立刻总结`}</div>`);
         }
         if (addingManual) form.show().html(manualFormHtml()); else form.hide().empty();
 
@@ -4466,6 +4481,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         } else if (act === 'resum') {
             const w = e.win ? winById(data, e.win) : null;
             if (!w) return toast('error', '找不到这条记忆所属的段落');
+            if (data.paused) return toast('info', PAUSED_TIP);
             if (!apiConfigured()) return toast('warning', '请先配置副 API');
             if (run.busy) return toast('info', '正在总结中，稍后再试');
             const n = winEntries(data, w.id).length;
@@ -4493,6 +4509,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const data = getData(); if (!data) return;
         const w = winById(data, wid); if (!w) return;
         if (act === 'retry' || act === 'split') {
+            if (data.paused) return toast('info', PAUSED_TIP);
             if (!apiConfigured()) return toast('warning', '请先配置副 API');
             if (run.busy) return toast('info', '正在总结中，稍后再试');
             if (act === 'split' && w.floors.length > 1) splitWindow(data, w);
@@ -4619,6 +4636,7 @@ C = 日常、闲聊、氛围、无后果的互动。
 
     function outlineAction(act, id) {
         const data = getData(); if (!data) return;
+        if ((act === 'fold' || act === 'recanon') && data.paused) return toast('info', PAUSED_TIP);
         if (act === 'fold') {
             if (!apiConfigured()) return toast('warning', '请先配置副 API');
             if (run.busy || gov.busy) return toast('info', '正在处理中，稍后再试');
@@ -4731,6 +4749,23 @@ C = 日常、闲聊、氛围、无后果的互动。
             let copied = false;
             try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); copied = true; } } catch { /* 没权限就算了 */ }
             toast('success', `前史文本已导出（${text.length} 字）${copied ? '，也复制进剪贴板了' : ''}。贴进新聊天的世界书（建议用「聊天世界书」，别贴进角色世界书，会带到这个角色的所有聊天）`);
+        } else if (act === 'pause') {
+            // 暂停 = 本插件在这个聊天里什么都不自己做：不总结、不注入、不召回、不整理（都是花钱或改上下文的事）；
+            // 藏起来的已总结楼层要放出来——不注入了还藏着，主模型原文和记忆两头都看不到。恢复时按现有记忆重新藏
+            if (!data.paused) {
+                if (!await confirmBox('暂停本聊天的记忆？暂停期间不自动总结、不注入记忆、不召回，不花副 API 和向量的钱；本插件藏起来的已总结楼层会放回来，免得主模型原文和记忆都看不到。已有记忆原样留着，面板里照常能看能改，随时可以恢复。')) return;
+                stopRun();
+                data.paused = true;
+                const n = unhideAll();
+                rc.key = ''; rc.result = null; rc.promise = null;
+                saveData(); applyInjection(); renderPanel(); refreshStatus();
+                toast('info', `本聊天的记忆已暂停${n ? `，放回 ${n} 条隐藏的消息` : ''}`);
+            } else {
+                data.paused = false;
+                const n = hideSummarized();
+                saveData(); applyInjection(); renderPanel(); refreshStatus();
+                toast('success', `本聊天的记忆已恢复${n ? `，重新隐藏 ${n} 条已总结的消息` : ''}；暂停期间的新楼层攒够了照常自动总结`);
+            }
         } else if (act === 'clear') {
             if (!await confirmBox(`清空当前聊天的全部记忆（${data.entries.length} 条、${data.people.length} 个人物、${data.items.length} 件物件、远景 ${data.outline.lines.length} 行）？不可恢复（建议先导出）。本插件隐藏的楼层会一并恢复显示`)) return;
             stopRun();   // 正在飞的调用返回后会发现库已换，结果作废
@@ -4742,6 +4777,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                 for (const c of cols) vecCall('purge', { collectionId: c }).catch(err => warn('清向量失败：', err.message));
             }
             getCtx().chatMetadata[META_KEY] = defaultData();
+            if (data.paused) getCtx().chatMetadata[META_KEY].paused = true;   // 暂停是这个聊天的开关，不是记忆内容：清空后照旧暂停，免得下一条消息就从头自动总结
             rc.key = ''; rc.result = null;
             saveData(); applyInjection(); renderPanel(); refreshStatus();
         }
@@ -4830,7 +4866,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const resync = () => { reconcile(); applyInjection(); renderPanel(); refreshStatus(); };
         const vecSyncSoon = debounce(() => {
             const data = getData();
-            if (!vecOn() || !data || !(data.entries.length || data.windows.length)) return;
+            if (!vecOn() || !data || data.paused || !(data.entries.length || data.windows.length)) return;
             vecSync(data).then(() => vecWarm(data)).catch(err => { if (err.vecKind === 'stale') return; data.vec.error = err.message; warn('向量对账失败：', err.message); });
         }, 5000);
 
@@ -4865,6 +4901,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
         prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist, fmtEntry, KNOWS_RULE, defaultHeader, knownOutside, pv, isThin, PERSON_FIELDS,
         cardName, charNames, charDisplay, charNormSet, isCharCard, charCardFilter, splitNames, learnCharNames, absorbCharCard, charCardHints, cardNameSeen, principalAction, personLabel,
+        chatPaused, outlineAction, windowAction, entryAction, applyInjection,
     };
 
     jQuery(() => {

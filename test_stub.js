@@ -1683,6 +1683,68 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         ctx.chatMetadata.eratoMemory = savedData; ctx.name2 = savedName2;
     }
 
+    console.log('== 外貌 / 物件名 / 相对时间（v0.4.27） ==');
+    t('模板：外貌只记一直如此的样子、照抄档案里仍成立的再补；人和物件都照抄档案名字；相对时间换成具体日子；档案行带外貌', () => {
+        const u = D.buildMessages({ floors: [{ idx: 1, userText: '', content: 'X', recap: {} }], recent: [], locked: [], data: D.getData() })[1].content;
+        assert.ok(u.includes('衣着、表情、当场的伤不写（伤写进 status）') && u.includes('仍成立的照抄、再补本段新看到的'), '外貌规则');
+        assert.ok(u.includes('已有档案里的人和物件，name 都要与档案一模一样'), '物件名照抄档案');
+        assert.ok(u.includes('周二说的『明天』写『周三』') && u.includes('『当天』『前一晚』『次日』'), '相对时间');
+        const roster = D.rosterText({ people: [{ name: '陈屹洲', aliases: ['阿洲'], tier: '配', f: { sex: { v: '男' }, look: { v: '清瘦，嘴角有小痣' } } }, { name: '路人', aliases: [], tier: '龙套', f: {} }], items: [] });
+        assert.strictEqual(roster, '人物：\n- 陈屹洲 [配·男]；别称：阿洲；外貌：清瘦，嘴角有小痣\n- 路人 [龙套]', '有外貌的带外貌，没有的不多出一截：' + roster);
+    });
+
+    console.log('== 本聊天暂停记忆（v0.4.27） ==');
+    await ta('暂停：注入清空、不召回、不总结、不整理、不藏楼，藏起来的放回；恢复后重新藏、照常注入', async () => {
+        const d = D.getData();
+        const savedConfirm = global.confirm; global.confirm = () => true;
+        try {
+            D.settings.hideSummarized = true;
+            D.unhideAll();
+            const hid = D.hideSummarized();
+            assert.ok(hid > 0 && chat[17].is_system === true, '先藏一些：' + hid);
+            D.applyInjection();
+            assert.ok(prompts.erato_memory.t.length > 0, '没暂停时有注入');
+            await D.panelAction('pause');
+            assert.strictEqual(d.paused, true);
+            assert.deepStrictEqual(d.hidden, {}, '藏的全放回');
+            assert.strictEqual(chat[17].is_system, false); assert.strictEqual(chat[0].is_system, true, '酒馆自己藏的不动');
+            assert.strictEqual(prompts.erato_memory.t, '', '注入清空');
+            assert.strictEqual(D.hideSummarized(), 0, '暂停时不藏楼');
+            assert.strictEqual(D.prepareRecall(), null, '暂停时不召回');
+            assert.strictEqual(await D.govern(true), false, '暂停时不整理');
+            const n0 = chat.length;
+            chat.push(mkMsg(901, true), mkMsg(902, false));   // 新来一问一答，还没总结
+            const wins = d.windows.length, todo = D.uncoveredFloors(chat, d, true).length;
+            await D.ingest('manual');
+            assert.ok(todo > 0, '要有待总结的楼，这一条才不是空测');
+            assert.strictEqual(d.windows.length, wins, `暂停时不总结（待总结 ${todo} 个 AI 楼）`);
+            chat.length = n0;
+            const canon = JSON.stringify(d.canon);
+            D.outlineAction('recanon');
+            assert.strictEqual(JSON.stringify(d.canon), canon, '暂停时「重建正典」不清正典');
+            D.applyInjection();
+            assert.strictEqual(prompts.erato_memory.t, '', '生成前再拼一次也是空');
+            await D.panelAction('pause');
+            assert.strictEqual(d.paused, false);
+            assert.ok(chat[17].is_system === true && Object.keys(d.hidden).length > 0, '恢复后重新藏');
+            D.applyInjection();
+            assert.ok(prompts.erato_memory.t.length > 0, '恢复后照常注入');
+        } finally { global.confirm = savedConfirm; d.paused = false; }
+    });
+    await ta('暂停是聊天的开关不是记忆内容：新聊天默认不暂停；清空记忆后仍暂停', async () => {
+        const savedData = ctx.chatMetadata.eratoMemory;
+        const savedConfirm = global.confirm; global.confirm = () => true;
+        try {
+            delete ctx.chatMetadata.eratoMemory;
+            const d = D.getData();
+            assert.strictEqual(d.paused, false, '新聊天默认不暂停');
+            d.paused = true; d.entries.push({ id: 'e_x', status: 'ok', src: { idx: 2 } });
+            await D.panelAction('clear');
+            const d2 = D.getData();
+            assert.ok(d2 !== d && d2.entries.length === 0 && d2.paused === true, '清空后仍暂停');
+        } finally { global.confirm = savedConfirm; ctx.chatMetadata.eratoMemory = savedData; }
+    });
+
     console.log('== 版本号 ==');
     t('index.js 的 VERSION 与 manifest.json 一致（面板标题显示的就是它，改版本两处要同步）', () => {
         const m = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'));

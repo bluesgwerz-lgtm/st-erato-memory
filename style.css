@@ -108,6 +108,11 @@
 .em-progress .em-bar { position: absolute; inset: 0 auto 0 0; width: 0; background: rgba(126, 200, 255, .45); transition: width .2s; }
 .em-progress .em-prog-txt { position: relative; font-size: .8em; line-height: 22px; text-align: center; }
 .em-alert { margin: 0 12px 6px; padding: 8px 12px; border-radius: 8px; background: rgba(230, 80, 80, .18); border: 1px solid rgba(230, 80, 80, .4); font-size: .85em; cursor: pointer; }
+/* 本聊天暂停记忆：面板顶上一条 + 恢复按钮；悬浮球角标换成灰色 ⏸ */
+.em-paused { display: flex; align-items: center; gap: 10px; margin: 10px 12px 4px; padding: 8px 12px; border-radius: 8px; background: rgba(150, 150, 150, .16); border: 1px solid rgba(150, 150, 150, .4); font-size: .85em; }
+.em-paused span { flex: 1 1 auto; }
+.em-paused .menu_button { flex: 0 0 auto; margin: 0; white-space: nowrap; }
+.em-ball.em-paused-ball .em-ball-badge { background: #8a8a8a; }
 
 /* 分区 */
 .em-section { border-top: 1px solid var(--SmartThemeBorderColor, rgba(128,128,128,.3)); }
