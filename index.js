@@ -11,7 +11,7 @@
     const META_KEY = 'eratoMemory';
     const PROMPT_KEY = 'erato_memory';
     const DATA_VERSION = 2;
-    const VERSION = '0.4.24';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
+    const VERSION = '0.4.25';   // 与 manifest.json 同步（桩测校验）；面板标题与设置页标题显示，升级后一眼能看出有没有换上新版
 
     // script.js 里的枚举值：extension_prompt_types.IN_CHAT = 1，extension_prompt_roles.SYSTEM = 0
     // getContext() 没有暴露这两个枚举，只能写死
@@ -70,13 +70,27 @@
     const END_MARK = '<END_OF_MEMORY/>';
     const RECAP_CHARS = 400;    // 逐楼 recap 底层每楼存多少字
     const CANON_RESEAL = 5;     // S 集合相对上次压缩变化这么多条就重压
-    // 向量走酒馆 /api/vector/* 的通用 embeddings 路线（source=vllm：任何 OpenAI 兼容 embeddings 地址 + 模型）；密钥自动写进酒馆的 vllm 槽位
+    // 向量：默认直连（浏览器自己请求任何 OpenAI 兼容 embeddings 地址，向量交给酒馆 /api/vector/* 的 webllm 源存）；
+    // 接口不允许跨域时退回经酒馆（vllm 源，酒馆后端代算，密钥写进酒馆的 vllm 槽位）。细节见「向量：通道 / 存储 / 自校准」一节
     const VEC_SECRET = 'api_key_vllm';
     const VEC_DEFAULT_URL = 'https://api.siliconflow.cn/v1';
     const VEC_DEFAULT_MODEL = 'Qwen/Qwen3-Embedding-0.6B';
+    const RERANK_DEFAULT_MODEL = 'BAAI/bge-reranker-v2-m3';
     const LEGACY_VEC_URL = { siliconflow: VEC_DEFAULT_URL, openai: 'https://api.openai.com/v1' };
     const RAW_CHUNK_CHARS = 600;   // 原文细节：已总结楼层的 <content> 按这么多字切块、带重叠入向量库
     const RAW_CHUNK_OVERLAP = 80;
+    const VEC_BATCH = 16;          // 一次 embeddings 请求的条数；一条坏文本会让整批被拒（硅基 20015），失败时对半拆到单条找出来
+    const VEC_RETRY = [1500, 4000];   // 429 / 5xx / 超时的退避重试
+    // 向量自校准：准入线 / 闸门 = 本次查询对样本相似度的中位数 + 几个离散度。闸门 3.3：331 楼真实聊天上 bge-m3 与 Qwen3-Embedding 两种模型，
+    // 「嗯」「继续推进剧情」「今天好累啊」这类最高到 3.17，回调问句的第一名大多在 3.7 以上（低于 3.3 的几个都有关键词通道接住）
+    const ADMIT_Z = 2, GATE_Z = 3.3;
+    const VEC_MIN_CONTENT = 4;   // 意图里实词（见 contentLen）少于这么多就不走向量：一两个字的查询跟什么都「有点像」
+    const CALIB_MEM = 48, CALIB_MEM_MIN = 12, CALIB_RAW = 32, CALIB_RAW_MIN = 8;   // 自校准样本量（条目 / 原文块）与最少要多少：24 条时噪声线随抽样抖得明显（同一句「嗯」在两次抽样里一次过闸一次不过）
+    const VEC_FALLBACK_THRESHOLD = 0.5;   // 没法自校准时（经酒馆通道、样本不够）的固定余弦阈值
+    const RERANK_FLOOR = 0.01, RERANK_REL = 0.05;   // 重排准入：分数 ≥ max(0.01, 本次第一名 × 0.05)
+    // 召回准入的强弱两档：每一路（关键词/recap/实体/向量）归一到 0–1，≥STRONG 强、≥WEAK 弱；至少一路强或两路弱才收。
+    // 向量过闸门线算强、只过准入线记 WEAK_VEC；recap 乘 RC_WEIGHT，永远只是弱（真实聊天回放：只靠 recap 撞词的几乎全错）
+    const STRONG = 0.6, WEAK = 0.3, WEAK_VEC = 0.45, RC_WEIGHT = 0.55;
 
     // 面板与设置里的「楼」都按酒馆楼层计（你一条 + AI 一条 = 2 楼）；存储与对账内部仍以 AI 楼为单位，见 floorSpan
     const DEFAULTS = {
@@ -97,8 +111,9 @@
         canonChars: 800,      // 正典段字数上限
         outlineChars: 2000,   // 远景层（被裁条目折成的按日骨架）注入预算，超过就把最老的日行再折成时期行
         foldMin: 6,           // 被预算裁掉且未折叠的条目攒够这么多才跑一次折叠
-        // 召回：关键词通道零网络默认开；向量走酒馆自带 /api/vector/*（通用 embeddings 路线：地址 + 密钥 + 模型，和副 API 一样填），默认关
-        recall: { keyword: true, vector: false, source: 'vllm', apiUrl: '', key: '', keyWritten: '', model: '', models: [], raw: true, topK: 8, threshold: 0.4, recallChars: 2000, rawChars: 1200, queryChars: 600, timeoutSec: 4 },
+        // 召回：关键词通道零网络默认开；向量（地址 + 密钥 + 模型，和副 API 一样填）默认关。threshold 0 = 自动（按本聊天现场估）；
+        // route：auto = 先直连、跨域被拦退经酒馆（routeMemo 按地址记结果）/ direct / tavern；rerank 默认关
+        recall: { keyword: true, vector: false, source: 'vllm', apiUrl: '', key: '', keyWritten: '', model: '', models: [], raw: true, topK: 8, threshold: 0, recallChars: 2000, rawChars: 1200, queryChars: 600, timeoutSec: 4, route: 'auto', routeMemo: null, rerank: false, rerankModel: '' },
         autoFold: 'batch',    // 治理（远景折叠/正典压缩）何时自动跑：always=每次生成后攒够就跑 / batch=只在总结批次结束后 / manual=只点「现在折叠」
         headerText: '',       // 注入块块首说明，留空用默认
         hideSummarized: true,
@@ -147,6 +162,9 @@
         delete settings.recall.cn;
     }
     if (!Array.isArray(settings.recall.models)) settings.recall.models = [];
+    // v0.4.25：阈值 0 = 自动。旧默认 0.4 对 bge-m3 等于不过滤（同一对主角的无关条目余弦就有 0.55+），没人专门改过的换成自动；手改过的值保留
+    if (!settings.recall.mig25) { if (Number(settings.recall.threshold) === 0.4) settings.recall.threshold = 0; settings.recall.mig25 = true; }
+    if (!['auto', 'direct', 'tavern'].includes(settings.recall.route)) settings.recall.route = 'auto';
     const saveSettings = () => getCtx().saveSettingsDebounced();
 
     /* ================= 工具 ================= */
@@ -159,6 +177,31 @@
     // 可被「停止」打断的等待（退避重试期间点停止不用等满）
     const sleepAbortable = (ms, signal) => new Promise(r => { if (signal?.aborted) return r(); const t = setTimeout(done, ms); function done() { clearTimeout(t); signal?.removeEventListener?.('abort', done); r(); } signal?.addEventListener?.('abort', done, { once: true }); });
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+    // 发往网络的文本统一过一遍：孤立的半个 emoji（落单的代理项）去掉、控制字符去掉（\t \n \r 保留）。
+    // v0.4.25 实测：硅基 embeddings 收到半个 emoji 回 400 / 20015，且一批里只要一条坏的整批都被拒——截字时把 emoji 从中间切开就会产生它。
+    // 不用后行断言写正则：老 iOS Safari 解析不了，整个扩展会加载失败
+    const CTRL_RX = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+    function wellFormed(s) {
+        let t = String(s ?? '');
+        if (typeof t.isWellFormed === 'function' ? !t.isWellFormed() : /[\uD800-\uDFFF]/.test(t)) {
+            let out = '';
+            for (let i = 0; i < t.length; i++) {
+                const c = t.charCodeAt(i);
+                if (c >= 0xD800 && c <= 0xDBFF) {
+                    const d = t.charCodeAt(i + 1);
+                    if (d >= 0xDC00 && d <= 0xDFFF) { out += t[i] + t[i + 1]; i++; }
+                    continue;
+                }
+                if (c >= 0xDC00 && c <= 0xDFFF) continue;
+                out += t[i];
+            }
+            t = out;
+        }
+        return t.replace(CTRL_RX, '');
+    }
+    // 截到 n 个 UTF-16 单元，但不把 emoji（代理对）从中间切开
+    const cut = (s, n) => { const t = String(s ?? ''); if (t.length <= n) return t; const c = t.charCodeAt(n - 1); return t.slice(0, c >= 0xD800 && c <= 0xDBFF ? n - 1 : n); };
 
     // FNV-1a 32 位，只对抠出的正文做，改状态栏/道具不算改
     function hash(str) {
@@ -195,7 +238,10 @@
             outline: { lines: [], pending: [], at: 0 },      // 远景层：被预算裁掉的条目按故事日折成一行；level 2 = 若干日行再折成的时期行
             recaps: {},   // 逐楼底层：send_date → { i, t, n }（预设每楼自带的 recap），失败/未总结楼层的保底与折叠材料
             tombstones: { p: {}, i: {} },   // 面板删掉的人物/物件：norm 名 → { name, at }，副模型再报同名直接忽略
-            vec: { entries: {}, raw: {}, source: '', model: '', at: 0 },   // 向量库对账表：条目 id → 数字 hash；楼层 send_date → { h: 正文哈希, hs: [chunk hash] }
+            // 向量库对账表：条目 id → 数字 hash；楼层 send_date → { h: 正文哈希, hs: [chunk hash] }；fp = 通道+地址+模型指纹，gen = 重建世代，
+            // rejected = 被接口拒收的文本（文本哈希 → { why, at, ref }），内容不变就不再重试；v = 2 表示集合名已是带指纹的新方案（v0.4.25）；
+            // stale = 换了指纹后待删的旧集合 [{ fp, gen }]：新指纹第一次同步成功才删（新模型名填错时旧库还在，换回来不用重算）
+            vec: { v: 2, fp: '', gen: 0, dim: 0, entries: {}, raw: {}, rejected: {}, stale: [], at: 0, error: '' },
             skip: {},
             hidden: {},   // 本插件隐藏过的楼层 send_date → true；只恢复自己藏的
             customRx: false,   // 本聊天是否启用设置里的自定义正文提取/剥除正则（按聊天记：测别家预设的聊天勾上，Erato 聊天不受影响）
@@ -220,7 +266,8 @@
         if (!Array.isArray(d.outline.pending)) d.outline.pending = [];
         if (!Array.isArray(d.canon.builtFrom)) d.canon.builtFrom = [];
         for (const k of ['p', 'i']) if (!d.tombstones[k] || typeof d.tombstones[k] !== 'object') d.tombstones[k] = {};
-        for (const k of ['entries', 'raw']) if (!d.vec[k] || typeof d.vec[k] !== 'object') d.vec[k] = {};
+        for (const k of ['entries', 'raw', 'rejected']) if (!d.vec[k] || typeof d.vec[k] !== 'object') d.vec[k] = {};
+        if (!Array.isArray(d.vec.stale)) d.vec.stale = [];
         if (!d.recaps || typeof d.recaps !== 'object') d.recaps = {};
         if ((Number(d.version) || 1) < 2) migrateV1(d);
         // v0.3.4：物件的自由文本 status 改名 note；档位/状态枚举键补空串
@@ -398,7 +445,7 @@
                     reverse_proxy: base,
                     proxy_password: settings.api.key.trim(),
                     model: settings.api.model.trim() || undefined,
-                    messages,
+                    messages: messages.map(m => (typeof m?.content === 'string' ? { ...m, content: wellFormed(m.content) } : m)),   // 截字可能切开 emoji，发出前修掉
                     temperature: Number(settings.api.temperature ?? 0.3),
                     max_tokens: maxTokens || Number(settings.api.maxTokens) || 900,
                     stream: false,
@@ -1349,7 +1396,7 @@ C = 日常、闲聊、氛围、无后果的互动。
     function storeRecap(data, f) {
         const t = String(f.recap?.storyTime || '').trim(), n = String(f.recap?.narrative || '').trim();
         if (!f.send_date || (!t && !n)) return false;
-        data.recaps[f.send_date] = { i: f.idx, t, n: n.slice(0, RECAP_CHARS) };
+        data.recaps[f.send_date] = { i: f.idx, t, n: cut(n, RECAP_CHARS) };
         return true;
     }
     function captureRecaps(chat, data) {
@@ -1843,9 +1890,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         const ent = entityLines(data, chat);
         const outline = outlineLines(data);
         const rendered = new Set([...canonAll.map(e => e.id), ...pool.filter(p => p.e).map(p => p.e.id)]);
-        const recall = recallLines(data, depths, rendered);
+        // skipRecall：召回自己要先知道「哪些条目已经在块里」好先剔后排（doRecall 调用），这时不拼召回段
+        const recall = opts.skipRecall ? { entries: [], raw: [] } : recallLines(data, depths, rendered);
         const count = canonAll.length + pool.filter(p => p.e).length;
-        if (!count && !ent.length && !outline.length && !recall.entries.length && !pool.length) return { ...empty, dropped, droppedIds };
+        if (!count && !ent.length && !outline.length && !recall.entries.length && !pool.length) return { ...empty, dropped, droppedIds, rendered };
         const parts = ['<erato_memory>', ...headerLines(outline.length > 0), ...ent];
         const sizeOf = arr => arr.reduce((n, s) => n + s.length + 1, 0);
         const sizes = { ent: sizeOf(ent), outline: sizeOf(outline), canon: sizeOf(canon), past: sizeOf(pool.filter(p => p.e).map(p => p.text)), fallback: sizeOf(pool.filter(p => p.fb).map(p => p.text)), recall: sizeOf(recall.entries), raw: sizeOf(recall.raw) };
@@ -1856,7 +1904,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (recall.raw.length) parts.push('', '## 原文细节', '[与当下话题相关的旧楼原文片段，只用来核对细节，不复述]', ...recall.raw);
         parts.push('</erato_memory>');
         const text = parts.join('\n');
-        return { text, count, chars: text.length, dropped, droppedIds, fallback: pool.filter(p => p.fb).length, outline: outline.length, recalled: recall.entries.length, raw: recall.raw.length, sizes };
+        return { text, count, chars: text.length, dropped, droppedIds, fallback: pool.filter(p => p.fb).length, outline: outline.length, recalled: recall.entries.length, raw: recall.raw.length, sizes, rendered };
     }
 
     // 前史文本（v0.4.13）：把本聊天的记忆整理成一段可贴进世界书 / 作者注释的纯文本，给「换个窗口接着这条线」用。
@@ -2114,7 +2162,13 @@ C = 日常、闲聊、氛围、无后果的互动。
         return true;
     }
 
-    /* ================= 召回：关键词通道（零网络）+ 向量通道（酒馆 /api/vector/*） ================= */
+    /* ================= 召回 ================= */
+    // 一次召回 = 回调意图 + 场景线索，五个通道合成一份候选（v0.4.25 重做）：
+    //   ①关键词：意图 n-gram 打条目　②recap：意图打逐楼作者摘要找楼，楼再连到条目　③实体：意图或最近一楼点到的配角/物件 → 它们的旧事
+    //   ④向量（可选）：意图向量 + 本聊天样本现场估的噪声线与闸门　⑤原文细节：候选楼就地切块打分（零网络），向量开着再并上向量原文块
+    // 候选只在「没进注入块、楼层也不在眼前」的条目里排（先剔后排：话题最像的往往是刚发生、本来就在往事里的条目，排完再剔会把名额吃光）。
+    // 意图不再拼上一楼 recap：真实聊天（331 楼）实测，recap 描写的是当下这一场，会把同类旧场景全拉上来、盖过用户真正问起的旧事
+    // （12 个回调问句：关键词通道准确率 6% → 去掉 recap 后 53%，向量同理）
 
     const STOP_TERMS = new Set(['这个', '那个', '然后', '已经', '还是', '因为', '所以', '但是', '自己', '我们', '你们', '他们', '她们', '一个', '没有', '不是', '就是', '可以', '什么', '怎么', '这样', '那样', '时候', '现在', '一下', '一点', 'the', 'and', 'that', 'this', 'with', 'from', 'have', 'you', 'are', 'was']);
     function termsOf(text, max = 400) {
@@ -2143,87 +2197,292 @@ C = 日常、闲聊、氛围、无后果的互动。
         if (!t) { t = termsOf(entryText(e), 600); if (termCache.size > 3000) termCache.clear(); termCache.set(k, t); }
         return t;
     }
-    // 关键词打分：查询串 n-gram 与条目 n-gram 的交集，按 IDF 加权，长词加权；至少命中 2 个词、分数不低于最高分三成
-    function keywordRecall(query, cands, limit) {
-        const q = [...termsOf(query, 300)];
-        if (!q.length || !cands.length) return [];
-        const sets = cands.map(entryTerms);
+    // 关键词打分（条目 / recap / 原文块共用）：查询词与文档 n-gram 的交集，按 IDF 加权、长词加权，归一到 0–1（排序用）；
+    // 一般要命中 ≥2 个词、不低于最高分三成；线头词（≥3 个汉字或 ≥4 个字母、在全部候选里只出现在 ≤2 篇）命中一个就算，
+    // 分数抬到最高分的六成——只提过一两次的东西最该被找回来。
+    // strong（准入用的绝对强度）：命中了线头词，或命中了少见的长词（≥3 字且在一成以内的文档里、或 ≥4 字且两成以内）；
+    // 两者都要是「东西」不是「话」：含虚字/代词的 n-gram（「抱紧他」「的时候」「把脸埋进」）再少见也不算——真实聊天回放里
+    // 正是这类词让「*抱紧他，把脸埋进他怀里*」撞上旧场景当了第一名。归一分第一名永远是 1，不能拿它当强弱
+    const FUNC_CH = /[的了着过他她你我它们这那个在是有和与把被就又还很不也都而或啊吗呢吧么您咱]/;
+    const rareTerm = t => !FUNC_CH.test(t) && ((/[㐀-鿿]/.test(t) && t.length >= 3) || t.length >= 4);
+    // headFn（可选）：文档的「标题 + 标签」——副模型专门点名关键事物的地方；查询词落在某篇的标题/标签里、又不常见，这篇就算强命中
+    // （两个字的专有词「疤痕」「发圈」「信封」靠这条进强档，动作短语进不了标题）
+    function keywordScores(qTerms, docs, termsFn, headFn) {
+        const q = [...qTerms];
+        if (!q.length || !docs.length) return [];
+        const sets = docs.map(termsFn);
+        const heads = headFn ? docs.map(headFn) : null;
         const df = new Map(q.map(t => [t, 0]));
         for (const s of sets) for (const t of q) if (s.has(t)) df.set(t, df.get(t) + 1);
-        const N = cands.length;
-        const scored = cands.map((e, i) => {
-            let score = 0, hits = 0;
+        const N = docs.length;
+        const scored = [];
+        docs.forEach((doc, i) => {
+            let score = 0, hits = 0, rare = false, long = false, titled = false;
             for (const t of q) {
                 if (!sets[i].has(t)) continue;
                 const f = df.get(t);
                 if (f / N > 0.6 && t.length <= 2) continue;
                 hits++;
+                if (f <= 2 && rareTerm(t)) rare = true;
+                if (heads && !FUNC_CH.test(t) && f / N <= 0.2 && heads[i].includes(t)) titled = true;
+                if (!FUNC_CH.test(t) && ((t.length >= 3 && f <= Math.max(2, 0.1 * N)) || (t.length >= 4 && f / N <= 0.2))) long = true;
                 score += (t.length >= 4 ? 3 : t.length === 3 ? 2 : 1.2) * (Math.log((N + 1) / (f + 1)) + 0.3);
             }
-            return { e, score, hits };
-        }).filter(x => x.score > 0 && x.hits >= 2).sort((a, b) => b.score - a.score);
-        const max = scored[0]?.score || 0;
-        return scored.filter(x => x.score >= max * 0.3).slice(0, limit).map(x => ({ id: x.e.id, score: x.score / max, kw: true }));
+            if (score > 0 && (hits >= 2 || rare || titled)) scored.push({ doc, score, rare, strong: rare || long || titled });
+        });
+        const max = Math.max(0, ...scored.map(x => x.score));
+        return scored.map(x => ({ doc: x.doc, rare: x.rare, strong: x.strong, score: Math.max(x.score / max, x.rare ? 0.6 : 0) }))
+            .filter(x => x.score >= 0.3).sort((a, b) => b.score - a.score);
+    }
+    // 关键词通道给融合的分：强命中至少 STRONG，只撞上常见词的封顶 0.5（弱，要别的通道印证）
+    const kwChannel = h => (h.strong ? Math.max(h.score, STRONG) : Math.min(h.score, 0.5));
+    const entryHeadText = e => norm(`${e.title} ${(e.tags || []).join(' ')}`);
+    function keywordRecall(query, cands, limit, extra = []) {
+        const q = new Set([...termsOf(query, 300), ...extra]);
+        return keywordScores(q, cands, entryTerms, entryHeadText).slice(0, limit).map(h => ({ id: h.doc.id, score: h.score, kw: true }));
     }
 
-    // 查询串：最新用户输入（去 OOC 括号）+ 最近一条 AI 楼的 recap 叙述（正文几千字会稀释话题）
+    // recap 通道的文档：正文已不在眼前的 AI 楼的作者摘要（一楼一篇，比条目细：条目漏写的小事 recap 里常有）
+    const recapTermCache = new Map();
+    function recapDocs(data, chat, depths) {
+        const ctx = getCtx(), cw = Number(settings.contentWindow) || 6, out = [];
+        for (let i = 0; i < chat.length; i++) {
+            const m = chat[i];
+            if (!m?.send_date || !isAiFloor(m, ctx)) continue;
+            if (depths[i] >= 0 && depths[i] < cw) continue;
+            const r = data.recaps[m.send_date];
+            if (r && (r.t || r.n)) out.push({ idx: i, date: m.send_date, text: `${r.t || ''} ${r.n || ''}`, head: norm(r.t || '') });
+        }
+        return out;
+    }
+    function recapTerms(doc) {
+        const k = `${doc.date}:${hash(doc.text)}`;
+        let t = recapTermCache.get(k);
+        if (!t) { t = termsOf(doc.text, 500); if (recapTermCache.size > 4000) recapTermCache.clear(); recapTermCache.set(k, t); }
+        return t;
+    }
+
+    // 实体：配角的名字与别称、物件名（≥2 字；主角不进人物志，天然不算）。别称一并展开：用户说「埃琳娜」，人物栏写 Elena 的条目也算；
+    // 带间隔号的名字拆段（「卡米拉·奥尔西尼」→ 卡米拉 / 奥尔西尼：用户常只叫名或只叫姓）。
+    // 物件不补「核心名词」（试过：「裸粉色发圈」补「发圈」、几把手机都补「手机」，场景里随口一提就把一串旧条目全拉进来，真实聊天回放噪声翻了十倍）
+    const entTokens = ent => {
+        const base = [ent.name, ...(ent.aliases || [])].map(norm);
+        const parts = base.flatMap(t => t.split(/[·・•．\s]+/));
+        return [...new Set([...base, ...parts])].filter(t => t.length >= 2 && !isRelative(t));
+    };
+    function mentionedEntities(data, text) {
+        const t = norm(text);
+        if (!t) return [];
+        const out = [];
+        for (const p of data.people) { if (p.lost) continue; const toks = entTokens(p); if (toks.some(x => t.includes(x))) out.push({ kind: 'p', name: p.name, toks }); }
+        for (const it of data.items) { if (it.lost || isProp(it)) continue; const toks = entTokens(it); if (toks.some(x => t.includes(x))) out.push({ kind: 'i', name: it.name, toks }); }
+        return out;
+    }
+    function entryHasEnt(e, ent) {
+        if (ent.kind === 'p' && (e.characters || []).some(c => ent.toks.includes(norm(c)))) return true;
+        const txt = norm(`${e.title} ${e.summary} ${(e.tags || []).join(' ')}`);
+        return ent.toks.some(x => txt.includes(x));
+    }
+
+    // 回调意图 = 用户这一楼的戏内文字：剥掉（OOC）括号、<Request: …> 这类尖括号指令（没闭合的剥到行尾）、[OOC…]/【注…】；
+    // 剩下「继续推进剧情」这种场外话也没关系：关键词通道没词可撞，向量通道过不了闸门
     function recallQuery(chat) {
-        const visible = (chat || []).filter(m => m && !m.is_system);
-        const lastUser = [...visible].reverse().find(m => m.is_user);
-        const lastAi = [...visible].reverse().find(m => !m.is_user);
-        const u = cleanUser(lastUser?.mes || '').replace(/[（(][^）)]*[）)]/g, ' ').trim();
-        const r = lastAi ? extractRecap(lastAi.mes).narrative : '';
-        const cap = Math.max(100, Number(settings.recall.queryChars) || 600);
-        return `${u}\n${r}`.trim().slice(0, cap);
+        const lastUser = [...(chat || [])].reverse().find(m => m && !m.is_system && m.is_user);
+        const u = cleanUser(lastUser?.mes || '')
+            .replace(/<[^<>]{0,4000}>/g, ' ')
+            .replace(/<\s*[a-z][\s\S]*$/i, ' ')
+            .replace(/[（(][^）)]*[）)]/g, ' ')
+            .replace(/[[【]\s*(ooc|注|系统|指令|request|旁白)[^\]】]*[\]】]/gi, ' ')
+            .replace(/\s+/g, ' ').trim();
+        return cut(u, Math.max(100, Number(settings.recall.queryChars) || 600));
+    }
+    // 场景 = 最近一个还看得见的 AI 楼正文：只用来认「谁、什么东西在场」，不拿来算相似度
+    function sceneText(chat) {
+        const ctx = getCtx();
+        for (let i = (chat || []).length - 1; i >= 0; i--) {
+            const m = chat[i];
+            if (m && !m.is_user && !m.is_system && isAiFloor(m, ctx)) return cut(extractContent(m.mes).text, 4000);
+        }
+        return '';
     }
 
-    const rc = { key: '', promise: null, result: null, at: 0, error: '' };
+    const rc = { key: '', promise: null, result: null, at: 0, error: '', note: '' };
     const recallEnabled = () => !!(settings.enabled && (settings.recall.keyword || settings.recall.vector));
-    const recallSig = () => `${settings.recall.keyword ? 'k' : ''}${settings.recall.vector ? `v:${settings.recall.apiUrl}:${settings.recall.model}:${settings.recall.raw ? 'r' : ''}` : ''}`;
+    const recallSig = () => [settings.recall.keyword ? 'k' : '', settings.recall.raw ? 'r' : '', Number(settings.recall.topK) || 8,
+        settings.recall.vector ? `v:${vecBase()}:${vecModel()}:${settings.recall.route || 'auto'}:${manualThreshold()}` : '',
+        settings.recall.rerank ? `rr:${rerankModel()}` : ''].join('|');
 
     // 预取：用户消息一落地就开始算（向量要走网络），生成前只等剩下的时间
     function prepareRecall(chat = getCtx().chat || []) {
-        if (!recallEnabled()) { rc.key = ''; rc.result = null; rc.promise = null; return null; }
+        const reset = () => { rc.key = ''; rc.result = null; rc.promise = null; return null; };
+        if (!recallEnabled()) return reset();
         const data = getData(); if (!data) return null;
-        const query = recallQuery(chat);
-        if (!query) { rc.key = ''; rc.result = null; rc.promise = null; return null; }
-        const key = hash(`${getCtx().chatId}|${recallSig()}|${query}`);
+        const q = { intent: recallQuery(chat), scene: sceneText(chat) };
+        if (!q.intent && !q.scene) return reset();
+        const key = hash(`${getCtx().chatId}|${recallSig()}|${q.intent}|${hash(q.scene)}`);
         if (rc.key === key && (rc.result || rc.promise)) return rc.promise;
-        rc.key = key; rc.result = null; rc.error = ''; rc.at = Date.now();
-        const p = doRecall(data, query, key).then(res => { if (rc.key === key) { rc.result = res; rc.promise = null; } return res; })
+        rc.key = key; rc.result = null; rc.error = ''; rc.note = ''; rc.at = Date.now();
+        const p = doRecall(data, q, key).then(res => { if (rc.key === key) { rc.result = res; rc.promise = null; rc.note = res.note || ''; } return res; })
             .catch(err => { if (rc.key === key) { rc.error = err.message; rc.promise = null; rc.result = { key, entries: [], raw: [], mode: `失败：${err.message}` }; } });
         rc.promise = p;
         return p;
     }
 
-    async function doRecall(data, query, key) {
-        const cands = data.entries.filter(e => e.status === 'ok');
+    async function doRecall(data, q, key) {
+        const chat = getCtx().chat || [];
+        const depths = visibleDepths(chat);
         const topK = clamp(Number(settings.recall.topK) || 8, 1, 30);
-        const scores = new Map();
-        let mode = [];
+        const rendered = buildBlock({ dry: true, skipRecall: true }).rendered || new Set();
+        const okAll = data.entries.filter(e => e.status === 'ok');
+        const byId = new Map(okAll.map(e => [e.id, e]));
+        const cands = okAll.filter(e => injectable(e, depths) && !rendered.has(e.id));
+        const candIds = new Set(cands.map(e => e.id));
+        const mode = [], notes = [];
+        const sc = new Map();   // id → { kw, rc, ent, vec }：各通道归一后的分
+        const bump = (id, ch, v) => { if (!candIds.has(id) || !(v > 0)) return; const o = sc.get(id) || {}; o[ch] = Math.max(o[ch] || 0, Math.min(1, v)); sc.set(id, o); };
+        const intentEnts = mentionedEntities(data, q.intent);
+        const qTerms = new Set([...termsOf(q.intent, 300), ...intentEnts.flatMap(e => e.toks)]);
+        let recapHits = [];
         if (settings.recall.keyword) {
-            for (const h of keywordRecall(query, cands, topK * 2)) scores.set(h.id, { score: h.score * 0.9, kw: true });
             mode.push('关键词');
+            if (qTerms.size) {
+                if (cands.length) for (const h of keywordScores(qTerms, cands, entryTerms, entryHeadText).slice(0, topK * 2)) bump(h.doc.id, 'kw', kwChannel(h));
+                recapHits = keywordScores(qTerms, recapDocs(data, chat, depths), recapTerms, d => d.head).slice(0, 8);   // 原文细节也要用，候选条目为空时照算
+                if (recapHits.length && cands.length) {
+                    const byDate = new Map();
+                    for (const e of cands) for (const d of (e.src?.dates || [])) { if (!byDate.has(d)) byDate.set(d, []); byDate.get(d).push(e); }
+                    for (const h of recapHits) for (const e of byDate.get(h.doc.date) || []) bump(e.id, 'rc', kwChannel(h) * RC_WEIGHT);
+                }
+            }
+            // 实体两路：意图里点名的（ent，算「字面」一类——它本来就是查询里的字，强弱看罕见程度）；
+            // 最近一楼正文里出现的（scn，单列「场景」一类，封顶在弱档：只能给别的通道作证，自己放不进任何一条）；出现在四成以上条目里的不算场景线索
+            const sceneEnts = mentionedEntities(data, q.scene).filter(e => !intentEnts.some(x => x.kind === e.kind && x.name === e.name));
+            const N = okAll.length;
+            const ref = Math.log(N + 1) + 0.3;
+            for (const [list, ch] of [[intentEnts, 'ent'], [sceneEnts, 'scn']]) {
+                const acc = new Map();
+                for (const ent of list) {
+                    const df = okAll.filter(e => entryHasEnt(e, ent)).length;
+                    if (!df || (ch === 'scn' && df / N > 0.4)) continue;
+                    const idf = (Math.log((N + 1) / (df + 1)) + 0.3) / ref;
+                    for (const e of cands) if (entryHasEnt(e, ent)) acc.set(e.id, Math.max(acc.get(e.id) || 0, idf));
+                }
+                for (const [id, v] of acc) bump(id, ch, ch === 'scn' ? Math.min(WEAK_VEC, v) : v);
+            }
         }
-        let raw = [];
-        if (settings.recall.vector) {
-            // 向量通道失败（密钥没写、服务超时）只丢向量结果，关键词命中照常给
+        const vecStrongEnts = [];
+        if (settings.recall.vector && q.intent && vecConfigured() && contentLen(q.intent) >= VEC_MIN_CONTENT) {
             try {
-                const v = await vecQuery(data, query, topK);
-                v.ids.forEach((id, rank) => {
-                    const s = Math.max(0.3, 1 - rank * 0.06);
-                    const old = scores.get(id);
-                    scores.set(id, old ? { score: Math.max(old.score, s) + 0.25, kw: old.kw, vec: true } : { score: s, vec: true });
-                });
-                raw = v.raw;
+                const v = await vecSearch('mem', q.intent, Math.min(100, topK + rendered.size + 8), data);
+                const rev = new Map(Object.entries(data.vec.entries).map(([id, h]) => [Number(h), id]));
+                let rank = 0;
+                for (const m of v.hits) {
+                    const id = rev.get(Number(m.hash));
+                    if (id && v.strong.has(Number(m.hash)) && byId.get(id) && injectable(byId.get(id), depths)) vecStrongEnts.push(byId.get(id));   // 原文的目标楼（含已在往事里的）
+                    if (!id || !candIds.has(id)) continue;
+                    // 过了闸门线（GATE_Z 个离散度）的算强信号，只过准入线（ADMIT_Z 个）的算弱、要别的通道印证
+                    bump(id, 'vec', v.strong.has(Number(m.hash)) ? Math.max(STRONG, 1 - rank * 0.03) : WEAK_VEC);
+                    rank++;
+                }
                 mode.push('向量');
+                if (v.note) notes.push(`向量：${v.note}`);
             } catch (err) {
                 rc.error = `向量召回失败：${err.message}`;
                 mode.push('向量失败');
             }
         }
-        const entries = [...scores.entries()].sort((a, b) => b[1].score - a[1].score).slice(0, topK).map(([id, s]) => ({ id, ...s }));
-        return { key, entries, raw, mode: mode.join('+'), at: Date.now() };
+        // 准入：每一路分强弱两档（≥0.6 强、≥0.3 弱），至少一路强、或两类证据各有一路弱才放进来；排序 = 最强那路 + 每多一类印证 +0.15。
+        // 证据按种类算：关键词、recap、意图里点名的实体都是同一批查询词撞字面（一类），最近一楼正文里出现的配角/物件是场景（一类，封顶弱），向量是语义（一类）——
+        // 同一份字面证据撞了条目又撞了同一楼的 recap 不算互相印证。依据（v0.4.25 真实聊天回放）：错的几乎都是只有一类弱信号——向量刚过线、意图里点到的常见配角把他十几条旧事
+        // 全拉进来、动作句撞上旧场景的字面；对的几乎都是多类印证。recap 永远只算弱（RC_WEIGHT），场景线索封顶弱档、常见实体 idf 低，自然落在弱档
+        const FAMILY = { kw: '字面', rc: '字面', ent: '字面', scn: '场景', vec: '语义' };
+        let fused = [...sc.entries()].map(([id, o]) => {
+            const chs = Object.keys(o).filter(k => o[k] >= WEAK);
+            const fams = new Set(chs.map(k => FAMILY[k]));
+            const strong = chs.some(k => o[k] >= STRONG);
+            return { id, chs, admit: strong || fams.size >= 2, score: Math.max(0, ...chs.map(k => o[k])) + 0.15 * Math.max(0, fams.size - 1) };
+        }).filter(x => x.admit).sort((a, b) => b.score - a.score);
+        let raw = [];
+        if (settings.recall.raw && q.intent) {
+            // 原文只在「条目层确实找到了回调目标」时才捞（recap 强命中只能给目标补楼，不能自己当目标），候选楼 = 目标的来源楼与 recap 强命中的楼（以楼为轴）：
+            // 短句、指令句在长篇正文里总能撞上字面相同的段落（实测「继续」在 1208 段原文里第一名高出噪声线 10 个离散度），不能让原文自己找目标。
+            // 目标不限于「没进注入块」的条目：条目在往事里、摘要没写这个细节、楼层又已隐藏，正是原文细节该补的地方
+            const seeds = new Map(fused.slice(0, 6).map(f => [f.id, byId.get(f.id)]));
+            if (settings.recall.keyword && qTerms.size) for (const h of keywordScores(qTerms, okAll.filter(e => injectable(e, depths)), entryTerms, entryHeadText).slice(0, 6)) if (h.strong) seeds.set(h.doc.id, h.doc);
+            for (const e of vecStrongEnts.slice(0, 6)) seeds.set(e.id, e);
+            const strongRecap = recapHits.filter(h => h.strong);
+            if (seeds.size) {
+                try { raw = await rawDetail(data, chat, depths, q, qTerms, [...seeds.values()], strongRecap, notes); }
+                catch (err) { notes.push(`原文细节失败：${err.message}`); }
+            }
+        }
+        // 两层互证：原文块落在某条召回条目的来源楼 → 条目再 +0.15（原文块那边在 rawDetail 里已加）
+        const rawFloors = new Set(raw.map(r => r.index));
+        for (const f of fused) { const e = byId.get(f.id); if (srcFloors(e).some(i => rawFloors.has(i))) { f.score += 0.15; f.chs.push('原文'); } }
+        fused.sort((a, b) => b.score - a.score);
+        if (settings.recall.rerank && q.intent && vecConfigured() && (fused.length || raw.length)) {
+            const ents = fused.slice(0, 12), rws = raw.slice(0, 6);
+            try {
+                const s = await rerankDocs(q.intent, [...ents.map(f => vecEntryText(byId.get(f.id))), ...rws.map(r => r.text)]);
+                const bar = Math.max(RERANK_FLOOR, Math.max(0, ...s) * RERANK_REL);
+                fused = ents.map((f, i) => ({ ...f, rr: s[i] })).filter(f => f.rr >= bar).sort((a, b) => b.rr - a.rr);
+                raw = rws.map((r, i) => ({ ...r, rr: s[ents.length + i] })).filter(r => r.rr >= bar).sort((a, b) => b.rr - a.rr);
+                mode.push('重排');
+            } catch (err) {
+                mode.push('重排失败');
+                notes.push(`重排：${err.message}`);
+            }
+        }
+        const entries = fused.slice(0, topK).map(f => ({ id: f.id, score: f.rr ?? f.score, via: f.chs }));
+        return { key, entries, raw, mode: mode.join('+'), note: notes.join('；'), at: Date.now() };
+    }
+    const srcFloors = e => !e ? [] : (e.src?.floors?.length ? e.src.floors : [e.src?.idx]).filter(Number.isInteger);
+    // 实词数：去掉虚字的汉字各算 1，≥3 个字母/数字的词算 3（一个英文名顶好几个汉字），两个字母的算 1
+    const contentLen = t => (String(t || '').match(/[㐀-鿿]/g) || []).filter(c => !FUNC_CH.test(c)).length + (String(t || '').match(/[a-z0-9]{2,}/gi) || []).reduce((n, w) => n + (w.length >= 3 ? 3 : 1), 0);
+
+    // 原文细节：目标楼 = 召回条目/强命中条目的来源楼 + recap 强命中的楼；关键词在目标楼前后各一个 AI 楼里就地切块打分（零网络，不开向量也有）；
+    // 向量原文块只收落在目标楼前后两个 AI 楼以内的（以楼为轴：不让原文库自己找目标），去掉正文还在眼前的
+    async function rawDetail(data, chat, depths, q, qTerms, topEntries, recapHits, notes) {
+        const ctx = getCtx(), cw = Number(settings.contentWindow) || 6;
+        const far = i => Number.isInteger(i) && i >= 0 && i < chat.length && (depths[i] < 0 || depths[i] >= cw);
+        const ai = [];
+        for (let i = 0; i < chat.length; i++) if (chat[i]?.send_date && isAiFloor(chat[i], ctx)) ai.push(i);
+        const pos = new Map(ai.map((i, k) => [i, k]));
+        const entFloors = new Set(topEntries.flatMap(srcFloors));
+        const floors = [], near = new Set();
+        for (const i of [...entFloors, ...recapHits.slice(0, 6).map(h => h.doc.idx)]) {
+            const k = pos.get(i);
+            if (k === undefined) continue;
+            for (const j of [i, ai[k - 1], ai[k + 1]]) if (far(j) && !floors.includes(j)) floors.push(j);
+            for (let d = -2; d <= 2; d++) if (far(ai[k + d])) near.add(ai[k + d]);
+        }
+        const pool = new Map();   // 文本哈希 → { index, text, kw, vec }
+        const put = (index, text, ch, v) => { const k = hash(text); const o = pool.get(k) || { index, text }; o[ch] = Math.max(o[ch] || 0, v); pool.set(k, o); };
+        if (settings.recall.keyword && qTerms.size && floors.length) {
+            const chunks = [];
+            for (const i of floors.slice(0, 14)) for (const text of chunkText(extractContent(chat[i].mes).text)) chunks.push({ index: i, text });
+            for (const h of keywordScores(qTerms, chunks, c => termsOf(c.text, 600)).slice(0, 6)) put(h.doc.index, h.doc.text, 'kw', h.score);
+        }
+        if (settings.recall.vector && vecConfigured() && near.size && contentLen(q.intent) >= VEC_MIN_CONTENT) {
+            try {
+                const v = await vecSearch('raw', q.intent, 40, data, { gate: false });
+                let r = 0;
+                for (const m of v.hits) {
+                    const i = Number(m.index);
+                    if (!near.has(i) || !m.text) continue;
+                    put(i, String(m.text), 'vec', Math.max(0.5, 1 - r * 0.08));
+                    if (++r >= 8) break;
+                }
+                if (v.note) notes.push(`原文向量：${v.note}`);
+            } catch (err) { notes.push(`原文向量失败：${err.message}`); }
+        }
+        // 同一楼最多两段（相邻切块有 80 字重叠，再多就是在重复同一段）
+        const perFloor = new Map();
+        return [...pool.values()]
+            .map(o => ({ index: o.index, text: o.text, score: Math.max(o.kw || 0, o.vec || 0) + (o.kw && o.vec ? 0.2 : 0) + (entFloors.has(o.index) ? 0.15 : 0) }))
+            .sort((a, b) => b.score - a.score)
+            .filter(o => { const n = (perFloor.get(o.index) || 0) + 1; perFloor.set(o.index, n); return n <= 2; })
+            .slice(0, 8);
     }
 
     // 生成前：最多等 timeoutSec，超时就不带召回（预取仍会继续跑完，下一轮能用上）
@@ -2269,18 +2528,53 @@ C = 日常、闲聊、氛围、无后果的互动。
         return out;
     }
 
-    /* ---- 向量库：酒馆自带 /api/vector/*，服务端 vectra 存储，浮点不进聊天文件 ---- */
+    /* ---- 向量：通道 / 存储 / 自校准（v0.4.25 重做） ---- */
+    // 两条通道：
+    //   直连（默认）：浏览器直接请求 embeddings 接口拿向量，交给酒馆 /api/vector/* 的 webllm 源只存不算 —— 上游报错原文看得见，不占酒馆的 vllm 密钥槽
+    //   经酒馆：旧路线（vllm 源，酒馆后端代算；密钥写进酒馆 vllm 槽位；上游原因被酒馆吞成 500，只在酒馆终端里）。
+    //           接口不允许浏览器跨域时自动退到这条，按地址记住（换地址或点「测试向量连接」重新判断）
+    // 集合名 = erato-<类>-<聊天>-<指纹>[g世代]：指纹 = 通道 + 地址 + 模型，换模型自动落到新集合，旧集合等新集合第一次同步成功再删（vec.stale）；
+    // 重建写进下一世代，全部成功才切过去再删旧的，中途失败旧库照用
+    // 对账是无状态的：每次都拿「本地该有的」和「库里有的」做差集 —— 先插缺的、再删多的；插入按批，坏文本对半拆到单条、记进拒收名单跳过
 
     const vecOn = () => !!settings.recall.vector;
     const numHash = s => parseInt(hash(String(s)), 16);
-    const vecCollection = kind => `erato-${kind}-${hash(String(getCtx().chatId || ''))}`;
-    // 地址：去尾斜杠与末尾 /v1（酒馆后端自己拼 /v1/embeddings；拉模型那条路则需要带 /v1）
-    const vecBase = () => String(settings.recall.apiUrl || '').trim().replace(/\/+$/, '').replace(/\/embeddings$/i, '').replace(/\/+$/, '');
-    function vecBody() {
-        return { source: 'vllm', apiUrl: vecBase().replace(/\/v1$/i, ''), model: String(settings.recall.model || '').trim() || VEC_DEFAULT_MODEL };
-    }
+    const vecErr = (msg, kind, status = 0, origin = '') => Object.assign(new Error(msg), { vecKind: kind, status, origin });
+    // 地址：去尾斜杠与误填的 /embeddings、/rerank；直连要带版本段（没写 /v1 的补上），经酒馆则去掉 /v1（酒馆后端自己拼）
+    const vecBase = () => String(settings.recall.apiUrl || '').trim().replace(/\/+$/, '').replace(/\/(embeddings|rerank)$/i, '').replace(/\/+$/, '');
+    const directBase = () => { const b = vecBase(); return /\/v\d+[a-z0-9]*$/i.test(b) ? b : `${b}/v1`; };
+    const vecModel = () => String(settings.recall.model || '').trim() || VEC_DEFAULT_MODEL;
     const vecConfigured = () => !!(vecBase() && String(settings.recall.key || '').trim());
-    // 密钥写进酒馆的 vllm 槽位（服务端只认槽位）；同一把密钥只写一次
+    const rerankModel = () => String(settings.recall.rerankModel || '').trim() || RERANK_DEFAULT_MODEL;
+    const manualThreshold = () => { const t = Number(settings.recall.threshold); return t > 0 && t < 1 ? t : 0; };
+    function vecRoute() {
+        const r = settings.recall.route || 'auto';
+        if (r !== 'auto') return r;
+        const memo = settings.recall.routeMemo;
+        return memo && memo.base === vecBase() ? memo.route : 'direct';
+    }
+    function setRouteMemo(route) { settings.recall.routeMemo = { base: vecBase(), route, at: Date.now() }; saveSettings(); }
+    // 通道没定过（auto 且这个地址没记过）就拿一个短词试直连：浏览器层面连不上（跨域被拦）= 退经酒馆；其他错误（密钥错、模型错）照常报
+    async function ensureRoute(force = false) {
+        if ((settings.recall.route || 'auto') !== 'auto') return settings.recall.route;
+        const memo = settings.recall.routeMemo;
+        if (!force && memo && memo.base === vecBase()) return memo.route;
+        try { await embedDirect(['记忆'], 15000); setRouteMemo('direct'); return 'direct'; }
+        catch (err) { if (err.vecKind === 'network') { setRouteMemo('tavern'); return 'tavern'; } throw err; }
+    }
+    function vecBody() {
+        return vecRoute() === 'tavern'
+            ? { source: 'vllm', apiUrl: vecBase().replace(/\/v1$/i, ''), model: vecModel() }
+            : { source: 'webllm', model: vecModel() };
+    }
+    const vecFp = () => hash(`${vecRoute() === 'tavern' ? 'vllm' : 'webllm'}|${vecBase()}|${vecModel()}`).slice(0, 6);
+    const chatTag = () => hash(String(getCtx().chatId || ''));
+    function vecCollection(kind, gen, fp, tag) {
+        const g = gen ?? (getData()?.vec?.gen || 0);
+        return `erato-${kind}-${tag ?? chatTag()}-${fp ?? vecFp()}${g ? `g${g}` : ''}`;
+    }
+
+    // 经酒馆通道：密钥写进酒馆的 vllm 槽位（服务端只认槽位）；同一把密钥只写一次。直连通道不碰槽位
     async function ensureVecSecret() {
         const key = String(settings.recall.key || '').trim();
         if (!key) return false;
@@ -2291,29 +2585,125 @@ C = 日常、闲聊、氛围、无后果的互动。
         saveSettings();
         return true;
     }
-    async function vecCall(route, body, timeoutMs = 60000) {
-        if (!vecBase()) throw new Error('未填 embeddings 地址');
-        await ensureVecSecret();
-        const ctx = getCtx();
+    async function writeVecSecret(value) {
+        const res = await fetch('/api/secrets/write', { method: 'POST', headers: getCtx().getRequestHeaders(), body: JSON.stringify({ key: VEC_SECRET, value: String(value || ''), label: 'Erato Memory' }) });
+        if (!res.ok) throw new Error(`写入密钥失败：HTTP ${res.status}`);
+        return VEC_SECRET;
+    }
+
+    // 上游错误体里挑出人能看懂的那句（硅基：{"code":20015,"message":"The parameter is invalid…"}）
+    function upstreamMsg(text) {
+        const s = String(text || '').trim();
+        if (!s) return '';
+        try {
+            const j = JSON.parse(s);
+            const m = j?.error?.message || j?.message || (typeof j?.error === 'string' ? j.error : '');
+            const c = j?.code ?? j?.error?.code;
+            return m ? `：${c != null && c !== '' ? `[${c}] ` : ''}${String(m).slice(0, 160)}` : `：${s.slice(0, 160)}`;
+        } catch { return `：${s.slice(0, 160)}`; }
+    }
+    // 只认与输入一一对应、序号不重不漏、维度一致、全是有限数的向量；不对就整批拒收，不让坏数据进库
+    function readVectors(json, n) {
+        const list = Array.isArray(json?.data) ? json.data : null;
+        if (!list || list.length !== n) throw vecErr(`接口返回 ${list ? list.length : 0} 条向量，应为 ${n} 条`, 'invalid', 0, 'up');
+        const out = new Array(n);
+        let dim = 0;
+        list.forEach((d, k) => {
+            const i = Number.isInteger(d?.index) ? d.index : k;
+            const v = d?.embedding;
+            if (i < 0 || i >= n || out[i]) throw vecErr('接口返回的向量序号错乱', 'invalid', 0, 'up');
+            if (!Array.isArray(v) || !v.length || !v.every(Number.isFinite)) throw vecErr('接口返回的不是数字向量（若是 base64 编码，换个接口）', 'invalid', 0, 'up');
+            if (dim && v.length !== dim) throw vecErr('同一批向量维度不一致', 'invalid', 0, 'up');
+            dim = v.length;
+            out[i] = v;
+        });
+        return out;
+    }
+    // 直连 embeddings：浏览器直接请求；fetch 本身抛错（跨域被拦 / 断网）记为 network，交给通道判断
+    async function embedDirect(texts, timeoutMs = 30000) {
+        const key = String(settings.recall.key || '').trim();
         const c = new AbortController();
         const t = setTimeout(() => c.abort(), timeoutMs);
+        let res, text;
         try {
-            const res = await fetch(`/api/vector/${route}`, { method: 'POST', headers: ctx.getRequestHeaders(), signal: c.signal, body: JSON.stringify({ ...vecBody(), ...body }) });
-            const text = await res.text();
-            if (!res.ok) throw new Error(`HTTP ${res.status}${text ? '：' + text.slice(0, 120) : ''}`);
-            try { return JSON.parse(text); } catch { return text; }
+            res = await fetch(`${directBase()}/embeddings`, {
+                method: 'POST', signal: c.signal,
+                headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+                body: JSON.stringify({ model: vecModel(), input: texts.map(wellFormed) }),
+            });
+            text = await res.text();
         } catch (err) {
-            throw new Error(c.signal.aborted ? '超时' : err.message);
+            throw c.signal.aborted ? vecErr(`embeddings 超时（${Math.round(timeoutMs / 1000)}s）`, 'timeout', 0, 'up')
+                : vecErr(`浏览器连不上 embeddings 接口（${err.message}；若是接口不允许浏览器直连，通道选「自动」或「经酒馆转发」）`, 'network', 0, 'up');
         } finally { clearTimeout(t); }
+        if (!res.ok) throw vecErr(`embeddings HTTP ${res.status}${upstreamMsg(text)}`, 'http', res.status, 'up');
+        let json;
+        try { json = JSON.parse(text); } catch { throw vecErr('embeddings 接口返回的不是 JSON', 'invalid', 0, 'up'); }
+        return readVectors(json, texts.length);
     }
-    const vecEntryText = e => `${e.story_time || ''}｜${e.title}｜${e.summary}${e.emotion_shift ? `｜情绪：${e.emotion_shift}` : ''}${e.characters?.length ? `｜人物：${e.characters.join('、')}` : ''}`.slice(0, 300);
-    const vecEntryHash = e => numHash(`${e.id}|${vecEntryText(e)}`);
+    // 限流 / 5xx / 超时退避重试两次；4xx 是这批内容或配置的问题，重发也一样，交给拆批
+    async function embedRetry(texts, timeoutMs) {
+        for (let i = 0; ; i++) {
+            try { return await embedDirect(texts, timeoutMs); }
+            catch (err) {
+                const transient = err.vecKind === 'timeout' || (err.vecKind === 'http' && (err.status === 429 || err.status >= 500));
+                if (!transient || i >= VEC_RETRY.length) throw err;
+                log('embeddings 暂时性失败，退避后重试', err.message);
+                await sleep(VEC_RETRY[i]);
+            }
+        }
+    }
+    async function rerankDocs(query, docs, timeoutMs = 15000) {
+        const key = String(settings.recall.key || '').trim();
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), timeoutMs);
+        let res, text;
+        try {
+            res = await fetch(`${directBase()}/rerank`, {
+                method: 'POST', signal: c.signal,
+                headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+                body: JSON.stringify({ model: rerankModel(), query: wellFormed(query), documents: docs.map(wellFormed), return_documents: false }),
+            });
+            text = await res.text();
+        } catch (err) {
+            throw vecErr(c.signal.aborted ? '重排超时' : `浏览器连不上重排接口（${err.message}）`, c.signal.aborted ? 'timeout' : 'network', 0, 'up');
+        } finally { clearTimeout(t); }
+        if (!res.ok) throw vecErr(`重排 HTTP ${res.status}${upstreamMsg(text)}`, 'http', res.status, 'up');
+        let json;
+        try { json = JSON.parse(text); } catch { throw vecErr('重排接口返回的不是 JSON', 'invalid', 0, 'up'); }
+        const out = new Array(docs.length).fill(0);
+        for (const r of (json?.results || [])) if (Number.isInteger(r?.index) && r.index >= 0 && r.index < docs.length && Number.isFinite(r.relevance_score)) out[r.index] = r.relevance_score;
+        return out;
+    }
 
-    // 原文按约 600 字切块、带重叠，尽量在句末断
+    // 酒馆向量库（/api/vector/*）：直连通道带 webllm 源 + 现成向量，经酒馆通道带 vllm 源 + 地址让后端代算
+    async function vecCall(route, body, timeoutMs = 60000) {
+        if (!vecBase()) throw vecErr('未填 embeddings 地址', 'config');
+        if (vecRoute() === 'tavern') await ensureVecSecret();
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), timeoutMs);
+        let res, text;
+        try {
+            res = await fetch(`/api/vector/${route}`, { method: 'POST', headers: getCtx().getRequestHeaders(), signal: c.signal, body: JSON.stringify({ ...vecBody(), ...body }) });
+            text = await res.text();
+        } catch (err) {
+            throw vecErr(c.signal.aborted ? '酒馆向量库超时' : `酒馆向量库连不上：${err.message}`, c.signal.aborted ? 'timeout' : 'network', 0, 'st');
+        } finally { clearTimeout(t); }
+        if (!res.ok) {
+            const tail = text && !/^\s*Internal Server Error\s*$/i.test(text) ? `：${String(text).slice(0, 120)}` : '';
+            throw vecErr(`酒馆向量库 HTTP ${res.status}${tail}${res.status === 500 && vecRoute() === 'tavern' ? '（经酒馆通道：上游的具体原因只在酒馆终端里）' : ''}`, 'http', res.status, 'st');
+        }
+        try { return JSON.parse(text); } catch { return text; }
+    }
+
+    // 入库文本：条目一行（≤300 字，不切开 emoji）；原文按约 600 字切块、带重叠，尽量在句末断
+    const vecEntryText = e => cut(wellFormed(`${e.story_time || ''}｜${e.title}｜${e.summary}${e.emotion_shift ? `｜情绪：${e.emotion_shift}` : ''}${e.characters?.length ? `｜人物：${e.characters.join('、')}` : ''}`), 300);
+    const vecEntryHash = e => numHash(`${e.id}|${vecEntryText(e)}`);
     function chunkText(text) {
-        const s = String(text || '').replace(/\s+/g, ' ').trim();
+        const s = wellFormed(String(text || '')).replace(/\s+/g, ' ').trim();
         if (!s) return [];
         if (s.length <= RAW_CHUNK_CHARS * 1.3) return [s];
+        const isHi = i => { const c = s.charCodeAt(i); return c >= 0xD800 && c <= 0xDBFF; };
         const out = [];
         let start = 0;
         while (start < s.length) {
@@ -2322,141 +2712,307 @@ C = 日常、闲聊、氛围、无后果的互动。
                 const seg = s.slice(start + Math.floor(RAW_CHUNK_CHARS * 0.6), end);
                 const m = seg.lastIndexOf('。') >= 0 ? seg.lastIndexOf('。') : Math.max(seg.lastIndexOf('！'), seg.lastIndexOf('？'), seg.lastIndexOf('\n'));
                 if (m >= 0) end = start + Math.floor(RAW_CHUNK_CHARS * 0.6) + m + 1;
+                if (end < s.length && isHi(end - 1)) end--;   // 不把 emoji 从中间切开
             }
             out.push(s.slice(start, end).trim());
             if (end >= s.length) break;
             start = Math.max(start + 1, end - RAW_CHUNK_OVERLAP);
+            if (start > 0 && isHi(start - 1)) start--;
         }
         return out.filter(Boolean);
     }
 
-    async function vecIndexEntries(data, entries) {
-        const items = [];
-        for (const e of entries) {
-            if (!e || e.status !== 'ok') continue;
-            const h = vecEntryHash(e);
-            if (data.vec.entries[e.id] === h) continue;
-            items.push({ e, h });
-        }
-        if (!items.length) return 0;
-        const stale = items.map(x => data.vec.entries[x.e.id]).filter(Number.isFinite);
-        if (stale.length) await vecCall('delete', { collectionId: vecCollection('mem'), hashes: stale });
-        for (let i = 0; i < items.length; i += 24) {
-            const batch = items.slice(i, i + 24);
-            await vecCall('insert', { collectionId: vecCollection('mem'), items: batch.map(x => ({ hash: x.h, text: vecEntryText(x.e), index: x.e.src?.idx ?? 0 })) }, 120000);
-            for (const x of batch) data.vec.entries[x.e.id] = x.h;
-        }
-        return items.length;
+    // 一次同步/重建的上下文：开工时记下聊天与库，之后每一步先核对，切了聊天就整次作废（不往新聊天的集合里写旧聊天的东西）
+    function vecOp(data) {
+        const chatId = getCtx().chatId;
+        const op = {
+            data, tag: chatTag(), route: vecRoute(), okHashes: new Set(), probeOk: false, dim: data.vec.dim || 0,
+            guard() { if (getCtx().chatId !== chatId || getData() !== data) throw vecErr('聊天已切换，本次向量同步作废', 'stale'); },
+            // 单条也被拒时先确认是不是接口/配置本身的问题：连一个短词都拒 = 配置错，整次中止，而不是把每一条都记成拒收
+            async probe() {
+                if (op.probeOk) return;
+                try {
+                    if (op.route === 'tavern') {
+                        const id = `erato-probe-${hash(String(Date.now()))}`;
+                        try { await vecCall('insert', { collectionId: id, items: [{ hash: 1, text: '记忆', index: 0 }] }); }
+                        finally { await vecCall('purge', { collectionId: id }).catch(() => {}); }
+                    } else await embedDirect(['记忆'], 15000);
+                    op.probeOk = true;
+                } catch (err) {
+                    throw vecErr(`接口连一个短词都拒收（${err.message}），不是个别文本的问题：检查模型名、地址和密钥`, 'config', err.status, err.origin);
+                }
+            },
+        };
+        return op;
     }
-    async function vecIndexRaw(data, inputs) {
-        if (!settings.recall.raw) return 0;
-        let n = 0;
-        for (const f of inputs) {
-            if (!f?.send_date || !f.content) continue;
-            const old = data.vec.raw[f.send_date];
-            if (old?.h === f.hash) continue;
-            if (old?.hs?.length) await vecCall('delete', { collectionId: vecCollection('raw'), hashes: old.hs });
-            const chunks = chunkText(f.content);
-            const hs = chunks.map((c, k) => numHash(`${f.send_date}|${k}|${f.hash}`));
-            for (let i = 0; i < chunks.length; i += 16) {
-                await vecCall('insert', { collectionId: vecCollection('raw'), items: chunks.slice(i, i + 16).map((c, k) => ({ hash: hs[i + k], text: c, index: f.idx })) }, 120000);
+    // 「这批内容有问题」的错误才拆批：直连看上游 400/413/422；经酒馆只能看到酒馆的 500/400
+    const badInput = (err, route) => err.vecKind === 'http' && (route === 'tavern' ? err.origin === 'st' && [400, 500].includes(err.status) : err.origin === 'up' && [400, 413, 422].includes(err.status));
+    const stItem = x => ({ hash: x.hash, text: x.text, index: x.index });
+    async function putBatch(col, batch, op, rejected) {
+        op.guard();
+        try {
+            if (op.route === 'tavern') await vecCall('insert', { collectionId: col, items: batch.map(stItem) }, 120000);
+            else {
+                const vecs = await embedRetry(batch.map(x => x.text));
+                op.guard();
+                const embeddings = {};
+                batch.forEach((x, k) => { embeddings[x.text] = vecs[k]; });
+                op.dim = vecs[0]?.length || op.dim;
+                await vecCall('insert', { collectionId: col, items: batch.map(stItem), embeddings }, 120000);
             }
-            data.vec.raw[f.send_date] = { h: f.hash, hs };
-            n += chunks.length;
+            for (const x of batch) op.okHashes.add(x.hash);
+        } catch (err) {
+            if (!badInput(err, op.route)) throw err;
+            if (batch.length > 1) {
+                const h = Math.ceil(batch.length / 2);
+                await putBatch(col, batch.slice(0, h), op, rejected);
+                await putBatch(col, batch.slice(h), op, rejected);
+                return;
+            }
+            await op.probe();
+            rejected[hash(batch[0].text)] = { why: String(err.message).slice(0, 160), at: Date.now(), ref: batch[0].ref };
+            warn('向量：接口拒收了一段文本，已跳过', batch[0].ref, err.message);
         }
-        return n;
     }
-    async function vecDeleteEntries(data, ids) {
-        const hs = ids.map(id => data.vec.entries[id]).filter(Number.isFinite);
-        for (const id of ids) delete data.vec.entries[id];
-        if (hs.length) await vecCall('delete', { collectionId: vecCollection('mem'), hashes: hs });
+
+    // 本地「该在库里的」：ok 条目一条一行；已总结楼层（ok 窗口）的正文切块
+    function vecWant(data) {
+        const mem = new Map();
+        for (const e of data.entries) if (e.status === 'ok') { const text = vecEntryText(e); const h = numHash(`${e.id}|${text}`); mem.set(h, { hash: h, text, index: e.src?.idx ?? 0, ref: e.id }); }
+        const raw = new Map(), rawByDate = {};
+        if (settings.recall.raw) {
+            const okDates = new Set();
+            for (const w of data.windows) if (w.status === 'ok') for (const d of w.dates) okDates.add(d);
+            const chat = getCtx().chat || [];
+            chat.forEach((m, i) => {
+                if (!m?.send_date || !okDates.has(m.send_date)) return;
+                const f = floorInput(chat, i);
+                const chunks = chunkText(f.content);
+                const hs = chunks.map((c, k) => numHash(`${f.send_date}|${k}|${f.hash}`));
+                chunks.forEach((c, k) => raw.set(hs[k], { hash: hs[k], text: c, index: i, ref: `#${i}` }));
+                rawByDate[f.send_date] = { h: f.hash, hs };
+            });
+        }
+        return { mem, raw, rawByDate };
     }
-    // 窗口 ok 后同步：失败只记错不影响入库，下次「补向量」或切聊天对账补上
-    function vecAfterWindow(data, w, made, inputs, oldIds = []) {
+    const asNums = r => Array.isArray(r) ? r.map(Number).filter(Number.isFinite) : [];
+    // 把一个世代的集合对齐到本地：先插缺的（跳过拒收名单里内容没变的），再删多的；返回新的对账表，不直接改 data.vec（重建失败时旧表不动）
+    async function syncCollections(data, op, gen, rejectedIn, onProgress) {
+        const want = vecWant(data);
+        const colM = vecCollection('mem', gen, undefined, op.tag), colR = vecCollection('raw', gen, undefined, op.tag);
+        op.guard();
+        const haveM = new Set(asNums(await vecCall('list', { collectionId: colM })));
+        const haveR = settings.recall.raw ? new Set(asNums(await vecCall('list', { collectionId: colR }))) : new Set();
+        const wantKeys = new Set([...want.mem.values(), ...want.raw.values()].map(x => hash(x.text)));
+        const rejected = {};
+        for (const [k, v] of Object.entries(rejectedIn || {})) if (wantKeys.has(k)) rejected[k] = v;   // 内容改过的掉出名单，这次重试
+        const needM = [...want.mem.values()].filter(x => !haveM.has(x.hash) && !rejected[hash(x.text)]);
+        const needR = [...want.raw.values()].filter(x => !haveR.has(x.hash) && !rejected[hash(x.text)]);
+        const total = needM.length + needR.length;
+        let done = 0;
+        for (const [col, list] of [[colM, needM], [colR, needR]]) {
+            for (let i = 0; i < list.length; i += VEC_BATCH) {
+                const batch = list.slice(i, i + VEC_BATCH);
+                await putBatch(col, batch, op, rejected);
+                done += batch.length;
+                onProgress?.(done, total);
+            }
+        }
+        op.guard();
+        const extraM = [...haveM].filter(h => !want.mem.has(h));
+        if (extraM.length) await vecCall('delete', { collectionId: colM, hashes: extraM });
+        const extraR = [...haveR].filter(h => !want.raw.has(h));
+        if (extraR.length) await vecCall('delete', { collectionId: colR, hashes: extraR });
+        const inLib = h => haveM.has(h) || haveR.has(h) || op.okHashes.has(h);
+        const entries = {};
+        for (const x of want.mem.values()) if (inLib(x.hash)) entries[x.ref] = x.hash;
+        const raw = {};
+        for (const [d, v] of Object.entries(want.rawByDate)) if (v.hs.length && v.hs.every(inLib)) raw[d] = v;
+        return { entries, raw, rejected, insertedM: needM.filter(x => op.okHashes.has(x.hash)).length, insertedR: needR.filter(x => op.okHashes.has(x.hash)).length };
+    }
+    // 开工前：定通道；旧版集合（名字不带指纹、经酒馆建的）一次性清掉；指纹变了（换了模型/地址/通道）对账表归零、旧指纹的集合记进待删
+    // （新指纹同步成功才删，见 vecDropStale；换回用过的指纹时沿用它还没删的集合与世代）
+    async function vecPrepare(data, op) {
+        op.route = await ensureRoute();
+        op.guard();
+        const v = data.vec;
+        if (!v.v) {
+            for (const k of ['mem', 'raw']) await vecCall('purge', { collectionId: `erato-${k}-${op.tag}` }).catch(() => {});
+            Object.assign(v, { v: 2, entries: {}, raw: {} });
+        }
+        const fp = vecFp();
+        if (v.fp !== fp) {
+            const back = (v.stale || []).find(s => s.fp === fp);
+            const stale = (v.stale || []).filter(s => s.fp !== fp);
+            if (v.fp) stale.push({ fp: v.fp, gen: v.gen || 0 });
+            Object.assign(v, { fp, gen: back ? back.gen : 0, dim: 0, entries: {}, raw: {}, rejected: {}, stale });
+        }
+        op.guard();
+    }
+    async function vecDropStale(data, op) {
+        const list = data.vec.stale || [];
+        if (!list.length) return;
+        data.vec.stale = [];
+        for (const s of list) for (const k of ['mem', 'raw']) await vecCall('purge', { collectionId: vecCollection(k, s.gen, s.fp, op.tag) }).catch(() => {});
+    }
+    // 同一时刻只跑一个同步/重建（自动对账、窗口入库后同步、手点补向量会撞在一起，并发会把同一条插两遍）
+    const vq = { tail: Promise.resolve() };
+    function vecExclusive(fn) { const p = vq.tail.then(fn); vq.tail = p.then(() => {}, () => {}); return p; }
+
+    async function vecSync(data, onProgress) {
+        if (!vecOn()) return { entries: 0, raw: 0, rejected: 0 };
+        return vecExclusive(async () => {
+            const op = vecOp(data);
+            await vecPrepare(data, op);
+            const r = await syncCollections(data, op, data.vec.gen || 0, data.vec.rejected, onProgress);
+            op.guard();
+            Object.assign(data.vec, { entries: r.entries, raw: r.raw, rejected: r.rejected, dim: op.dim || data.vec.dim || 0, at: Date.now(), error: '' });
+            saveData();
+            await vecDropStale(data, op);
+            return { entries: r.insertedM, raw: r.insertedR, rejected: Object.keys(r.rejected).length };
+        });
+    }
+    // 重建：写进下一世代，全部成功才切换，再删旧世代；失败只清掉新世代的半截，旧库与旧对账表原样可用
+    async function vecRebuild(onProgress) {
+        const data = getData(); if (!data) return null;
+        return vecExclusive(async () => {
+            const op = vecOp(data);
+            await vecPrepare(data, op);
+            const oldGen = data.vec.gen || 0, gen = oldGen + 1;
+            for (const k of ['mem', 'raw']) await vecCall('purge', { collectionId: vecCollection(k, gen, undefined, op.tag) }).catch(() => {});
+            let r;
+            try { r = await syncCollections(data, op, gen, {}, onProgress); op.guard(); }
+            catch (err) {
+                if (err.vecKind !== 'stale') for (const k of ['mem', 'raw']) vecCall('purge', { collectionId: vecCollection(k, gen, undefined, op.tag) }).catch(() => {});
+                throw err;
+            }
+            Object.assign(data.vec, { gen, entries: r.entries, raw: r.raw, rejected: r.rejected, dim: op.dim || data.vec.dim || 0, at: Date.now(), error: '' });
+            saveData();
+            for (const k of ['mem', 'raw']) await vecCall('purge', { collectionId: vecCollection(k, oldGen, undefined, op.tag) }).catch(() => {});
+            await vecDropStale(data, op);
+            calib.key = '';
+            return { entries: r.insertedM, raw: r.insertedR, rejected: Object.keys(r.rejected).length };
+        });
+    }
+    // 条目改/删、窗口入库后：都交给无状态对账（插新删旧一次做完）
+    const vecIndexEntries = data => vecSync(data);
+    const vecIndexRaw = data => vecSync(data);
+    function vecDeleteEntries(data, ids) { for (const id of ids || []) delete data.vec.entries[id]; return vecSync(data); }
+    function vecAfterWindow(data) {
         if (!vecOn()) return;
-        (async () => {
-            try {
-                if (oldIds.length) await vecDeleteEntries(data, oldIds);
-                await vecIndexEntries(data, made);
-                await vecIndexRaw(data, inputs);
-                data.vec.source = settings.recall.source; data.vec.model = vecBody().model || ''; data.vec.at = Date.now(); data.vec.error = '';
-                saveData();
-            } catch (err) {
-                data.vec.error = err.message;
-                warn('向量同步失败：', err.message);
-                if (!rc.vecToasted) { rc.vecToasted = true; toast('warning', `向量同步失败：${err.message.slice(0, 80)}（不影响总结，可稍后「补向量」）`); }
-            }
-        })();
+        vecSync(data).catch(err => {
+            if (err.vecKind === 'stale') return;
+            data.vec.error = err.message;
+            warn('向量同步失败：', err.message);
+            if (!rc.vecToasted) { rc.vecToasted = true; toast('warning', `向量同步失败：${err.message.slice(0, 80)}（不影响总结，可稍后「补向量」）`); }
+        });
     }
-    async function vecQuery(data, query, topK) {
-        const out = { ids: [], raw: [] };
-        const rev = new Map(Object.entries(data.vec.entries).map(([id, h]) => [Number(h), id]));
-        if (rev.size) {
-            const res = await vecCall('query', { collectionId: vecCollection('mem'), searchText: query, topK, threshold: Number(settings.recall.threshold) || 0 }, 30000);
-            for (const m of (res?.metadata || [])) { const id = rev.get(Number(m.hash)); if (id && !out.ids.includes(id)) out.ids.push(id); }
+
+    // 自校准：从本聊天均匀抽一批条目（原文块另抽一批）算一次向量，只放内存、不进聊天文件；
+    // 每次查询先量「查询 vs 样本」的相似度分布：中位数 + 2 个离散度（1.4826×MAD）= 准入线，+3 个离散度 = 闸门 ——
+    // 第一名连闸门都过不了，说明没有哪条旧记忆明显相关，一条都不捞。
+    // 依据（v0.4.25 实测，331 楼真实聊天、12 个回调问句、11 句没有回调意图的话）：同一对主角的无关条目余弦就有 0.55–0.63（bge-m3），
+    // 固定 0.4 等于不过滤，换个查询串噪声线还会整体浮动；现场估的线在 bge-m3 与 Qwen3-Embedding 上都稳，「嗯」「继续推进剧情」过不了闸门
+    const calib = { key: '', mem: null, raw: null };
+    const evenPick = (arr, n) => arr.length <= n ? arr.slice() : Array.from({ length: n }, (_, k) => arr[Math.floor(k * arr.length / n)]);
+    async function vecCalib(kind, data) {
+        const ok = data.entries.filter(e => e.status === 'ok');
+        const key = `${getCtx().chatId}|${vecFp()}|${Math.floor(ok.length / 20)}`;
+        if (calib.key !== key) { calib.key = key; calib.mem = null; calib.raw = null; }
+        if (calib[kind]) return calib[kind];
+        let texts;
+        if (kind === 'mem') texts = evenPick(ok, CALIB_MEM).map(vecEntryText);
+        else {
+            const chat = getCtx().chat || [];
+            const okDates = new Set();
+            for (const w of data.windows) if (w.status === 'ok') for (const d of w.dates) okDates.add(d);
+            const floors = [];
+            chat.forEach((m, i) => { if (m?.send_date && okDates.has(m.send_date)) floors.push(i); });
+            texts = evenPick(floors, CALIB_RAW).map(i => chunkText(extractContent(chat[i].mes).text)[0]).filter(Boolean);
         }
-        if (settings.recall.raw && Object.keys(data.vec.raw).length) {
-            const res = await vecCall('query', { collectionId: vecCollection('raw'), searchText: query, topK: Math.max(2, Math.min(6, Math.ceil(topK / 2))), threshold: Number(settings.recall.threshold) || 0 }, 30000);
-            out.raw = (res?.metadata || []).map(m => ({ index: Number(m.index), text: String(m.text || '') })).filter(r => r.text);
+        if (texts.length < (kind === 'mem' ? CALIB_MEM_MIN : CALIB_RAW_MIN)) return null;
+        const vecs = await embedRetry(texts, 20000);
+        if (calib.key === key) calib[kind] = { vecs, n: texts.length };
+        return { vecs, n: texts.length };
+    }
+    const median = a => { const s = [...a].sort((x, y) => x - y), n = s.length; return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2; };
+    const cosine = (a, b) => { let p = 0, x = 0, y = 0; for (let i = 0; i < a.length && i < b.length; i++) { p += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i]; } return x && y ? p / Math.sqrt(x * y) : 0; };
+    // 噪声线：本次查询对样本的相似度 → 准入线 / 闸门（中位数 + k × 1.4826·MAD；离散度设下限 0.005，样本太整齐时线不至于贴着中位数）
+    const noiseLine = sims => { const m = median(sims); const sd = Math.max(0.005, 1.4826 * median(sims.map(x => Math.abs(x - m)))); return { m, sd, admit: m + ADMIT_Z * sd, gate: m + GATE_Z * sd }; };
+    // 一次向量检索：返回过准入线的 metadata（酒馆按相似度从高到低排好）、其中过闸门线的强命中（hash 集合）与一句说明。
+    // 闸门：强命中为空 = 没有哪条明显相关，整次一条不捞（opts.gate = false 时只按准入线取，原文块用：它的目标由条目层定）。
+    // 手填了阈值、经酒馆通道（没法自校准）、样本不够时用固定阈值，过线的都算强
+    async function vecSearch(kind, text, topK, data, opts = {}) {
+        await ensureRoute();
+        const col = vecCollection(kind);
+        const fixed = manualThreshold();
+        const allStrong = (hits, note) => ({ hits, strong: new Set(hits.map(h => Number(h.hash))), note });
+        if (vecRoute() === 'tavern') {
+            const t = fixed || VEC_FALLBACK_THRESHOLD;
+            const res = await vecCall('query', { collectionId: col, searchText: text, topK, threshold: t }, 30000);
+            return allStrong(res?.metadata || [], `经酒馆·固定阈值 ${t}`);
+        }
+        const [qv] = await embedRetry([text], 15000);
+        const ask = (threshold, k) => vecCall('query', { collectionId: col, searchText: text, topK: k, threshold, embeddings: { [text]: qv } }, 30000).then(r => r?.metadata || []);
+        if (fixed) return allStrong(await ask(fixed, topK), `固定阈值 ${fixed}`);
+        const cal = await vecCalib(kind, data).catch(err => { log('自校准取样失败：', err.message); return null; });
+        if (!cal) return allStrong(await ask(VEC_FALLBACK_THRESHOLD, topK), `样本不足，固定阈值 ${VEC_FALLBACK_THRESHOLD}`);
+        const line = noiseLine(cal.vecs.map(v => cosine(qv, v)));
+        const hits = await ask(line.admit, topK);
+        if (!hits.length) return { hits: [], strong: new Set(), note: '没有过噪声线' };
+        if (opts.gate === false) return { hits, strong: new Set(), note: `准入线 ${line.admit.toFixed(3)}` };
+        const strong = await ask(line.gate, topK);
+        if (!strong.length) return { hits: [], strong: new Set(), note: '闸门未过（没有明显相关的旧记忆）' };
+        return { hits, strong: new Set(strong.map(h => Number(h.hash))), note: `准入线 ${line.admit.toFixed(3)}，强命中 ${strong.length}` };
+    }
+    // 排障用：一次查询的条目 id 与原文块
+    async function vecQuery(data, query, topK = 8) {
+        const rev = new Map(Object.entries(data.vec.entries).map(([id, h]) => [Number(h), id]));
+        const m = await vecSearch('mem', query, topK, data);
+        const out = { ids: [], raw: [], notes: [m.note] };
+        for (const x of m.hits) { const id = rev.get(Number(x.hash)); if (id && !out.ids.includes(id)) out.ids.push(id); }
+        if (settings.recall.raw) {
+            const r = await vecSearch('raw', query, Math.max(2, Math.min(6, Math.ceil(topK / 2))), data);
+            out.raw = r.hits.map(x => ({ index: Number(x.index), text: String(x.text || '') })).filter(x => x.text);
+            out.notes.push(r.note);
         }
         return out;
     }
-    // 对账：库里有本地没有 → 删；本地该有没有 → 补。onProgress(done, total) 给「重建」用
-    async function vecSync(data, onProgress) {
-        if (!vecOn()) return { entries: 0, raw: 0 };
-        const okDates = new Set();
-        for (const w of data.windows) if (w.status === 'ok') for (const d of w.dates) okDates.add(d);
-        const okEntries = data.entries.filter(e => e.status === 'ok');
-        const wantEntry = new Map(okEntries.map(e => [e.id, vecEntryHash(e)]));
-        for (const id of Object.keys(data.vec.entries)) if (!wantEntry.has(id) || wantEntry.get(id) !== data.vec.entries[id]) delete data.vec.entries[id];
-        const have = new Set((await vecCall('list', { collectionId: vecCollection('mem') }) || []).map(Number));
-        const extra = [...have].filter(h => ![...wantEntry.values()].includes(h));
-        if (extra.length) await vecCall('delete', { collectionId: vecCollection('mem'), hashes: extra });
-        for (const [id, h] of wantEntry) if (have.has(h)) data.vec.entries[id] = h;
-        const need = okEntries.filter(e => data.vec.entries[e.id] !== wantEntry.get(e.id));
-        const total = need.length + (settings.recall.raw ? okDates.size : 0);
-        let done = 0;
-        for (let i = 0; i < need.length; i += 24) { await vecIndexEntries(data, need.slice(i, i + 24)); done += Math.min(24, need.length - i); onProgress?.(done, total); }
-        let rawN = 0;
-        if (settings.recall.raw) {
-            const chat = getCtx().chat || [];
-            for (const d of Object.keys(data.vec.raw)) if (!okDates.has(d)) { const hs = data.vec.raw[d]?.hs || []; if (hs.length) await vecCall('delete', { collectionId: vecCollection('raw'), hashes: hs }); delete data.vec.raw[d]; }
-            const haveRaw = new Set((await vecCall('list', { collectionId: vecCollection('raw') }) || []).map(Number));
-            for (const d of Object.keys(data.vec.raw)) if (!(data.vec.raw[d].hs || []).every(h => haveRaw.has(h))) delete data.vec.raw[d];
-            const byDate = new Map(); chat.forEach((m, i) => { if (m?.send_date) byDate.set(m.send_date, i); });
-            for (const d of okDates) {
-                const i = byDate.get(d);
-                if (i === undefined) { done++; continue; }
-                const f = floorInput(chat, i);
-                if (data.vec.raw[d]?.h !== f.hash) rawN += await vecIndexRaw(data, [f]);
-                done++; onProgress?.(done, total);
-            }
-        }
-        data.vec.source = settings.recall.source; data.vec.model = vecBody().model || ''; data.vec.at = Date.now(); data.vec.error = '';
-        saveData();
-        return { entries: need.length, raw: rawN };
+    // 切聊天后预热：样本向量先算好，第一句话就不用多等一次请求
+    function vecWarm(data) {
+        if (!vecOn() || !vecConfigured() || manualThreshold() || vecRoute() !== 'direct' || !data) return;
+        vecCalib('mem', data).then(() => settings.recall.raw ? vecCalib('raw', data) : null).catch(err => log('自校准预热失败：', err.message));
     }
-    async function vecRebuild(onProgress) {
-        const data = getData(); if (!data) return null;
-        await vecCall('purge', { collectionId: vecCollection('mem') });
-        await vecCall('purge', { collectionId: vecCollection('raw') });
-        data.vec = { entries: {}, raw: {}, source: '', model: '', at: 0 };
-        return vecSync(data, onProgress);
-    }
+    // 测试：通道（重新判断）→ 酒馆存储（插入/查询/清理一条探针）→ 重排（开了才测）；返回一行结果
     async function vecTest() {
+        const lines = [];
+        const route = await ensureRoute(true);
+        const text = '探针：记忆插件向量连接测试';
+        let qv = null;
+        if (route === 'direct') {
+            const t0 = Date.now();
+            [qv] = await embedRetry([text], 20000);
+            lines.push(`直连 ✓（${qv.length} 维，${Date.now() - t0}ms）`);
+        } else lines.push(settings.recall.route === 'tavern' ? '经酒馆通道' : '直连被浏览器拦下（接口不允许跨域），改走经酒馆通道');
         const id = `erato-probe-${hash(String(Date.now()))}`;
-        const h = numHash(id);
-        await vecCall('insert', { collectionId: id, items: [{ hash: h, text: '探针：记忆插件向量连接测试', index: 0 }] }, 60000);
-        const res = await vecCall('query', { collectionId: id, searchText: '向量连接测试', topK: 1, threshold: 0 }, 60000);
-        await vecCall('purge', { collectionId: id }).catch(() => {});
-        if (!Array.isArray(res?.metadata)) throw new Error('查询没有返回结果');
-        return res.metadata.length;
-    }
-    // 把密钥写进酒馆 vllm 槽位（会覆盖同名槽位）
-    async function writeVecSecret(value) {
-        const res = await fetch('/api/secrets/write', { method: 'POST', headers: getCtx().getRequestHeaders(), body: JSON.stringify({ key: VEC_SECRET, value: String(value || ''), label: 'Erato Memory' }) });
-        if (!res.ok) throw new Error(`写入密钥失败：HTTP ${res.status}`);
-        return VEC_SECRET;
+        try {
+            const extra = qv ? { embeddings: { [text]: qv } } : {};
+            await vecCall('insert', { collectionId: id, items: [{ hash: numHash(id), text, index: 0 }], ...extra }, 60000);
+            const res = await vecCall('query', { collectionId: id, searchText: text, topK: 1, threshold: 0, ...extra }, 60000);
+            if (!Array.isArray(res?.metadata) || !res.metadata.length) throw vecErr('酒馆向量库查询没有返回探针', 'invalid', 0, 'st');
+            lines.push('酒馆存储 ✓');
+        } catch (err) {
+            if (route === 'direct' && err.origin === 'st' && (settings.recall.route || 'auto') === 'auto') {
+                setRouteMemo('tavern');
+                throw vecErr(`酒馆向量库不接受直连写入（${err.message}，可能酒馆版本较旧），已改走经酒馆通道，请再点一次测试`, 'st', err.status, 'st');
+            }
+            throw err;
+        } finally { await vecCall('purge', { collectionId: id }).catch(() => {}); }
+        if (settings.recall.rerank) {
+            try { const t0 = Date.now(); await rerankDocs('测试', ['测试一下', '今天天气不错']); lines.push(`重排 ✓（${Date.now() - t0}ms）`); }
+            catch (err) { lines.push(`重排 ✗ ${err.message}`); }
+        }
+        return lines.join(' · ');
     }
 
     /* ================= 状态 ================= */
@@ -2479,7 +3035,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const c = counts();
         const bad = c.failed + c.refused;
         const N = Math.max(0, Number(settings.autoInterval) || 0);
-        const injectLine = `本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（预算裁掉 ${lastInject.dropped}）` : ''}${lastInject.outline ? ` · 远景 ${lastInject.outline} 行` : ''}${lastInject.fallback ? ` · 保底 ${lastInject.fallback}` : ''}${lastInject.recalled || lastInject.raw ? ` · 召回 ${lastInject.recalled}${lastInject.raw ? `+原文 ${lastInject.raw}` : ''}` : ''}${rc.error ? ` · ${rc.error}` : ''}`;
+        const injectLine = `本轮注入 ${lastInject.count} 条 ≈ ${lastInject.chars} 字${lastInject.dropped ? `（预算裁掉 ${lastInject.dropped}）` : ''}${lastInject.outline ? ` · 远景 ${lastInject.outline} 行` : ''}${lastInject.fallback ? ` · 保底 ${lastInject.fallback}` : ''}${lastInject.recalled || lastInject.raw ? ` · 召回 ${lastInject.recalled}${lastInject.raw ? `+原文 ${lastInject.raw}` : ''}` : ''}${rc.error ? ` · ${rc.error}` : ''}${rc.note && settings.recall.vector ? ` · ${rc.note}` : ''}`;
         const autoLine = N ? `自动：每 ${N} 楼总结一次（已攒 ${Math.min(c.todoAuto, N)}/${N}，不含最新两楼），单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼` : `自动总结已关：只在点「总结到当前」时总结，单次最多 ${Math.max(1, Number(settings.windowFloors) || 40)} 楼`;
         $('.em-status').text(`已总结 ${c.done} 楼 / ${c.events} 条 · 待总结 ${c.todo} 楼 · 失败 ${bad} 段 · 人物 ${c.people} · 物件 ${c.items} · 已隐藏 ${c.hidden} · ${injectLine}`);
 
@@ -2697,7 +3253,7 @@ C = 日常、闲聊、氛围、无后果的互动。
             <div class="menu_button" id="em_test">测试连接</div>
             <hr>
             <div class="em-sec">向量召回（高楼层可选）</div>
-            <div class="em-hint">两三百楼以内不需要开。开了以后，被注入上限裁掉、或已折进远景的旧记忆会按你当下聊的话题被捞回来。填法和副 API 一样：地址 + 密钥 + 拉取模型选一个；任何 OpenAI 兼容的 embeddings 接口都行（硅基流动填 https://api.siliconflow.cn/v1，模型选 Qwen/Qwen3-Embedding-0.6B 或 BAAI/bge-m3）。向量存在酒馆服务端，不进聊天文件。</div>
+            <div class="em-hint">两三百楼以内不需要开。开了以后，被注入上限裁掉、或已折进远景的旧记忆会在你问起时被捞回来。填法和副 API 一样：地址 + 密钥 + 拉取模型选一个；任何 OpenAI 兼容的 embeddings 接口都行（硅基流动填 https://api.siliconflow.cn/v1，模型选 Qwen/Qwen3-Embedding-0.6B 或 BAAI/bge-m3）。默认由浏览器直连接口算向量、存进酒馆服务端，不进聊天文件；接口不允许浏览器直连时自动改走酒馆转发。</div>
             <label class="checkbox_label"><input type="checkbox" id="em_rc_vec"><span>启用向量召回</span></label>
             <label>地址<input id="em_rc_url" class="text_pole" placeholder="${VEC_DEFAULT_URL}"></label>
             <label>密钥<input id="em_rc_key" class="text_pole" type="password" placeholder="sk-…" autocomplete="off"></label>
@@ -2709,16 +3265,25 @@ C = 日常、闲聊、氛围、无后果的互动。
             </div>
             <label>模型名（手填 / 当前生效值）<input id="em_rc_model" class="text_pole" placeholder="${VEC_DEFAULT_MODEL}"></label>
             <div class="em-hint"><span id="em_rc_model_count"></span></div>
+            <label>通道
+                <select id="em_rc_route">
+                    <option value="auto">自动（先直连，被浏览器拦了就走酒馆转发）</option>
+                    <option value="direct">直连（浏览器直接请求接口，报错原文看得见）</option>
+                    <option value="tavern">经酒馆转发（密钥写进酒馆 vllm 槽位）</option>
+                </select>
+            </label>
             <div class="em-row">
                 <div class="menu_button" id="em_rc_test">测试向量连接</div>
                 <div class="menu_button" id="em_rc_fill">补向量（只补缺的）</div>
-                <div class="menu_button" id="em_rc_rebuild">重建向量（清空重灌）</div>
+                <div class="menu_button" id="em_rc_rebuild">重建向量</div>
             </div>
-            <label class="checkbox_label"><input type="checkbox" id="em_rc_raw"><span>原文细节（已总结楼层的正文切块入库，捞摘要没写进的小细节；正文会发给向量服务）</span></label>
+            <label class="checkbox_label"><input type="checkbox" id="em_rc_raw"><span>原文细节（从旧楼正文里捞摘要没写进的小细节；不开向量也能用，开了向量时已总结楼层的正文会切块发给向量服务）</span></label>
             <label class="checkbox_label"><input type="checkbox" id="em_rc_kw"><span>关键词召回（零网络、不需要配置，默认开）</span></label>
+            <label class="checkbox_label"><input type="checkbox" id="em_rc_rerank"><span>重排（向量开着时，再用重排模型给候选逐条打分、只留够格的；生成前多一次请求，默认关）</span></label>
+            <label>重排模型<input id="em_rc_rerank_model" class="text_pole" placeholder="${RERANK_DEFAULT_MODEL}"></label>
             <div class="em-row">
                 <label>topK <input id="em_rc_topk" class="text_pole em-short" type="number" min="1" max="30"></label>
-                <label>阈值 <input id="em_rc_thr" class="text_pole em-short" type="number" min="0" max="1" step="0.05" title="余弦相似度阈值，Qwen3-Embedding 建议 0.4 起调"></label>
+                <label>阈值 <input id="em_rc_thr" class="text_pole em-short" type="number" min="0" max="1" step="0.05" placeholder="自动" title="留空或 0 = 自动：每次查询按本聊天的样本现场估噪声线，没有明显相关的旧记忆就一条不捞。手填 0–1 的余弦值则固定用它"></label>
                 <label>召回预算(字) <input id="em_rc_chars" class="text_pole em-short" type="number" min="200" step="100"></label>
                 <label>原文预算(字) <input id="em_rc_raw_chars" class="text_pole em-short" type="number" min="200" step="100"></label>
                 <label>查询串上限(字) <input id="em_rc_query" class="text_pole em-short" type="number" min="100" step="100"></label>
@@ -2836,13 +3401,29 @@ C = 日常、闲聊、氛围、无后果的互动。
         bindNum('#em_keep', 'keepVisible', () => { $('#em_keep_q').val(settings.keepVisible); if (settings.hideSummarized) { hideSummarized(); applyInjection(); refreshStatus(); } });
 
         // 向量召回：地址 / 密钥 / 拉模型选择，与副 API 同一套交互
+        const routeLabel = () => {
+            const r = settings.recall.route || 'auto';
+            if (r === 'direct') return '直连';
+            if (r === 'tavern') return '经酒馆转发';
+            const memo = settings.recall.routeMemo;
+            if (!memo || memo.base !== vecBase()) return '自动（还没测过）';
+            return memo.route === 'direct' ? '自动 → 直连' : '自动 → 经酒馆转发（直连被浏览器拦了）';
+        };
         const rcHint = () => {
             const s = settings.recall;
             const data = getData();
-            const n = data ? Object.keys(data.vec.entries).length : 0, r = data ? Object.keys(data.vec.raw).length : 0;
+            const v = data?.vec;
+            const n = v ? Object.keys(v.entries).length : 0, r = v ? Object.keys(v.raw).length : 0;
+            const rej = v ? Object.values(v.rejected || {}) : [];
+            const thr = manualThreshold();
             $('#em_rc_hint').text(s.vector
-                ? `向量：${vecBase() || '（未填地址）'} · 模型 ${vecBody().model} · 密钥${String(s.key || '').trim() ? '已填（自动写入酒馆 vllm 槽位）' : '未填'} · 本聊天已入库 ${n} 条记忆 / ${r} 楼原文${data?.vec?.error ? ` · 上次错误：${data.vec.error}` : ''}`
-                : '向量召回未开启；关键词召回不需要任何配置。');
+                ? [`通道：${routeLabel()}`, `${vecBase() || '（未填地址）'} · 模型 ${vecModel()}${v?.dim ? `（${v.dim} 维）` : ''}`,
+                    `密钥${String(s.key || '').trim() ? (vecRoute() === 'tavern' ? '已填（经酒馆时自动写进酒馆 vllm 槽位）' : '已填') : '未填'}`,
+                    `阈值：${thr ? `固定 ${thr}` : '自动（每次按本聊天的样本现场估）'}`,
+                    `本聊天已入库 ${n} 条记忆 / ${r} 楼原文`,
+                    rej.length ? `${rej.length} 段被接口拒收、已跳过（${rej[0].why}）` : '',
+                    v?.error ? `上次错误：${v.error}` : '', rc.note ? `最近一次召回：${rc.note}` : ''].filter(Boolean).join(' · ')
+                : '向量召回未开启；关键词召回与原文细节不需要任何配置。');
         };
         const renderVecModelSelect = () => {
             const sel = $('#em_rc_model_sel');
@@ -2853,10 +3434,13 @@ C = 日常、闲聊、氛围、无后果的互动。
             $('#em_rc_model_count').text(list.length ? `已拉取 ${list.length} 个模型（像 embedding 的排在前面）` : '尚未拉取模型列表');
         };
         const bindRc = (id, key, kind) => $(id).each(function () {
-            if (kind === 'bool') $(this).prop('checked', !!settings.recall[key]); else $(this).val(settings.recall[key] ?? '');
+            if (kind === 'bool') $(this).prop('checked', !!settings.recall[key]);
+            else if (key === 'threshold') $(this).val(manualThreshold() || '');   // 0 = 自动，框里留空显示占位「自动」
+            else $(this).val(settings.recall[key] ?? '');
         }).on('change', function () {
-            settings.recall[key] = kind === 'bool' ? this.checked : kind === 'num' ? Number(this.value) : this.value.trim();
-            if (key === 'key') settings.recall.keyWritten = '';   // 换了密钥，下次调用重新写槽位
+            settings.recall[key] = kind === 'bool' ? this.checked : kind === 'num' ? (Number(this.value) || 0) : this.value.trim();
+            if (key === 'key') settings.recall.keyWritten = '';   // 换了密钥，经酒馆时重新写槽位
+            if (key === 'route') settings.recall.routeMemo = null;   // 换通道：自动模式下次重新判断
             saveSettings(); rc.key = ''; rc.result = null; rcHint(); applyInjection();
             if (key === 'model') renderVecModelSelect();
             if (key === 'vector' && this.checked) {
@@ -2867,6 +3451,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         bindRc('#em_rc_kw', 'keyword', 'bool'); bindRc('#em_rc_vec', 'vector', 'bool'); bindRc('#em_rc_url', 'apiUrl'); bindRc('#em_rc_key', 'key'); bindRc('#em_rc_model', 'model');
         bindRc('#em_rc_raw', 'raw', 'bool'); bindRc('#em_rc_topk', 'topK', 'num'); bindRc('#em_rc_thr', 'threshold', 'num');
         bindRc('#em_rc_chars', 'recallChars', 'num'); bindRc('#em_rc_raw_chars', 'rawChars', 'num'); bindRc('#em_rc_query', 'queryChars', 'num'); bindRc('#em_rc_timeout', 'timeoutSec', 'num');
+        bindRc('#em_rc_route', 'route'); bindRc('#em_rc_rerank', 'rerank', 'bool'); bindRc('#em_rc_rerank_model', 'rerankModel');
         $('#em_rc_model_sel').on('change', function () {
             if (!this.value) return;
             settings.recall.model = this.value; saveSettings();
@@ -2877,7 +3462,7 @@ C = 日常、闲聊、氛围、无后果的互动。
         const busyBtn = async (btn, text, fn) => {
             const el = $(btn); const old = el.text();
             el.addClass('disabled').text(text);
-            try { await fn(); } catch (err) { toast('error', `${old}失败：${err.message}`); const d = getData(); if (d) d.vec.error = err.message; }
+            try { await fn(); } catch (err) { toast('error', `${old}失败：${err.message}`); const d = getData(); if (d && err.vecKind !== 'stale') d.vec.error = err.message; }
             finally { el.removeClass('disabled').text(old); rcHint(); }
         };
         $('#em_rc_models').on('click', () => busyBtn('#em_rc_models', '拉取中…', async () => {
@@ -2889,22 +3474,23 @@ C = 日常、闲聊、氛围、无后果的互动。
         $('#em_rc_test').on('click', () => busyBtn('#em_rc_test', '测试中…', async () => {
             if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
             if (!String(settings.recall.model || '').trim()) toast('warning', `未选模型，将用默认 ${VEC_DEFAULT_MODEL}`);
-            const n = await vecTest();
-            toast('success', `向量接口可用（探针查询命中 ${n} 条）`);
+            const line = await vecTest();
+            toast('success', `向量接口可用：${line}`);
         }));
+        const syncToast = (verb, r) => `${verb} ${r.entries} 条记忆、${r.raw} 段原文${r.rejected ? `；${r.rejected} 段被接口拒收已跳过（设置页底部提示里有原因）` : ''}`;
         $('#em_rc_fill').on('click', () => busyBtn('#em_rc_fill', '补充中…', async () => {
             if (!settings.recall.vector) throw new Error('请先勾选「启用向量召回」');
             if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
             const data = getData(); if (!data) throw new Error('没有打开聊天');
             const r = await vecSync(data, (done, total) => $('#em_rc_fill').text(`补充中 ${done}/${total}`));
-            toast('success', `已补 ${r.entries} 条记忆、${r.raw} 段原文`);
+            toast('success', syncToast('已补', r));
         }));
         $('#em_rc_rebuild').on('click', () => busyBtn('#em_rc_rebuild', '重建中…', async () => {
             if (!settings.recall.vector) throw new Error('请先勾选「启用向量召回」');
             if (!vecConfigured()) throw new Error('请先填写 embeddings 地址与密钥');
-            if (!await confirmBox('清空本聊天的向量并全部重灌？条目多时要跑一会儿')) return;
+            if (!await confirmBox('重建本聊天的向量？会全部重算一遍，条目多时要跑一会儿。重建期间旧向量照常可用，全部成功才替换；中途失败旧库不受影响')) return;
             const r = await vecRebuild((done, total) => $('#em_rc_rebuild').text(`重建中 ${done}/${total}`));
-            toast('success', `已重建：${r.entries} 条记忆、${r.raw} 段原文`);
+            toast('success', syncToast('已重建：', r));
         }));
 
         $('#em_ball_on').prop('checked', settings.ball.enabled).on('change', function () { settings.ball.enabled = this.checked; saveSettings(); updateBallVisibility(); });
@@ -4009,7 +4595,12 @@ C = 日常、闲聊、氛围、无后果的互动。
             if (!await confirmBox(`清空当前聊天的全部记忆（${data.entries.length} 条、${data.people.length} 个人物、${data.items.length} 件物件、远景 ${data.outline.lines.length} 行）？不可恢复（建议先导出）。本插件隐藏的楼层会一并恢复显示`)) return;
             stopRun();   // 正在飞的调用返回后会发现库已换，结果作废
             unhideAll();
-            if (vecOn()) { for (const k of ['mem', 'raw']) vecCall('purge', { collectionId: vecCollection(k) }).catch(err => warn('清向量失败：', err.message)); }
+            if (vecOn()) {
+                const v = data.vec;
+                const cols = [...(v.fp ? [{ fp: v.fp, gen: v.gen || 0 }] : []), ...(v.stale || [])].flatMap(s => ['mem', 'raw'].map(k => vecCollection(k, s.gen, s.fp)));
+                if (!v.v) cols.push(...['mem', 'raw'].map(k => `erato-${k}-${chatTag()}`));   // 旧版集合名
+                for (const c of cols) vecCall('purge', { collectionId: c }).catch(err => warn('清向量失败：', err.message));
+            }
             getCtx().chatMetadata[META_KEY] = defaultData();
             rc.key = ''; rc.result = null;
             saveData(); applyInjection(); renderPanel(); refreshStatus();
@@ -4034,7 +4625,7 @@ C = 日常、闲聊、氛围、无后果的互动。
                     : 'replace';
                 if (mode === 'replace') {
                     for (const k of ['entries', 'windows', 'people', 'items', 'relation', 'principal', 'skip', 'archives', 'hidden', 'outline', 'canon', 'recaps', 'tombstones']) data[k] = src[k];
-                    data.vec = { entries: {}, raw: {}, source: '', model: '', at: 0 };   // 向量库是本地索引，导入后按需「补向量」
+                    data.vec = { ...defaultData().vec, v: data.vec?.v, fp: data.vec?.fp || '', gen: data.vec?.gen || 0, stale: data.vec?.stale || [] };   // 向量库是服务端索引：对账表清空，下次对账按集合实况补齐/删多余
                 } else {
                     const eIds = new Set(data.entries.map(e => e.id)), wIds = new Set(data.windows.map(w => w.id));
                     for (const w of src.windows) if (!wIds.has(w.id)) data.windows.push(w);
@@ -4099,12 +4690,12 @@ C = 日常、闲聊、氛围、无后果的互动。
         const vecSyncSoon = debounce(() => {
             const data = getData();
             if (!vecOn() || !data || !(data.entries.length || data.windows.length)) return;
-            vecSync(data).catch(err => { data.vec.error = err.message; warn('向量对账失败：', err.message); });
+            vecSync(data).then(() => vecWarm(data)).catch(err => { if (err.vecKind === 'stale') return; data.vec.error = err.message; warn('向量对账失败：', err.message); });
         }, 5000);
 
         es.on(ET.CHAT_CHANGED, () => {
             expanded.clear(); addingManual = false; stopRun(); run.failToasted = false; rc.vecToasted = false;
-            rc.key = ''; rc.result = null; rc.promise = null; rc.error = '';
+            rc.key = ''; rc.result = null; rc.promise = null; rc.error = ''; rc.note = '';
             gov.fails = 0; clearTimeout(gov.timer);
             setTimeout(() => { resync(); if (autoOn()) ingest('chat_changed'); vecSyncSoon(); }, 1500);
         });
@@ -4126,8 +4717,10 @@ C = 日常、闲聊、氛围、无后果的互动。
         visibleDepths, hideSummarized, unhideAll, addManualEntry, migrateV1, settings, run, weight, weightAt,
         rawLogText, rawAction, RAW_LOG_MAX, RAW_LOG_CHARS, RETRY_DELAYS, isTransient, callApiRetry, PLACEHOLDER_RX,
         govern, foldCanon, foldOutline, foldPeriods, dayKey, captureRecaps, fallbackLines, contextText,
-        keywordRecall, termsOf, recallQuery, prepareRecall, recallForPrompt, doRecall, rc,
-        vecSync, vecRebuild, vecTest, vecQuery, vecIndexEntries, vecIndexRaw, chunkText, vecBody, vecBase, vecCollection, vecConfigured, ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList,
+        keywordRecall, keywordScores, contentLen, termsOf, recallQuery, sceneText, mentionedEntities, prepareRecall, recallForPrompt, doRecall, rawDetail, recallLines, rc,
+        vecSync, vecRebuild, vecTest, vecQuery, vecSearch, vecCalib, calib, vecIndexEntries, vecIndexRaw, vecDeleteEntries, chunkText, vecBody, vecBase, directBase, vecCollection, vecConfigured, vecRoute, ensureRoute, vecFp, chatTag,
+        ensureVecSecret, writeVecSecret, fetchVecModels, fetchModelList, embedDirect, embedRetry, rerankDocs, readVectors, upstreamMsg, vecCall, vecEntryText, wellFormed, cut, median, cosine, noiseLine,
+        VEC_RETRY, ADMIT_Z, GATE_Z, VEC_BATCH,
         isTomb, addTomb, removeTomb, restoreTomb, rollbackValues, rollbackOnDelete, undoWindow, normDate, headerLines, hasEndMark, stripEndMark, stopRun, gov, lastInject: () => lastInject,
         prehistoryText, panelAction, VERSION, repairOrder, notEarlier, pushHist, fmtEntry, KNOWS_RULE, defaultHeader, knownOutside, pv, isThin, PERSON_FIELDS,
     };

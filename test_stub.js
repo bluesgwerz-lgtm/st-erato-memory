@@ -51,27 +51,66 @@ const END = '<END_OF_MEMORY/>';
 // mode.failQueue：按队列依次回 HTTP 错误 [{status,msg}]（测 429/5xx 退避重试与 401 直接失败），队列空了才正常回
 const apiLog = [];
 const foldLog = [];
-const vecStore = {};   // collectionId → Map(hash → { text, index })
+const vecStore = {};   // collectionId → Map(hash → { text, index, hash, vec })：假酒馆向量库（vectra 的行为：先按余弦取 topK，再按阈值滤）
 const vecLog = [];
 const secrets = [];
 const modelCalls = [];
 const mode = { fewEvents: false, finishLength: 0, clearDuring: false, noSentinel: 0, allowBig: false, skipFloors: 0, declare: false, slow: false, fenced: false, failQueue: [] };
+// ---- 假 embeddings / 重排（直连通道）----
+// 假向量：64 维字符桶 + 相邻二字桶，归一化；同字越多越像。含「【拒收】」的文本回 400/20015（模拟接口拒收个别内容）；
+// 输入里有落单的代理项（半个 emoji）同样回 400/20015（与硅基实测一致：一批里一条坏的整批拒）；
+// vecMode.cors = true 时 fetch 直接抛 TypeError（模拟浏览器跨域拦截）；vecMode.failQueue 依次回 HTTP 错误；vecMode.badModel 模型名被拒（配置错）；
+// vecMode.onEmbed 每次 embeddings 请求前回调（测切聊天作废）
+const vecMode = { cors: false, failQueue: [], badModel: '', onEmbed: null, rerankFail: false, embedLog: [], rerankLog: [] };
+const LONE_RX = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+function fakeVec(text) {
+    const v = new Array(64).fill(0);
+    const s = String(text);
+    for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); v[c % 61] += 1; if (i + 1 < s.length) v[(c * 31 + s.charCodeAt(i + 1)) % 64] += 0.5; }
+    const n = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1;
+    return v.map(x => x / n);
+}
+const cosv = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 global.fetch = async (url, opt) => {
     const body = JSON.parse(opt.body);
+    if (/^https?:\/\//.test(url) && /\/embeddings$/.test(url)) {
+        if (vecMode.cors) throw new TypeError('Failed to fetch');
+        vecMode.embedLog.push({ url, n: body.input.length, input: body.input, model: body.model, auth: opt.headers?.Authorization });
+        if (vecMode.onEmbed) await vecMode.onEmbed(body);
+        if (vecMode.failQueue.length) { const f = vecMode.failQueue.shift(); return { ok: false, status: f.status, text: async () => JSON.stringify({ code: f.code ?? 50000, message: f.msg, data: null }) }; }
+        if (vecMode.badModel && body.model === vecMode.badModel) return { ok: false, status: 400, text: async () => JSON.stringify({ code: 20012, message: 'Model does not exist.', data: null }) };
+        if (body.input.some(t => LONE_RX.test(t) || t.includes('【拒收】'))) return { ok: false, status: 400, text: async () => JSON.stringify({ code: 20015, message: 'The parameter is invalid. Please check again.', data: null }) };
+        return { ok: true, status: 200, text: async () => JSON.stringify({ data: body.input.map((t, index) => ({ index, embedding: fakeVec(t) })), usage: {} }) };
+    }
+    if (/^https?:\/\//.test(url) && /\/rerank$/.test(url)) {
+        if (vecMode.cors) throw new TypeError('Failed to fetch');
+        vecMode.rerankLog.push({ query: body.query, n: body.documents.length });
+        if (vecMode.rerankFail) return { ok: false, status: 503, text: async () => JSON.stringify({ message: 'busy' }) };
+        const qv = fakeVec(body.query);
+        return { ok: true, status: 200, text: async () => JSON.stringify({ results: body.documents.map((d, index) => ({ index, relevance_score: Math.max(0, cosv(qv, fakeVec(d))) ** 6 })) }) };
+    }
     if (url.startsWith('/api/vector/')) {
         const route = url.slice('/api/vector/'.length);
-        vecLog.push({ route, collection: body.collectionId, n: body.items?.length || body.hashes?.length || 0, source: body.source, endpoint: body.siliconflow_endpoint, model: body.model });
+        vecLog.push({ route, collection: body.collectionId, n: body.items?.length || body.hashes?.length || 0, source: body.source, model: body.model, threshold: body.threshold, topK: body.topK, hashes: body.items?.map(x => x.hash) || body.hashes || [], hasEmb: !!body.embeddings });
+        // webllm 源：向量随请求带来，缺了就 500（与酒馆一致：拿不到向量会抛错）；vllm 源：「酒馆后端」自己算，坏文本同样 500
+        const vecOf = text => body.source === 'webllm' ? body.embeddings?.[text] : (LONE_RX.test(text) || text.includes('【拒收】') ? undefined : fakeVec(text));
+        const fail = () => ({ ok: false, status: 500, text: async () => 'Internal Server Error' });
+        if (route === 'purge') { delete vecStore[body.collectionId]; return { ok: true, status: 200, text: async () => 'OK' }; }
         const col = (vecStore[body.collectionId] ||= new Map());
         let out = 'OK';
-        if (route === 'insert') for (const it of body.items) col.set(Number(it.hash), { text: it.text, index: it.index, hash: it.hash });
+        if (route === 'insert') {
+            const vs = body.items.map(it => vecOf(it.text));
+            if (vs.some(v => !Array.isArray(v))) return fail();
+            body.items.forEach((it, k) => col.set(Number(it.hash), { text: it.text, index: it.index, hash: it.hash, vec: vs[k] }));
+        }
         else if (route === 'list') out = JSON.stringify([...col.keys()]);
         else if (route === 'delete') for (const h of body.hashes) col.delete(Number(h));
-        else if (route === 'purge') delete vecStore[body.collectionId];
         else if (route === 'query') {
-            const q = String(body.searchText);
-            const hits = [...col.values()].filter(v => [...q].some(ch => /[㐀-鿿]/.test(ch) && v.text.includes(ch) && q.includes(ch) && ['钥', '匙', '刘'].includes(ch))).slice(0, body.topK);
-            out = JSON.stringify({ metadata: hits.map(v => ({ hash: v.hash, text: v.text, index: v.index })), hashes: hits.map(v => v.hash) });
+            const qv = vecOf(String(body.searchText));
+            if (!Array.isArray(qv)) return fail();
+            const hits = [...col.values()].map(v => ({ v, s: cosv(qv, v.vec) })).sort((a, b) => b.s - a.s).slice(0, body.topK).filter(x => x.s >= (Number(body.threshold) || 0));
+            out = JSON.stringify({ metadata: hits.map(({ v }) => ({ hash: v.hash, text: v.text, index: v.index })), hashes: hits.map(({ v }) => v.hash) });
         }
         return { ok: true, status: 200, text: async () => out };
     }
@@ -763,54 +802,306 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         assert.strictEqual(D.rc.key, key, '同一查询串不重算');
         D.settings.maxInjectChars = 9000;
     });
-    await ta('向量：地址+密钥+拉模型选择（与副 API 同法）；密钥自动写进酒馆 vllm 槽位且只写一次；窗口入库后同步条目与原文 chunk；对账补缺；查询命中；重建 purge 后重灌', async () => {
-        D.settings.recall.vector = true; D.settings.recall.apiUrl = 'https://api.siliconflow.cn/v1/'; D.settings.recall.key = 'sk-vec'; D.settings.recall.model = '';
+    // ---- 向量与召回（v0.4.25 重做）----
+    D.VEC_RETRY.splice(0, D.VEC_RETRY.length, 5, 5);   // 桩环境把 1.5s/4s 退避缩成 5ms
+    const vecSetup = (over = {}) => Object.assign(D.settings.recall, { vector: true, apiUrl: 'https://api.siliconflow.cn/v1/', key: 'sk-vec', model: 'BAAI/bge-m3', route: 'auto', routeMemo: null, threshold: 0, rerank: false, raw: true, keyword: true }, over);
+    const vecTeardown = () => {
+        Object.assign(D.settings.recall, { vector: false, rerank: false, route: 'auto', routeMemo: null, threshold: 0 });
+        Object.assign(vecMode, { cors: false, failQueue: [], badModel: '', onEmbed: null, rerankFail: false });
+        D.rc.key = ''; D.rc.result = null;
+    };
+    const memCol = () => D.vecCollection('mem');
+    const bumpEntry = (idx, add) => { const e = data.entries.find(x => x.src.idx === idx); e.summary += add; e.updated_at = Date.now(); return e; };
+    t('文本安全：落单代理项与控制字符去掉、成对 emoji 与换行保留；截字不切开 emoji；切块边界与条目入库文本都不会出现半个 emoji', () => {
+        assert.strictEqual(D.wellFormed('a\uD83Db\uDF38c🌸\n\t\u0000\u0007d'), 'abc🌸\n\td');
+        assert.strictEqual(D.cut('一二🌸', 3), '一二', '第 3 个单元是 emoji 的前半，整个退掉');
+        assert.strictEqual(D.cut('一二🌸', 4), '一二🌸');
+        const chunks = D.chunkText('她笑了🌸然后转身。'.repeat(200));
+        assert.ok(chunks.length >= 3 && chunks.every(c => !LONE_RX.test(c)), '切块边界不能有半个 emoji');
+        const e = { id: 'x', story_time: '', title: 't', summary: '字'.repeat(296) + '🌸🌸🌸', characters: [] };
+        assert.ok(!LONE_RX.test(D.vecEntryText(e)) && D.vecEntryText(e).length <= 300, D.vecEntryText(e).slice(-4));
+    });
+    await ta('副 API 请求发出前同样修掉半个 emoji（截字切开 emoji 的提示词不会被上游 400）', async () => {
+        const n0 = apiLog.length;
+        await D.callApiRetry([{ role: 'system', content: 's' }, { role: 'user', content: '材料【#1】坏\uD83D字' }]).catch(() => {});
+        assert.ok(apiLog.length > n0 && !LONE_RX.test(apiLog[apiLog.length - 1].user), JSON.stringify(apiLog[apiLog.length - 1].user));
+    });
+    await ta('拉模型列表照旧走酒馆后端；直连同步：浏览器自己算向量交给酒馆 webllm 源存，不写酒馆密钥槽；集合名带指纹；旧版集合一次性清掉；对账表与维度落地；二次对账零插入', async () => {
+        vecSetup();
         assert.ok(D.vecConfigured());
         const ids = await D.fetchVecModels();
         assert.deepStrictEqual(ids.slice(0, 2), ['BAAI/bge-m3', 'Qwen/Qwen3-Embedding-0.6B'], '像 embedding 的排前面：' + ids.join(','));
-        assert.deepStrictEqual(D.settings.recall.models, ids);
         assert.strictEqual(modelCalls[modelCalls.length - 1].base, 'https://api.siliconflow.cn/v1', '拉模型带 /v1');
-        D.settings.recall.model = 'Qwen/Qwen3-Embedding-0.6B';
-        assert.deepStrictEqual(D.vecBody(), { source: 'vllm', apiUrl: 'https://api.siliconflow.cn', model: 'Qwen/Qwen3-Embedding-0.6B' }, '向量调用去掉 /v1，后端自己拼');
-        const s0 = secrets.length;
+        assert.strictEqual(D.directBase(), 'https://api.siliconflow.cn/v1');
+        const tag = D.chatTag();
+        vecStore[`erato-mem-${tag}`] = new Map([[1, { text: 'old', index: 0, hash: 1, vec: fakeVec('old') }]]);   // v0.4.24 的旧版集合
+        delete data.vec.v;
+        const s0 = secrets.length, e0 = vecMode.embedLog.length, l0 = vecLog.length;
         const r = await D.vecSync(data);
-        assert.ok(r.entries >= 10 && r.raw >= 10, '首次补向量：' + JSON.stringify(r));
-        assert.strictEqual(secrets.length, s0 + 1, '密钥只写一次'); assert.strictEqual(secrets[s0].key, 'api_key_vllm'); assert.strictEqual(secrets[s0].value, 'sk-vec');
-        assert.ok(vecLog.some(l => l.route === 'insert' && l.collection.startsWith('erato-mem-') && l.source === 'vllm' && l.model === 'Qwen/Qwen3-Embedding-0.6B'));
-        assert.ok(vecLog.some(l => l.route === 'insert' && l.collection.startsWith('erato-raw-')));
+        assert.ok(r.entries >= 10 && r.raw >= 10 && r.rejected === 0, JSON.stringify(r));
+        assert.strictEqual(D.vecRoute(), 'direct'); assert.strictEqual(D.settings.recall.routeMemo.route, 'direct');
+        assert.strictEqual(secrets.length, s0, '直连不写酒馆密钥槽');
+        assert.ok(vecMode.embedLog.slice(e0).every(x => x.url === 'https://api.siliconflow.cn/v1/embeddings' && x.auth === 'Bearer sk-vec' && x.model === 'BAAI/bge-m3' && x.n <= D.VEC_BATCH));
+        const ins = vecLog.slice(l0).filter(x => x.route === 'insert');
+        assert.ok(ins.length && ins.every(x => x.source === 'webllm' && x.hasEmb && x.model === 'BAAI/bge-m3'), JSON.stringify(ins[0]));
+        assert.strictEqual(memCol(), `erato-mem-${tag}-${data.vec.fp}`);
+        assert.ok(!vecStore[`erato-mem-${tag}`], '旧版集合清掉');
+        assert.strictEqual(data.vec.v, 2); assert.strictEqual(data.vec.dim, 64);
         assert.strictEqual(Object.keys(data.vec.entries).length, data.entries.filter(e => e.status === 'ok').length);
+        assert.strictEqual(vecStore[memCol()].size, Object.keys(data.vec.entries).length);
         const r2 = await D.vecSync(data);
-        assert.strictEqual(r2.entries, 0, '第二次对账无需补');
-        assert.strictEqual(secrets.length, s0 + 1, '同一把密钥不重复写');
-        const q = await D.vecQuery(data, '7号钥匙', 8);
-        assert.ok(q.ids.length >= 1 && q.raw.length >= 1, '向量查询：' + JSON.stringify(q));
-        assert.ok(q.raw.some(x => x.index === 7 && x.text.includes('7号钥匙藏进了抽屉')), '原文 chunk 命中 7 楼');
-        D.rc.key = ''; D.rc.result = null;
-        D.settings.maxInjectChars = 700;
-        await D.recallForPrompt();
-        assert.strictEqual(D.rc.result.mode, '关键词+向量');
-        const b = D.buildBlock();
-        assert.ok(b.text.includes('## 原文细节') && b.text.includes('#7：') && b.text.includes('藏进了抽屉'), '原文细节：' + b.text);
-        assert.ok(b.raw >= 1);
-        // 条目删除同步删向量；新窗口入库后自动灌
-        const e = data.entries.find(x => x.src.idx === 7);
-        await D.vecIndexEntries(data, [e]);
-        const n0 = vecLog.length;
+        assert.deepStrictEqual([r2.entries, r2.raw], [0, 0], '二次对账无需补');
+    });
+    await ta('新窗口入库后自动同步向量（后台跑，不阻塞总结）', async () => {
+        const l0 = vecLog.length;
         chat.push(mkMsg(42, false), mkMsg(43, true), mkMsg(44, false));
         await D.ingest('manual');
-        await sleep(20);
-        assert.ok(vecLog.slice(n0).some(l => l.route === 'insert'), '入库后应同步向量');
-        const rr = await D.vecRebuild();
-        assert.ok(vecLog.some(l => l.route === 'purge') && rr.entries >= 10);
-        // 换密钥 → 下次调用重新写槽位
-        D.settings.recall.key = 'sk-new'; D.settings.recall.keyWritten = '';
-        await D.vecCall?.('list', { collectionId: D.vecCollection('mem') }).catch(() => {});
+        await sleep(30);
+        assert.ok(vecLog.slice(l0).some(l => l.route === 'insert' && l.collection === memCol()), '入库后应同步向量');
+        assert.strictEqual(Object.keys(data.vec.entries).length, data.entries.filter(e => e.status === 'ok').length);
+    });
+    await ta('拆批与拒收名单：一条被接口拒收（400/20015）只跳过它，同批其他照常入库；名单里内容没变不再重试，改了自动重试；半个 emoji 发出前就修掉、不会被拒', async () => {
+        const bad = bumpEntry(9, '【拒收】');
+        const half = bumpEntry(11, '\uD83D');
+        const e0 = vecMode.embedLog.length;
+        const r = await D.vecSync(data);
+        const rej = Object.values(data.vec.rejected);
+        assert.strictEqual(rej.length, 1, JSON.stringify(data.vec.rejected));
+        assert.ok(/20015/.test(rej[0].why) && rej[0].ref === bad.id, rej[0].why);
+        assert.strictEqual(r.rejected, 1);
+        assert.ok(!data.vec.entries[bad.id], '被拒的不进对账表');
+        assert.ok(data.vec.entries[half.id], '半个 emoji 修掉后照常入库');
+        assert.ok(vecMode.embedLog.slice(e0).some(x => x.n === 1 && x.input[0].includes('【拒收】')), '应拆到单条：' + vecMode.embedLog.slice(e0).map(x => x.n).join(','));
+        const e1 = vecMode.embedLog.length;
         await D.vecSync(data);
-        assert.strictEqual(secrets[secrets.length - 1].value, 'sk-new');
-        D.settings.recall.apiUrl = 'https://emb.example.com/v1/'; D.settings.recall.model = 'bge-m3';
-        assert.deepStrictEqual(D.vecBody(), { source: 'vllm', apiUrl: 'https://emb.example.com', model: 'bge-m3' });
-        D.settings.recall.vector = false; D.settings.maxInjectChars = 9000;
-        D.rc.key = ''; D.rc.result = null;
+        assert.ok(!vecMode.embedLog.slice(e1).some(x => x.input.some(s => s.includes('【拒收】'))), '内容没变不再重试');
+        bad.summary = bad.summary.replace('【拒收】', ''); bad.updated_at = Date.now();
+        await D.vecSync(data);
+        assert.ok(data.vec.entries[bad.id] && !Object.keys(data.vec.rejected).length, '内容改了重试成功、出名单');
+    });
+    await ta('配置错：模型名被拒时连探针也过不了 → 整次中止报「检查模型名」，不把每一条都记成拒收；旧模型的集合不动，换回来不用重算', async () => {
+        const oldCol = memCol(), n = vecStore[oldCol].size;
+        D.settings.recall.model = 'bad-model'; vecMode.badModel = 'bad-model';
+        await assert.rejects(D.vecSync(data), err => /短词都拒收/.test(err.message) && /Model does not exist/.test(err.message));
+        assert.strictEqual(Object.keys(data.vec.rejected).length, 0);
+        assert.strictEqual(vecStore[oldCol]?.size, n, '旧集合原样');
+        D.settings.recall.model = 'BAAI/bge-m3'; vecMode.badModel = '';
+        const r = await D.vecSync(data);
+        assert.strictEqual(r.entries + r.raw, 0, '换回原模型：集合还在，不用重算：' + JSON.stringify(r));
+        assert.strictEqual(memCol(), oldCol); assert.strictEqual(Object.keys(data.vec.entries).length, n);
+        assert.strictEqual(data.vec.stale.length, 0, '错模型的空集合同步成功后清掉');
+    });
+    await ta('429 退避：一次限流后重试成功，不当成坏文本', async () => {
+        bumpEntry(13, '（补）');
+        vecMode.failQueue = [{ status: 429, msg: 'rate limit' }];
+        const r = await D.vecSync(data);
+        assert.strictEqual(r.entries, 1); assert.strictEqual(Object.keys(data.vec.rejected).length, 0);
+    });
+    await ta('改条目：先插新版本、再删旧版本（中途失败也不会出现「这条在库里消失」）', async () => {
+        const e = data.entries.find(x => x.src.idx === 15);
+        const oldH = data.vec.entries[e.id];
+        bumpEntry(15, '（改）');
+        const l0 = vecLog.length;
+        await D.vecIndexEntries(data, [e]);
+        const log = vecLog.slice(l0).filter(x => x.collection === memCol());
+        const iIns = log.findIndex(x => x.route === 'insert'), iDel = log.findIndex(x => x.route === 'delete' && x.hashes.includes(oldH));
+        assert.ok(iIns >= 0 && iDel > iIns, JSON.stringify(log.map(x => x.route)));
+        assert.notStrictEqual(data.vec.entries[e.id], oldH);
+    });
+    await ta('同步互斥：同时触发三次对账，同一条只插一次', async () => {
+        bumpEntry(17, '（并发）');
+        const l0 = vecLog.length;
+        await Promise.all([D.vecSync(data), D.vecSync(data), D.vecIndexEntries(data)]);
+        const ins = vecLog.slice(l0).filter(x => x.route === 'insert' && x.collection === memCol()).flatMap(x => x.hashes);
+        assert.strictEqual(ins.length, 1, '只插一次：' + ins.join(','));
+    });
+    await ta('切聊天作废：同步途中换了聊天，后面的批次不写进任何集合，对账表不动', async () => {
+        bumpEntry(19, '（切）');
+        const before = JSON.stringify(data.vec.entries);
+        vecMode.onEmbed = () => { ctx.chatId = 'chat-other'; };
+        const l0 = vecLog.length;
+        await assert.rejects(D.vecSync(data), err => err.vecKind === 'stale');
+        vecMode.onEmbed = null; ctx.chatId = 'chat1';
+        assert.ok(!vecLog.slice(l0).some(x => x.route === 'insert'), '作废后不该再插');
+        assert.strictEqual(JSON.stringify(data.vec.entries), before);
+        await D.vecSync(data);
+    });
+    await ta('重建写进下一世代：中途失败旧库与对账表原样可用、新世代半截清掉；成功才切换并删旧世代', async () => {
+        const gen0 = data.vec.gen || 0, col0 = memCol(), n0 = vecStore[col0].size, map0 = JSON.stringify(data.vec.entries);
+        let calls = 0;
+        vecMode.onEmbed = () => { if (++calls === 2) vecMode.failQueue = [{ status: 401, msg: 'Invalid token' }]; };
+        await assert.rejects(D.vecRebuild(), /401|Invalid token/);
+        vecMode.onEmbed = null; vecMode.failQueue = [];
+        await sleep(5);
+        assert.strictEqual(data.vec.gen || 0, gen0); assert.strictEqual(memCol(), col0);
+        assert.strictEqual(vecStore[col0].size, n0, '旧库原样'); assert.strictEqual(JSON.stringify(data.vec.entries), map0);
+        assert.ok(!vecStore[D.vecCollection('mem', gen0 + 1)]?.size, '新世代半截清掉');
+        const r = await D.vecRebuild();
+        assert.strictEqual(data.vec.gen, gen0 + 1);
+        assert.ok(memCol().endsWith(`g${gen0 + 1}`));
+        assert.ok(r.entries >= 10 && vecStore[memCol()].size === Object.keys(data.vec.entries).length, JSON.stringify(r));
+        assert.ok(!vecStore[col0], '旧世代删掉');
+    });
+    t('噪声线：中位数 + 2 / 3.3 个离散度（1.4826×MAD）；样本完全一样时离散度有下限', () => {
+        // 形状取自 331 楼真实聊天 bge-m3 实测：样本相似度中位 ≈0.68、MAD ≈0.02–0.04
+        const flat = [0.62, 0.64, 0.65, 0.66, 0.67, 0.67, 0.68, 0.68, 0.68, 0.69, 0.69, 0.70, 0.70, 0.71, 0.72, 0.72, 0.73, 0.74, 0.66, 0.67, 0.69, 0.70, 0.65, 0.71];
+        const line = D.noiseLine(flat);
+        assert.ok(Math.abs(line.m - 0.685) < 1e-9 && Math.abs(line.sd - 1.4826 * 0.02) < 1e-9, JSON.stringify(line));
+        assert.strictEqual(D.ADMIT_Z, 2); assert.strictEqual(D.GATE_Z, 3.3);
+        assert.ok(Math.abs(line.admit - (0.685 + 2 * 1.4826 * 0.02)) < 1e-9 && Math.abs(line.gate - (0.685 + 3.3 * 1.4826 * 0.02)) < 1e-9);
+        const same = D.noiseLine(new Array(24).fill(0.5));
+        assert.ok(same.sd === 0.005 && same.gate > same.admit);
+    });
+    await ta('自校准检索：先按准入线查、有结果再按闸门线查强命中；一条强命中都没有就一条不捞；手填阈值则固定用它、过线全算强', async () => {
+        const okN = data.entries.filter(e => e.status === 'ok').length;
+        const noise = Array.from({ length: 24 }, (_, k) => `今天的天气${k}很好，股票涨了${k}点，晚饭吃了面条。`);
+        const arm = () => { D.calib.key = `chat1|${D.vecFp()}|${Math.floor(okN / 20)}`; D.calib.mem = { vecs: noise.map(fakeVec), n: 24 }; };
+        arm();
+        const l0 = vecLog.length;
+        const hit = await D.vecSearch('mem', '那把7号钥匙后来藏到哪了', 8, data);
+        const qs = vecLog.slice(l0).filter(x => x.route === 'query');
+        assert.ok(qs.length === 2 && qs[1].threshold > qs[0].threshold, JSON.stringify(qs.map(q => [q.threshold, q.topK])));
+        assert.ok(hit.hits.length >= 1 && hit.strong.size >= 1 && /准入线/.test(hit.note), JSON.stringify({ n: hit.hits.length, s: [...hit.strong], note: hit.note }));
+        arm();
+        const miss = await D.vecSearch('mem', '今天的天气不错，股票又涨了，晚饭想吃面条。', 8, data);
+        assert.strictEqual(miss.hits.length, 0, JSON.stringify(miss));
+        assert.ok(/噪声线|闸门/.test(miss.note), miss.note);
+        D.settings.recall.threshold = 0.3;
+        const l1 = vecLog.length;
+        const fx = await D.vecSearch('mem', '7号钥匙', 8, data);
+        const q1 = vecLog.slice(l1).filter(x => x.route === 'query');
+        assert.ok(q1.length === 1 && q1[0].threshold === 0.3 && /固定阈值 0.3/.test(fx.note) && fx.strong.size === fx.hits.length, JSON.stringify(q1));
+        D.settings.recall.threshold = 0;
+        D.calib.key = '';
+    });
+    await ta('测试向量连接：直连 → 维度；酒馆存储插入/查询/清理一条探针；开了重排再测重排', async () => {
+        D.settings.recall.rerank = true;
+        const line = await D.vecTest();
+        assert.ok(/直连 ✓（64 维/.test(line) && /酒馆存储 ✓/.test(line) && /重排 ✓/.test(line), line);
+        assert.ok(!Object.keys(vecStore).some(k => k.startsWith('erato-probe-')), '探针集合清掉');
+        D.settings.recall.rerank = false;
+    });
+    await ta('直连被浏览器拦（跨域）→ 自动改走经酒馆：按地址记住，密钥写进 vllm 槽位，通道不同指纹不同、新集合重灌，检索用固定阈值；放开后点测试回到直连', async () => {
+        D.settings.recall.routeMemo = null; vecMode.cors = true;
+        const s0 = secrets.length, l0 = vecLog.length;
+        const r = await D.vecSync(data);
+        assert.strictEqual(D.vecRoute(), 'tavern');
+        assert.deepStrictEqual([D.settings.recall.routeMemo.base, D.settings.recall.routeMemo.route], ['https://api.siliconflow.cn/v1', 'tavern']);
+        assert.strictEqual(secrets.length, s0 + 1); assert.strictEqual(secrets[s0].key, 'api_key_vllm'); assert.strictEqual(secrets[s0].value, 'sk-vec');
+        assert.ok(vecLog.slice(l0).filter(x => x.route === 'insert').every(x => x.source === 'vllm' && !x.hasEmb));
+        assert.ok(r.entries >= 10, '指纹变了 → 新集合重灌：' + JSON.stringify(r));
+        assert.deepStrictEqual(D.vecBody(), { source: 'vllm', apiUrl: 'https://api.siliconflow.cn', model: 'BAAI/bge-m3' });
+        const q = await D.vecQuery(data, '7号钥匙', 8);
+        assert.ok(/经酒馆·固定阈值 0.5/.test(q.notes[0]) && q.ids.length >= 1, JSON.stringify(q));
+        vecMode.cors = false;
+        const line = await D.vecTest();
+        assert.ok(/直连 ✓/.test(line) && D.vecRoute() === 'direct', line);
+        await D.vecSync(data);
+    });
+
+    console.log('== 召回（v0.4.25）：意图 / 先剔后排 / 实体 / 原文细节 / 重排 ==');
+    t('回调意图：剥 <Request…>（含没闭合的）、（OOC）、【注…】，不再拼上一楼 recap', () => {
+        assert.strictEqual(D.recallQuery([{ is_user: true, mes: '<Request: 请承接当前剧情，继续推进性爱剧情>那把钥匙呢（OOC：快点）【注：别写太长】' }]), '那把钥匙呢');
+        assert.strictEqual(D.recallQuery([{ is_user: true, mes: '她把门锁上了 <Request: 请承接当前剧情，逐步继续' }]), '她把门锁上了');
+        assert.strictEqual(D.recallQuery([{ is_user: true, mes: '继续推进剧情' }, { is_user: false, mes: '<recap>**3月1日**\n长长的叙述</recap>' }]), '继续推进剧情');
+    });
+    t('关键词强弱：线头词、少见长词、落在标题/标签里的词算强；含虚字代词的短语（抱紧他、的时候）再少见也不算——归一分第一名不等于强', () => {
+        const filler = Array.from({ length: 10 }, (_, k) => ({ id: 'f' + k, title: '日常', text: `第${k}天在厨房做饭，聊了一会儿天` }));
+        const docs = [
+            { id: 'a', title: '疤痕的意义', text: '他抚摸她肩上的疤痕' },
+            { id: 'b', title: '晨间', text: '她抱紧他，把脸埋进他怀里，那时候雨很大' },
+            { id: 'c', title: '旧物', text: '她找出自己做的月光石银链' },
+            ...filler,
+        ];
+        const tf = d => D.termsOf(`${d.title} ${d.text}`, 600), hf = d => d.title;
+        const k1 = D.keywordScores(D.termsOf('抱紧他的时候'), docs, tf, hf);
+        assert.ok(k1.length && k1[0].doc.id === 'b' && k1[0].score === 1 && !k1[0].strong, '动作短语：第一名但不强：' + JSON.stringify(k1.map(h => [h.doc.id, h.score, h.strong])));
+        const k2 = D.keywordScores(D.termsOf('那条月光石银链呢'), docs, tf, hf);
+        assert.ok(k2[0].doc.id === 'c' && k2[0].strong && k2[0].rare, '线头词');
+        const k3 = D.keywordScores(D.termsOf('这道疤痕'), docs, tf, hf);
+        assert.ok(k3.length && k3[0].doc.id === 'a' && k3[0].strong, '标题里的两字词，只撞这一个也算强：' + JSON.stringify(k3.map(h => [h.doc.id, h.strong])));
+    });
+    t('实词太少不走向量：「嗯」「好」「继续」按实词计不到 4 个；「继续推进剧情」「今天好累啊」够数（交给闸门）', () => {
+        assert.deepStrictEqual(['嗯', '好', '继续', '继续推进剧情', '今天好累啊', 'Elena 是谁'].map(D.contentLen), [1, 1, 2, 6, 4, 4]);
+    });
+    const recallOnce = async (intent, scene = '') => D.doRecall(data, { intent, scene }, 'k');
+    await ta('先剔后排：话题最像的条目已经在往事里时，名额留给没进注入块的那条（旧版排完再剔，topK=1 时会一条不剩）', async () => {
+        vecTeardown();
+        D.settings.maxInjectChars = 300; D.settings.recall.topK = 1;
+        const b = D.buildBlock({ dry: true, skipRecall: true });
+        const inBlock = data.entries.find(e => e.status === 'ok' && b.rendered.has(e.id) && e.grade !== 'S');
+        const dropped = data.entries.find(e => b.droppedIds.includes(e.id));
+        const s1 = inBlock?.summary, s2 = dropped?.summary;
+        try {
+            assert.ok(inBlock && dropped, '需要一条在块里、一条被裁掉的');
+            inBlock.summary += '金色钥匙扣、金色钥匙扣'; dropped.summary += '金色钥匙扣'; inBlock.updated_at = dropped.updated_at = Date.now();
+            const res = await recallOnce('那个金色钥匙扣呢');
+            assert.deepStrictEqual(res.entries.map(x => x.id), [dropped.id], JSON.stringify(res.entries));
+        } finally {
+            if (inBlock) { inBlock.summary = s1; inBlock.updated_at = Date.now(); }
+            if (dropped) { dropped.summary = s2; dropped.updated_at = Date.now(); }
+            D.settings.maxInjectChars = 9000; D.settings.recall.topK = 8;
+        }
+    });
+    await ta('实体：别称换成正式名（「阿晚」→ 林晚）去对条目的人物栏；名字带间隔号的按段认；最近一楼正文里点到的配角只算「场景」证据、自己放不进条目；太常见的不算线索', async () => {
+        D.settings.maxInjectChars = 300;
+        const b = D.buildBlock({ dry: true, skipRecall: true });
+        const target = data.entries.find(e => b.droppedIds.includes(e.id));
+        const saved = (target?.characters || []).slice();
+        try {
+            assert.ok(target, '需要一条被裁掉的条目');
+            target.characters = [...saved, '林晚']; target.updated_at = Date.now();
+            data.people.push({ id: 'p_lw', name: '林晚', aliases: ['阿晚'], tier: '配', f: {}, views: {}, state: '' });
+            const byAlias = await recallOnce('阿晚最近怎么样了');
+            assert.ok(byAlias.entries.some(x => x.id === target.id && x.via.includes('ent')), JSON.stringify(byAlias.entries));
+            data.people.find(p => p.id === 'p_lw').name = '林晚·周';
+            const bySeg = await recallOnce('林晚最近怎么样了');
+            assert.ok(bySeg.entries.some(x => x.id === target.id), '间隔号名字按段认：' + JSON.stringify(bySeg.entries));
+            data.people.find(p => p.id === 'p_lw').name = '林晚';
+            const byScene = await recallOnce('', '林晚推门进来，手里提着一袋橘子。');
+            assert.ok(!byScene.entries.length, '场景线索只能作证：' + JSON.stringify(byScene.entries));
+            const common = await recallOnce('', '陆衍在厨房里。');
+            assert.ok(!common.entries.length, '陆衍出现在几乎每条里，不算场景线索：' + JSON.stringify(common.entries));
+        } finally {
+            if (target) { target.characters = saved; target.updated_at = Date.now(); }
+            data.people = data.people.filter(p => p.id !== 'p_lw');
+            D.settings.maxInjectChars = 9000;
+        }
+    });
+    await ta('原文细节不开向量也有：条目还在往事里、但摘要没写的细节（抽屉），从已隐藏楼层的正文里就地切块捞出来，进 ## 原文细节', async () => {
+        vecTeardown();
+        const res = await recallOnce('那把7号钥匙最后藏进抽屉了吗');
+        assert.ok(res.raw.some(r => r.index === 7 && r.text.includes('抽屉')), JSON.stringify(res.raw));
+        assert.strictEqual(res.mode, '关键词');
+        const none = await recallOnce('抽屉里有什么');
+        assert.ok(!none.raw.length, '条目层没有目标（没有条目提到抽屉）就不捞原文，原文库不自己找目标：' + JSON.stringify(none.raw));
+        D.rc.result = res; D.rc.key = 'manual';
+        const blk = D.buildBlock({ dry: true });
+        assert.ok(blk.text.includes('## 原文细节') && blk.text.includes('#7：') && blk.text.includes('抽屉'), blk.text.slice(-300));
+        D.rc.result = null; D.rc.key = '';
+    });
+    await ta('向量召回整合：直连 + 自校准 + 原文向量；开重排时按重排分取舍、标「重排」，重排失败退回原排序标「重排失败」', async () => {
+        vecSetup({ routeMemo: { base: 'https://api.siliconflow.cn/v1', route: 'direct' } });
+        await D.vecSync(data);
+        D.settings.maxInjectChars = 300;
+        const okN = data.entries.filter(e => e.status === 'ok').length;
+        const noise = Array.from({ length: 24 }, (_, k) => `今天的天气${k}很好，股票涨了${k}点，晚饭吃了面条。`);
+        D.calib.key = `chat1|${D.vecFp()}|${Math.floor(okN / 20)}`; D.calib.mem = { vecs: noise.map(fakeVec), n: 24 }; D.calib.raw = { vecs: noise.map(fakeVec), n: 24 };
+        try {
+            const res = await recallOnce('那把7号钥匙后来藏到哪了');
+            assert.ok(/关键词\+向量/.test(res.mode), res.mode);
+            assert.ok(res.entries.length >= 1 && res.raw.some(r => r.index === 7), JSON.stringify({ e: res.entries, r: res.raw.map(r => r.index), n: res.note }));
+            D.settings.recall.rerank = true;
+            const r0 = vecMode.rerankLog.length;
+            const rr = await recallOnce('那把7号钥匙后来藏到哪了');
+            assert.ok(/重排/.test(rr.mode) && !/失败/.test(rr.mode) && vecMode.rerankLog.length === r0 + 1, rr.mode);
+            assert.ok(rr.entries.every(x => x.score >= 0.01), JSON.stringify(rr.entries));
+            vecMode.rerankFail = true;
+            const rf = await recallOnce('那把7号钥匙后来藏到哪了');
+            assert.ok(/重排失败/.test(rf.mode) && rf.entries.length >= 1, rf.mode);
+        } finally {
+            vecTeardown(); D.calib.key = ''; D.settings.maxInjectChars = 9000;
+        }
     });
     t('原文切块：长文按句末切、带重叠', () => {
         const chunks = D.chunkText(('陆衍在厨房里做了一个决定。').repeat(120));
@@ -1362,6 +1653,15 @@ const ta = async (name, fn) => { try { await fn(); pass++; console.log('  ok  ',
         // v0.4.0 首版的「向量源」下拉：旧设置换成对应地址
         s = load({ recall: { source: 'siliconflow', cn: true, vector: true, model: 'BAAI/bge-m3' } });
         assert.strictEqual(s.recall.source, 'vllm'); assert.strictEqual(s.recall.apiUrl, 'https://api.siliconflow.cn/v1'); assert.strictEqual(s.recall.cn, undefined); assert.strictEqual(s.recall.model, 'BAAI/bge-m3'); assert.deepStrictEqual(s.recall.models, []);
+        // v0.4.25：旧默认阈值 0.4 换成自动（0），手改过的值保留；只迁一次；新装默认自动、通道自动、重排关
+        s = load({ recall: { vector: true, threshold: 0.4 } });
+        assert.strictEqual(s.recall.threshold, 0); assert.strictEqual(s.recall.mig25, true); assert.strictEqual(s.recall.route, 'auto'); assert.strictEqual(s.recall.rerank, false);
+        s = load({ recall: { vector: true, threshold: 0.55 } });
+        assert.strictEqual(s.recall.threshold, 0.55, '手改过的阈值保留');
+        s = load({ recall: { vector: true, threshold: 0.4, mig25: true } });
+        assert.strictEqual(s.recall.threshold, 0.4, '迁过一次后用户再填 0.4 不动');
+        s = load({ recall: { route: 'bogus' } });
+        assert.strictEqual(s.recall.route, 'auto');
         s = load({ autoInterval: 0, windowFloors: 50, enabled: true });
         assert.strictEqual(s.autoInterval, 0, '手动模式保持 0'); assert.strictEqual(s.windowFloors, 100);
         s = load(null);
